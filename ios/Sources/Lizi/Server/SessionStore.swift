@@ -89,10 +89,10 @@ final class SessionStore {
     }
 
     private static func randomHex(_ n: Int) -> String {
-        (0..<n).map { _ in "0123456789abcdef".randomElement()! }.joined()
+        String((0..<n).map { _ in "0123456789abcdef".randomElement()! })
     }
     private static func randomLetters(_ n: Int) -> String {
-        (0..<n).map { _ in "abcdefghijklmnopqrstuvwxyz".randomElement()! }.joined()
+        String((0..<n).map { _ in "abcdefghijklmnopqrstuvwxyz".randomElement()! })
     }
 
     /// 合并写入（增量更新）。
