@@ -41,6 +41,8 @@ targets:
       path: Sources/Lizi/Info.plist
       properties:
         CFBundleDisplayName: LIZI 粒子播放器
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft
