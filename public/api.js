@@ -236,6 +236,26 @@ const API = (() => {
       return call(`${src}/lyric`, { id: track.id }, 'GET');
     },
 
+    /**
+     * 落雪（LX）兜底：主音源拿不到地址时调 /api/lx/song/url。
+     * quality 不传时服务端默认从 master 向下回退，返回的 quality 是实际档位。
+     * undefined 的字段不进查询串，别让服务端收到 mid=undefined。
+     */
+    lxSongUrl: (track, quality) => {
+      const params = { source: track.source || 'netease', quality: quality || 'master' };
+      if (track.id != null) params.id = track.id;
+      if (track.mid) params.mid = track.mid;
+      if (track.hash) params.hash = track.hash;
+      if (track.name) params.name = track.name;
+      if (track.artists && track.artists.length) {
+        params.artists = track.artists.map((a) => a.name || a).join('/');
+      }
+      return call('lx/song/url', params, 'GET');
+    },
+
+    /** LX 解析出的音频直链走 /api/lx/audio 代理（白名单见服务端 AUDIO_HOSTS.lx） */
+    lxAudio: (u) => (u ? `/api/lx/audio?url=${encodeURIComponent(u)}` : ''),
+
     /** 所有非网易云音源的音频都走各自代理（服务端按源做域名白名单 + 转发 Range） */
     srcAudio: (src, u) => (u ? `/api/${src}/audio?url=${encodeURIComponent(u)}` : ''),
   };

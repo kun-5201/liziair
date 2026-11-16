@@ -21,6 +21,8 @@ import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 /* 扫码收尾的纯逻辑放在边车目录里（那边是登录专项的地盘），这里只注入真实 I/O */
 import { parseCookieInput, extractCookie, harvest } from './services/netease-api/harvest-core.mjs';
+/* 落雪（LX）音源解析：主音源拿不到地址时兜底，见 services/lx-api/lx-resolver.mjs */
+import { LX_API_URL, LX_SOURCE_MAP, TIERS, resolveMusicUrl, resolveViaExternalServer } from './services/lx-api/lx-resolver.mjs';
 /* Wallpaper Engine 壁纸接口（658 形态 iframe 同源调用，见 wallpaper-api.mjs） */
 import { handleWallpaper } from './wallpaper-api.mjs';
 
@@ -3528,6 +3530,40 @@ async function handleKuwo(req, res, url) {
   }
 }
 
+/* ---------------- 落雪（LX）兜底 ----------------
+   主音源拿不到播放地址（VIP / 无版权，url:null）时，前端调 /api/lx/song/url
+   再试一次。只接 netease / qq / kugou / kuwo 四家；汽水 / 波点 / Spotify
+   没有 LX 解析，直接回 6。
+   quality 默认 master：解析器从高档向下回退，返回的 quality 永远是实际
+   拿到的档位，界面按它显示，不拿请求的档位冒充。
+   LX_API_URL 设了就走外部自建 lx-music-api-server（你的 Ciallo / 溯音等
+   自定义音源脚本跑在那台服务上，不进这个仓库）；没设就走内置解析。 */
+async function handleLxSongUrl(req, res, url) {
+  const q = url.searchParams;
+  const source = (q.get('source') || 'netease').trim();
+  const lxSource = LX_SOURCE_MAP[source];
+  if (!lxSource) return json(res, 200, { code: 6, error: '该音源没有 LX 解析: ' + source });
+  let songId = '';
+  if (source === 'qq') songId = (q.get('mid') || q.get('id') || '').trim();
+  else if (source === 'kugou') {
+    songId = (q.get('hash') || q.get('id') || '').trim();
+    if (!/^[0-9a-fA-F]{32}$/.test(songId)) {
+      songId = [q.get('name') || '', q.get('artists') || ''].filter(Boolean).join(' ');
+    }
+  } else if (source === 'kuwo') songId = (q.get('name') || q.get('id') || '').trim();
+  else songId = (q.get('id') || '').trim();
+  if (!songId) return json(res, 400, { code: 6, error: '缺少歌曲 id' });
+  const quality = (q.get('quality') || 'master').trim();
+  try {
+    const r = LX_API_URL
+      ? await resolveViaExternalServer(lxSource, songId, quality)
+      : await resolveMusicUrl(lxSource, songId, quality);
+    return json(res, 200, { code: 0, url: r.url, quality: r.quality, lxSource, via: LX_API_URL ? 'external' : 'builtin' });
+  } catch (e) {
+    return json(res, 200, { code: 2, error: String(e.message || e) });
+  }
+}
+
 /* ---------------- 各平台音频代理（一律转发 Range） ----------------
    `<audio>` 拖进度条会发 Range 请求，代理不转发就会整段重下（QQ 那边踩过）。
    只放行目标 CDN 域名，别把这个口子变成任意 SSRF。 */
@@ -3547,6 +3583,9 @@ const AUDIO_HOSTS = {
      "MEDIA_ELEMENT_ERROR: Format error"，一首歌都放不出来。
      结论：网易云和 QQ 一样，直链必须走本机代理（同源 = 没有 CORS 这道门）。 */
   netease: [/\.music\.126\.net$/i],
+  /* 落雪：解析出的地址来自各家 CDN（网易 126.net、QQ qqmusic、酷我 kuwo.cn、
+     酷狗 kugou.com、咪咕 migu.cn），只放行这些音乐 CDN，别把口子开成任意 SSRF。 */
+  lx: [/\.music\.126\.net$/i, /\.126\.net$/i, /\.163\.com$/i, /\.qqmusic\.qq\.com$/i, /\.tc\.qq\.com$/i, /\.kuwo\.cn$/i, /\.kuwo\.com$/i, /\.kugou\.com$/i, /\.kgmusic\.cn$/i, /\.kglink\.com$/i, /\.migu\.cn$/i, /\.music\.migu\.cn$/i],
 };
 const AUDIO_REFERER = {
   kugou: 'https://www.kugou.com/',
@@ -4129,6 +4168,18 @@ const server = http.createServer(async (req, res) => {
   }
   if (url.pathname === '/api/qq' || url.pathname.startsWith('/api/qq/')) {
     return handleQQ(req, res, url);
+  }
+
+  /* ---- 落雪（LX）兜底：必须在通用 /api/ 转发之前，否则会被当成 unknown api ----
+     /api/lx/song/url 解析地址；/api/lx/audio 代理 LX 解析出的音频（走 lx 白名单）。 */
+  if (url.pathname === '/api/lx/song/url') {
+    return handleLxSongUrl(req, res, url);
+  }
+  if (url.pathname === '/api/lx/health') {
+    return json(res, 200, { code: 0, sources: ['wy', 'tx', 'kg', 'kw', 'mg'], tiers: TIERS, via: LX_API_URL ? 'external' : 'builtin' });
+  }
+  if (url.pathname === '/api/lx/audio') {
+    return proxySourceAudio(req, res, url, 'lx');
   }
 
   /* ---- 其它三个音源 + Spotify 骨架（同一套边车，见上半部分说明） ----

@@ -781,6 +781,7 @@ const Player = (() => {
     let demo = false;
     let reason = '';
     let preview = false;
+    let lxQuality = '';
     let clipStartMs = 0;
     try {
       if (isQQ) {
@@ -816,11 +817,26 @@ const Player = (() => {
       }
     } catch { reason = 'network'; }
 
+    /* 落雪兜底：主音源没给地址（VIP / 无版权）时再试一次 LX 解析，
+       拿到真地址就不放演示音轨。LX 只接 netease / qq / kugou / kuwo。
+       lx.quality 是实际拿到的档位，界面按它显示。 */
+    if (!url && (src === 'netease' || src === 'qq' || src === 'kugou' || src === 'kuwo')) {
+      try {
+        const lx = await API.lxSongUrl(track);
+        if (lx && lx.url) {
+          url = API.lxAudio(lx.url);
+          lxQuality = lx.quality || '';
+          reason = '';
+          preview = false;
+        }
+      } catch { /* LX 也失败就继续走演示音轨 */ }
+    }
+
     if (!url) {
       demo = true;
       url = makeDemoTrack(40, track.id);
     }
-    return { url, demo, reason, preview, clipStartMs };
+    return { url, demo, reason, preview, clipStartMs, lxQuality };
   }
 
   /** 换歌时统一的元数据入口：trackchange + 清空歌词 + 异步拉歌词 / BPM。
@@ -894,7 +910,7 @@ const Player = (() => {
 
     audio.preload = 'metadata';
     audio.src = data.url;
-    emit('source', { demo: data.demo, track, reason: data.reason, preview: data.preview, clipStartMs: data.clipStartMs });
+    emit('source', { demo: data.demo, track, reason: data.reason, preview: data.preview, clipStartMs: data.clipStartMs, lxQuality: data.lxQuality });
 
     if (autoplay) {
       try {
@@ -998,7 +1014,7 @@ const Player = (() => {
     state.objectUrl = deckBlobs.get(incoming) || null;
     emit('source', {
       demo: prepared.demo, track: prepared.track, reason: prepared.reason,
-      preview: prepared.preview, clipStartMs: prepared.clipStartMs,
+      preview: prepared.preview, clipStartMs: prepared.clipStartMs, lxQuality: prepared.lxQuality,
     });
     state.playing = !audio.paused;
     if (state.playing) { Beat.resume(); Beat.start(); }
