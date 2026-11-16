@@ -77,10 +77,14 @@ enum NetEaseCrypto {
 
     // MARK: - RSA（原始 RSA：m^e mod n，SecKey kSecKeyAlgorithmRSAEncryptionRaw）
 
+    // 本地服务多线程并发调 weapiRequest 都会碰这个缓存，NSLock 保护。
     private static var cachedPublicKey: SecKey?
+    private static let publicKeyLock = NSLock()
 
     /// 用 modulus/exponent 拼 DER SubjectPublicKeyInfo，建 SecKey。
     static func rsaPublicKey() -> SecKey? {
+        publicKeyLock.lock()
+        defer { publicKeyLock.unlock() }
         if let k = cachedPublicKey { return k }
         let modulusBytes = hexToData(modulus)
         let exponentBytes = hexToData(pubKey)
@@ -116,11 +120,16 @@ enum NetEaseCrypto {
         return Data([UInt8(0x80 | bytes.count)] + bytes)
     }
     private static func derInteger(_ data: Data) -> Data {
-        var body = data
-        // 去掉前导 0；最高位为 1 时前面补 0x00（保证正数）。
-        while body.count > 1 && body.first == 0x00 { body.removeFirst() }
-        if let first = body.first, first & 0x80 != 0 { body.insert(0x00, at: 0) }
-        return Data([0x02]) + derLength(body.count) + body
+        // 去前导 0（至少留 1 字节）；最高位为 1 时前面补 0x00（保证正数）。
+        // 全程在 [UInt8] 上算、最后拼新 Data：不要在同一个 Data 上
+        // removeFirst/insert——崩溃日志证实 Data.insert(0x00, at: 0) 在此
+        // 路径会 trap（EXC_BREAKPOINT，modulus 首字节 0x00 去掉后剩 0xe0）。
+        let bytes = [UInt8](data)
+        var start = 0
+        while start + 1 < bytes.count && bytes[start] == 0x00 { start += 1 }
+        var body: [UInt8] = bytes.isEmpty ? [0x00] : Array(bytes[start...])
+        if body[0] & 0x80 != 0 { body = [0x00] + body }
+        return Data([0x02]) + derLength(body.count) + Data(body)
     }
     private static func derSequence(_ body: Data) -> Data {
         Data([0x30]) + derLength(body.count) + body
