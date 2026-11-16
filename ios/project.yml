@@ -20,11 +20,17 @@ targets:
     platform: iOS
     sources:
       - Sources/Lizi
-    # public/ 是上游原封不动的前端：以 folder reference 打进包，
-    # Bundle 里路径保持 public/...，Swift 服务按这个路径提供静态文件。
-    resources:
-      - path: ../public
-        type: folder
+    # public/ 是上游原封不动的前端：XcodeGen 2.46 对 Xcode 16+ 工程把
+    # type: folder 的 resources 当同步组处理，../public 在工程目录外
+    # 会被静默丢弃（run 43956308629 证实：archive 成功但 .app 里无 public/）。
+    # 改用 post-build 脚本直接拷进 .app，Bundle 里路径保持 public/...。
+    postBuildScripts:
+      - name: Copy public frontend
+        basedOnDependencyAnalysis: false
+        script: |
+          set -e
+          rm -rf "$TARGET_BUILD_DIR/$PRODUCT_NAME.app/public"
+          cp -R "$SRCROOT/../public" "$TARGET_BUILD_DIR/$PRODUCT_NAME.app/public"
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.lty5201.lizi
