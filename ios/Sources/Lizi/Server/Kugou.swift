@@ -213,6 +213,7 @@ final class KugouService {
               let ivData = iv.data(using: .utf8) else { return nil }
         var outLen = 0
         var out = Data(count: data.count + kCCBlockSizeAES128)
+        let outCapacity = out.count
         let status: CCCryptorStatus = out.withUnsafeMutableBytes { outPtr in
             data.withUnsafeBytes { dataPtr in
                 keyData.withUnsafeBytes { keyPtr in
@@ -221,7 +222,7 @@ final class KugouService {
                                 CCOptions(kCCOptionPKCS7Padding),
                                 keyPtr.baseAddress, keyData.count, ivPtr.baseAddress,
                                 dataPtr.baseAddress, data.count,
-                                outPtr.baseAddress, out.count, &outLen)
+                                outPtr.baseAddress, outCapacity, &outLen)
                     }
                 }
             }
@@ -238,6 +239,7 @@ final class KugouService {
               let ivData = iv.data(using: .utf8) else { return nil }
         var outLen = 0
         var out = Data(count: data.count + kCCBlockSizeAES128)
+        let outCapacity = out.count
         let status: CCCryptorStatus = out.withUnsafeMutableBytes { outPtr in
             data.withUnsafeBytes { dataPtr in
                 keyData.withUnsafeBytes { keyPtr in
@@ -246,7 +248,7 @@ final class KugouService {
                                 CCOptions(kCCOptionPKCS7Padding),
                                 keyPtr.baseAddress, keyData.count, ivPtr.baseAddress,
                                 dataPtr.baseAddress, data.count,
-                                outPtr.baseAddress, out.count, &outLen)
+                                outPtr.baseAddress, outCapacity, &outLen)
                     }
                 }
             }
@@ -281,6 +283,7 @@ final class KugouService {
               let ivData = iv.data(using: .utf8) else { return nil }
         var outLen = 0
         var out = Data(count: data.count + kCCBlockSizeAES128)
+        let outCapacity = out.count
         let status: CCCryptorStatus = out.withUnsafeMutableBytes { outPtr in
             data.withUnsafeBytes { dataPtr in
                 keyData.withUnsafeBytes { keyPtr in
@@ -289,7 +292,7 @@ final class KugouService {
                                 CCOptions(kCCOptionPKCS7Padding),
                                 keyPtr.baseAddress, keyData.count, ivPtr.baseAddress,
                                 dataPtr.baseAddress, data.count,
-                                outPtr.baseAddress, out.count, &outLen)
+                                outPtr.baseAddress, outCapacity, &outLen)
                     }
                 }
             }
@@ -308,6 +311,7 @@ final class KugouService {
               let ivData = iv.data(using: .utf8) else { return nil }
         var outLen = 0
         var out = Data(count: data.count + kCCBlockSizeAES128)
+        let outCapacity = out.count
         let status: CCCryptorStatus = out.withUnsafeMutableBytes { outPtr in
             data.withUnsafeBytes { dataPtr in
                 keyData.withUnsafeBytes { keyPtr in
@@ -316,7 +320,7 @@ final class KugouService {
                                 CCOptions(kCCOptionPKCS7Padding),
                                 keyPtr.baseAddress, keyData.count, ivPtr.baseAddress,
                                 dataPtr.baseAddress, data.count,
-                                outPtr.baseAddress, out.count, &outLen)
+                                outPtr.baseAddress, outCapacity, &outLen)
                     }
                 }
             }

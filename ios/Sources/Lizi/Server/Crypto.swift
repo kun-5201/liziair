@@ -26,6 +26,9 @@ enum NetEaseCrypto {
     private static func aesEncrypt(_ data: Data, key: Data, iv: Data?, mode: CCOptions) -> Data? {
         var outLen = 0
         var out = Data(count: data.count + kCCBlockSizeAES128)
+        // 先把容量取出来：out 被 withUnsafeMutableBytes 独占借用期间，
+        // 里面再读 out.count 会触发独占性冲突。
+        let outCapacity = out.count
         let status: CCCryptorStatus = out.withUnsafeMutableBytes { outPtr in
             data.withUnsafeBytes { dataPtr in
                 key.withUnsafeBytes { keyPtr in
@@ -36,7 +39,7 @@ enum NetEaseCrypto {
                                 keyPtr.baseAddress, key.count,
                                 ivPtr.baseAddress,
                                 dataPtr.baseAddress, data.count,
-                                outPtr.baseAddress, out.count, &outLen
+                                outPtr.baseAddress, outCapacity, &outLen
                             )
                         }
                     }
@@ -45,7 +48,7 @@ enum NetEaseCrypto {
                         keyPtr.baseAddress, key.count,
                         nil,
                         dataPtr.baseAddress, data.count,
-                        outPtr.baseAddress, out.count, &outLen
+                        outPtr.baseAddress, outCapacity, &outLen
                     )
                 }
             }
