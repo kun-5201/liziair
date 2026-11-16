@@ -109,7 +109,7 @@ final class NetEaseService {
             "Content-Type": "application/x-www-form-urlencoded",
             "Referer": "https://music.163.com",
             "Origin": "https://music.163.com",
-            "User-Agent": Self.weapiUA,
+            "User-Agent": Self.neteaseUA,
             "Cookie": session.cookieHeader,
         ]
         if checkToken, let token = await fetchAntiCheatToken(), !token.isEmpty {

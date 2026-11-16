@@ -47,7 +47,7 @@ final class SessionStore {
     }
 
     /// 设备指纹（对标 .netease-device.json）：首次运行生成并持久化。
-    /// appver 3.1.17.204416（与 eapi header 的 8.9.70 不同，见规格文档 §10）。
+    /// appver 3.1.17.204416，与 eapi header 一致。
     private(set) var deviceInfo: [String: String] = [:]
 
     private var deviceFile: URL { dir.appendingPathComponent("device.json") }
@@ -57,21 +57,42 @@ final class SessionStore {
            let obj = try? JSONSerialization.jsonObject(with: data) as? [String: String],
            !obj.isEmpty {
             deviceInfo = obj
-            return
+        } else {
+            deviceInfo = [
+                "os": "pc",
+                "osver": "Microsoft-Windows-10-Professional-build-19045-64bit",
+                "appver": "3.1.17.204416",
+                "versioncode": "140",
+                "mobilename": "",
+                "resolution": "1920x1080",
+                "channel": "netease",
+                "deviceId": UUID().uuidString.uppercased(),
+            ]
         }
-        deviceInfo = [
-            "os": "pc",
-            "osver": "Microsoft-Windows-10-Professional-build-19045-64bit",
-            "appver": "3.1.17.204416",
-            "versioncode": "140",
-            "mobilename": "",
-            "resolution": "1920x1080",
-            "channel": "netease",
-            "deviceId": UUID().uuidString.uppercased(),
-        ]
+        // 匿名身份 cookie（对标边车 processCookieObject）：扫码登录的上游风控按它认匿名会话。
+        // 首次运行生成并持久化进 device.json；已生成的沿用，不随请求变化。
+        // cookieHeader 会把 deviceInfo 里尚未在 jar 中的键补进请求头，所以这里一加就全量生效。
+        let nuid = deviceInfo["_ntes_nuid"] ?? Self.randomHex(32)
+        deviceInfo["_ntes_nuid"] = nuid
+        if deviceInfo["_ntes_nnid"] == nil {
+            deviceInfo["_ntes_nnid"] = "\(nuid),\(Int(Date().timeIntervalSince1970 * 1000))"
+        }
+        if deviceInfo["WNMCID"] == nil {
+            deviceInfo["WNMCID"] = "\(Self.randomLetters(6)).\(Int(Date().timeIntervalSince1970 * 1000)).01.0"
+        }
+        if deviceInfo["WEVNSM"] == nil { deviceInfo["WEVNSM"] = "1.0.0" }
+        if deviceInfo["__remember_me"] == nil { deviceInfo["__remember_me"] = "true" }
+        if deviceInfo["ntes_kaola_ad"] == nil { deviceInfo["ntes_kaola_ad"] = "1" }
         if let data = try? JSONSerialization.data(withJSONObject: deviceInfo) {
             try? data.write(to: deviceFile, options: .atomic)
         }
+    }
+
+    private static func randomHex(_ n: Int) -> String {
+        (0..<n).map { _ in "0123456789abcdef".randomElement()! }.joined()
+    }
+    private static func randomLetters(_ n: Int) -> String {
+        (0..<n).map { _ in "abcdefghijklmnopqrstuvwxyz".randomElement()! }.joined()
     }
 
     /// 合并写入（增量更新）。

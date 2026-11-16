@@ -359,3 +359,8 @@
   #view-hall .pstrip__icons { gap: 5px; }
   #view-hall .pstrip__i { width: 28px; height: 28px; }
 }
+
+/* 落雪音源设置：服务器地址输入框（设置 → 落雪音源） */
+.lx-set__row { gap: 10px; }
+.lx-set__input { flex: 1 1 auto; min-width: 0; border: 0; outline: 0; background: transparent; }
+.lx-set__input::placeholder { opacity: .45; }

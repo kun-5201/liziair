@@ -237,7 +237,7 @@ const API = (() => {
     },
 
     /**
-     * 落雪（LX）兜底：主音源拿不到地址时调 /api/lx/song/url。
+     * 落雪（LX）优先：播放地址默认先走 /api/lx/song/url（内置解析或设置里填的自建服务器），
      * quality 不传时服务端默认从 master 向下回退，返回的 quality 是实际档位。
      * undefined 的字段不进查询串，别让服务端收到 mid=undefined。
      */

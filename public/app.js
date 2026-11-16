@@ -14069,4 +14069,48 @@
       window.open(QQ_GROUP_URL, '_blank', 'noopener');
     });
   })();
+
+  /* 设置 → 关于：赞助一行（支付宝收款码；与 QQ 群行同款写法）。 */
+  (function initSponsorRow() {
+    const row = document.getElementById('set-sponsor');
+    if (!row) return;
+    const SPONSOR_URL = 'https://qr.alipay.com/fkx14272dybkfpkj6nmile0';
+    row.addEventListener('click', () => {
+      const native = window.__liziNative;
+      if (native && typeof native.openExternal === 'function') {
+        try { native.openExternal(SPONSOR_URL); return; } catch { /* 桥调用失败退回 window.open */ }
+      }
+      window.open(SPONSOR_URL, '_blank', 'noopener');
+    });
+  })();
+
+  /* 设置 → 落雪音源：自定义服务器地址（GET/POST /api/settings/lx，
+     存 UserDefaults，重启仍生效；留空 = 内置解析；保存后立即生效）。 */
+  (function initLxSettings() {
+    const input = document.getElementById('lx-server-url');
+    const saveBtn = document.getElementById('lx-server-save');
+    const state = document.getElementById('lx-server-state');
+    if (!input || !saveBtn) return;
+    const showState = (url) => {
+      if (state) state.textContent = url ? `当前：自定义服务器 ${url}` : '当前：内置解析';
+    };
+    fetch('/api/settings/lx', { cache: 'no-store' })
+      .then((r) => r.json()).then((d) => {
+        if (d && typeof d.url === 'string') { input.value = d.url; showState(d.url); }
+      }).catch(() => { /* 读不到就保持默认显示 */ });
+    saveBtn.addEventListener('click', async () => {
+      const url = input.value.trim();
+      saveBtn.disabled = true;
+      try {
+        const r = await fetch('/api/settings/lx', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url }),
+        });
+        const d = await r.json();
+        if (d && d.code === 200) { showState(d.url || ''); if (state) state.textContent += '（已保存）'; }
+        else if (state) state.textContent = '保存失败：' + ((d && d.error) || '未知错误');
+      } catch (e) { if (state) state.textContent = '保存失败：' + (e && e.message || e); }
+      saveBtn.disabled = false;
+    });
+  })();
 })();

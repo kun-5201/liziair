@@ -783,7 +783,22 @@ const Player = (() => {
     let preview = false;
     let lxQuality = '';
     let clipStartMs = 0;
-    try {
+
+    /* 落雪优先：netease / qq / kugou / kuwo 先试 LX 解析（内置，或设置里填的自建服务器），
+       拿到真地址就直接用；LX 拿不到再走平台接口。lx.quality 是实际拿到的档位，界面按它显示。 */
+    if (src === 'netease' || src === 'qq' || src === 'kugou' || src === 'kuwo') {
+      try {
+        const lx = await API.lxSongUrl(track);
+        if (lx && lx.url) {
+          url = API.lxAudio(lx.url);
+          lxQuality = lx.quality || '';
+          reason = '';
+          preview = false;
+        }
+      } catch { /* LX 失败就走平台接口 */ }
+    }
+
+    if (!url) try {
       if (isQQ) {
         /* QQ 给的是 http 的 vkey 直链（会过期、CDN 挑 referer），统一走本机代理；
            没登录/没会员时上游只给试听片段，如实标 preview，不假装能放全曲。 */
@@ -816,21 +831,6 @@ const Player = (() => {
         else reason = 'unavailable';
       }
     } catch { reason = 'network'; }
-
-    /* 落雪兜底：主音源没给地址（VIP / 无版权）时再试一次 LX 解析，
-       拿到真地址就不放演示音轨。LX 只接 netease / qq / kugou / kuwo。
-       lx.quality 是实际拿到的档位，界面按它显示。 */
-    if (!url && (src === 'netease' || src === 'qq' || src === 'kugou' || src === 'kuwo')) {
-      try {
-        const lx = await API.lxSongUrl(track);
-        if (lx && lx.url) {
-          url = API.lxAudio(lx.url);
-          lxQuality = lx.quality || '';
-          reason = '';
-          preview = false;
-        }
-      } catch { /* LX 也失败就继续走演示音轨 */ }
-    }
 
     if (!url) {
       demo = true;

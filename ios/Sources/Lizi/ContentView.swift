@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import WebKit
 import AVFoundation
 import MediaPlayer
@@ -36,7 +37,7 @@ struct ContentView: View {
 
 // MARK: - WebView 宿主
 
-final class WebHost: NSObject, ObservableObject {
+final class WebHost: NSObject, ObservableObject, WKUIDelegate {
     private var server: LocalHttpServer?
     private var router = LiziRouter()
     let webView: WKWebView
@@ -60,12 +61,24 @@ final class WebHost: NSObject, ObservableObject {
         self.webView = WKWebView(frame: .zero, configuration: config)
         self.webView.scrollView.bounces = false
         super.init()
+        // window.open（设置页 QQ 群 / 赞助行）交给系统浏览器/对应 App 打开；
+        // 不设 uiDelegate 时 WKWebView 会直接丢弃新窗口请求，按钮点了没反应。
+        self.webView.uiDelegate = self
+    }
+
+    // MARK: - WKUIDelegate
+
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if let url = navigationAction.request.url {
+            UIApplication.shared.open(url, options: [:], completionHandler: nil)
+        }
+        return nil
     }
 
     func start() {
         failed = false
         do {
-            // 外部 LX 服务地址（用户在别处配好后可经 UserDefaults 注入，默认内置解析）。
+            // 外部 LX 服务地址（设置页「落雪音源」里填，存 UserDefaults；默认内置解析）。
             if let lxURL = UserDefaults.standard.string(forKey: "lxApiUrl"), !lxURL.isEmpty {
                 LXResolver.externalApiURL = lxURL
             }

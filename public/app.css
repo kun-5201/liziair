@@ -8606,3 +8606,8 @@ body.is-stage .updtoast { bottom: 18px; }
 @media (prefers-reduced-motion: reduce) {
   .updmodal, .updmodal__card { animation: none; }
 }
+
+/* 落雪音源设置：服务器地址输入框（设置 → 落雪音源） */
+.lx-set__row { gap: 10px; }
+.lx-set__input { flex: 1 1 auto; min-width: 0; border: 0; outline: 0; background: transparent; }
+.lx-set__input::placeholder { opacity: .45; }

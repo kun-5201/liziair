@@ -542,7 +542,8 @@ private func qqMqttParseProperties(_ data: Data, offset: inout Int) -> (user: [S
     var user: [String: String] = [:]
     var serverReference: String?
     guard offset < data.count else { return (user, serverReference) }
-    // 变长属性总长度
+    // 变长属性总长度（与 qqMqttSplitPackets 同款上限：MQTT 变长整数最多 4 字节，
+    // 超过就截断丢弃；不设上限时 multiplier *= 128 会在 9 个连续 0x80 后溢出 Int64 闪退）。
     var propLen = 0
     var multiplier = 1
     while offset < data.count {
@@ -551,6 +552,7 @@ private func qqMqttParseProperties(_ data: Data, offset: inout Int) -> (user: [S
         propLen += Int(b & 0x7F) * multiplier
         multiplier *= 128
         if b & 0x80 == 0 { break }
+        if multiplier > 128 * 128 * 128 { break }
     }
     let end = min(data.count, offset + propLen)
     func readUTF8() -> String? {

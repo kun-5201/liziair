@@ -214,7 +214,7 @@ enum NetEaseCrypto {
         return [
             "osver": "Microsoft-Windows-10-Professional-build-19045-64bit",
             "deviceId": eapiDeviceId,
-            "appver": "8.9.70",
+            "appver": "3.1.17.204416",
             "versioncode": "140",
             "mobilename": "",
             "buildver": String(nowMs / 1000).prefix(10).description,

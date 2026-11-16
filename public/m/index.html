@@ -901,6 +901,18 @@ python -c "from pedalboard import load_plugin; p=load_plugin(r'C:\Program Files\
       </button>
     </section>
 
+    <!-- ---------- 落雪音源 ---------- -->
+      <section class="setpage__sec setcard setcard--wide" id="set-sec-lx" aria-labelledby="setpage-h-lx">
+        <h2 class="setpage__h" id="setpage-h-lx">落雪音源</h2>
+      <p class="setpage__note">播放地址优先走落雪（内置解析，或下面填你自己的落雪服务器）；落雪拿不到时再走平台接口。搜索与歌词仍走平台接口。</p>
+      <div class="setpage__row lx-set__row">
+        <span class="setpage__label">落雪服务器</span>
+        <input class="lx-set__input" id="lx-server-url" type="url" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="留空用内置解析，如 http://192.168.1.2:3000">
+        <button class="setpage__act" id="lx-server-save" type="button">保存</button>
+      </div>
+      <p class="setpage__note" id="lx-server-state" role="status">当前：内置解析</p>
+      </section>
+
     <!-- ---------- 音效 ---------- -->
       <section class="setpage__sec setcard setcard--half" id="set-sec-audio" aria-labelledby="setpage-h-audio">
         <h2 class="setpage__h" id="setpage-h-audio">音效</h2>
@@ -1095,12 +1107,13 @@ python -c "from pedalboard import load_plugin; p=load_plugin(r'C:\Program Files\
       </div>
       <!-- QQ 群：点整行走 app.js 的 openExternal（桌面交给系统浏览器，安卓走原生桥） -->
       <button class="setpage__row" id="set-qq-group" type="button"
-              aria-label="加入 QQ 群：LIZI用户体验群，群号 1132061192">
+              aria-label="加入 QQ 群：LIZI用户体验群，群号 724899514">
         <span class="setpage__label">QQ 群</span>
         <span class="setpage__hint">LIZI用户体验群</span>
-        <span class="setpage__val">1132061192</span>
+        <span class="setpage__val">724899514</span>
         <svg class="ico setpage__caret" aria-hidden="true"><use href="#i-chevron"/></svg>
       </button>
+      <button class="setpage__row" id="set-sponsor" type="button" aria-label="赞助：打开支付宝收款码"><span class="setpage__label">赞助</span><span class="setpage__hint">支付宝</span><span class="setpage__val">支持一下</span><svg class="ico setpage__caret" aria-hidden="true"><use href="#i-chevron"/></svg></button>
       <p class="setpage__note">折射和形态渲染已固定为默认值；形态切换在播放页右侧抽屉里。</p>
       </section>
       </div><!-- /.setconsole__grid -->

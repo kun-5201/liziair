@@ -35,6 +35,25 @@ final class LiziRouter {
         }
         if path == "/api/lx/audio" { return await Proxies.proxySourceAudio(req, source: "lx") }
 
+        // ---- 落雪设置：自定义服务器地址（设置页用；存 UserDefaults，重启仍生效；留空 = 内置解析）----
+        if path == "/api/settings/lx" {
+            if req.method == "POST" {
+                let url = req.string("url").trimmingCharacters(in: .whitespacesAndNewlines)
+                if !url.isEmpty {
+                    guard url.hasPrefix("http://") || url.hasPrefix("https://") else {
+                        return .json(400, ["code": 400, "error": "地址须以 http:// 或 https:// 开头"])
+                    }
+                    UserDefaults.standard.set(url, forKey: "lxApiUrl")
+                    LXResolver.externalApiURL = url
+                } else {
+                    UserDefaults.standard.removeObject(forKey: "lxApiUrl")
+                    LXResolver.externalApiURL = ""
+                }
+            }
+            return .json(200, ["code": 200, "url": LXResolver.externalApiURL,
+                                "via": LXResolver.externalApiURL.isEmpty ? "builtin" : "external"])
+        }
+
         // ---- 其它边车：音频代理 + handler ----
         for name in ["kugou", "qishui", "bodian", "spotify", "kuwo"] {
             if path == "/api/\(name)/audio" { return await Proxies.proxySourceAudio(req, source: name) }
