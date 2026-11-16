@@ -1,0 +1,80 @@
+name: Build Unsigned IPA
+
+# 把 LIZI 粒子播放器（woshi32s/liziair 的 1:1 iOS 复刻：WKWebView 壳 +
+# Swift 本地服务）编成未签名 IPA，供侧载工具（AltStore、Sideloadly、
+# eSign、全能签等）用自己的 Apple ID 重签后安装。
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ipa:
+    # 2026-11-17 实测：macOS arm64 编译机池子没空，Placard 连续 5 次排队 16-17 分钟后被取消；
+    # 改成 macos-26-intel 后第 7 次不到 1 分钟接单、4 分钟编完成功（同一个 Xcode，照样编 arm64 的 iOS 包）。
+    # 所以这里直接用 macos-26-intel，不用 macos-latest / macos-26 / xcode-27。
+    runs-on: macos-26-intel
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # project.yml 是唯一事实来源（XcodeGen）；重新生成 Xcode 工程，
+      # 保证 archive 包含 project.yml 里的全部 target 与资源。
+      - name: Generate Xcode project (XcodeGen)
+        run: |
+          brew install xcodegen
+          cd ios
+          xcodegen generate
+
+      - name: Archive the iOS app (unsigned)
+        run: |
+          mkdir -p .build
+          xcodebuild archive \
+            -project ios/Lizi.xcodeproj \
+            -scheme Lizi \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath .build/Lizi.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS=""
+
+      - name: Verify the app bundle
+        run: |
+          APP_PATH="$(find .build/Lizi.xcarchive/Products/Applications -maxdepth 1 -name '*.app' -print -quit)"
+          echo "app: $APP_PATH"
+          ls "$APP_PATH"
+          echo "--- public/ must be a folder reference with the full frontend ---"
+          test -d "$APP_PATH/public" || { echo "::error::public/ missing in app bundle"; exit 1; }
+          ls "$APP_PATH/public" | head
+          test -f "$APP_PATH/public/index.html" || { echo "::error::public/index.html missing"; exit 1; }
+          du -sh "$APP_PATH/public"
+          echo "--- bundle id / arch ---"
+          /usr/libexec/PlistBuddy -c "Print CFBundleIdentifier" "$APP_PATH/Info.plist"
+          lipo -archs "$APP_PATH/Lizi"
+          echo "--- Live Activity extension must be embedded ---"
+          test -d "$APP_PATH/PlugIns/LiziLiveActivity.appex" || { echo "::error::LiziLiveActivity.appex missing in app bundle"; exit 1; }
+          /usr/libexec/PlistBuddy -c "Print CFBundleIdentifier" "$APP_PATH/PlugIns/LiziLiveActivity.appex/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print NSExtension:NSExtensionPointIdentifier" "$APP_PATH/PlugIns/LiziLiveActivity.appex/Info.plist"
+
+      - name: Package the IPA
+        run: |
+          mkdir -p Payload dist
+          APP_PATH="$(find .build/Lizi.xcarchive/Products/Applications -maxdepth 1 -name '*.app' -print -quit)"
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::No .app found in archive" >&2
+            exit 1
+          fi
+          cp -R "$APP_PATH" Payload/
+          zip -qr dist/lizi.ipa Payload
+
+      - name: Upload the IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lizi-ipa
+          path: dist/lizi.ipa
+          if-no-files-found: error

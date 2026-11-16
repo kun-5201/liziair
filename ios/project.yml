@@ -1,0 +1,73 @@
+name: Lizi
+
+options:
+  bundleIdPrefix: com.lty5201
+  deploymentTarget:
+    iOS: "16.2"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.2"
+    MARKETING_VERSION: "1.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+
+targets:
+  Lizi:
+    type: application
+    platform: iOS
+    sources:
+      - Sources/Lizi
+    # public/ 是上游原封不动的前端：以 folder reference 打进包，
+    # Bundle 里路径保持 public/...，Swift 服务按这个路径提供静态文件。
+    resources:
+      - path: ../public
+        type: folder
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.lty5201.lizi
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    dependencies:
+      - target: LiziLiveActivity
+    info:
+      path: Sources/Lizi/Info.plist
+      properties:
+        CFBundleDisplayName: LIZI 粒子播放器
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UIBackgroundModes:
+          - audio
+        UILaunchScreen: {}
+        ITSAppUsesNonExemptEncryption: false
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        CFBundleURLTypes:
+          - CFBundleURLName: com.lty5201.lizi
+            CFBundleURLSchemes:
+              - lizi
+
+  # 歌词灵动岛扩展（Live Activity）：配置按 Beans/kun 的成功做法——
+  # NSExtension 只写在 project.yml 的 info.properties 里（XcodeGen 每次
+  # 生成工程都会重写 Info.plist 文件，手改 plist 活不到构建）；绝不写
+  # NSExtensionPrincipalClass（岛上歌词项目曾因此装不上）。
+  LiziLiveActivity:
+    type: app-extension
+    platform: iOS
+    sources:
+      - Sources/LiziLiveActivity
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.lty5201.lizi.LiziLiveActivity
+        PRODUCT_NAME: LiziLiveActivity
+    info:
+      path: Sources/LiziLiveActivity/Info.plist
+      properties:
+        CFBundleDisplayName: 歌词灵动岛
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
