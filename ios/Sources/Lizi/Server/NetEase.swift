@@ -81,8 +81,12 @@ final class NetEaseService {
     }
 
     private func formBody(_ fields: [(String, String)]) -> Data {
+        // application/x-www-form-urlencoded：必须用严格字符集。
+        // .urlQueryAllowed 不转义 +，而 weapi 的 params 是 base64（含 +），
+        // + 会被服务端解成空格 → base64 损坏 → AES 解密失败（约 98.5% 的调用）。
+        let strict = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
         let s = fields.map { k, v in
-            "\(k)=\(v.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")"
+            "\(k)=\(v.addingPercentEncoding(withAllowedCharacters: strict) ?? "")"
         }.joined(separator: "&")
         return Data(s.utf8)
     }

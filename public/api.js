@@ -277,7 +277,11 @@ const API = (() => {
       if (track.hash) params.hash = track.hash;
       if (track.name) params.name = track.name;
       if (track.artists && track.artists.length) {
-        params.artists = track.artists.map((a) => a.name || a).join('/');
+        // artists 可能是数组（[{name}] 或 ['a','b']），也可能是 app.js 拼好的
+        // 字符串（'a / b'）：字符串没有 .map，直接调用会抛异常导致整个 LX 腿跳过。
+        params.artists = Array.isArray(track.artists)
+          ? track.artists.map((a) => a.name || a).join('/')
+          : String(track.artists);
       }
       return call('lx/song/url', params, 'GET');
     },

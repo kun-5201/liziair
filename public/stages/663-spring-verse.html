@@ -1,0 +1,721 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>663 · 弹簧诗行</title>
+<script src="assets/custom-bg.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box;-webkit-font-smoothing:antialiased}
+html,body{margin:0;height:100%;overflow:hidden;background:#0b0b10}
+body{font-family:"SF Pro Text",-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+     -webkit-user-select:none;user-select:none;cursor:default}
+
+/* ================= 背景：原生渐变打底（壁纸没开/没加载时也绝不黑屏） ================= */
+.bg{position:fixed;inset:0;
+    background:
+      radial-gradient(120% 90% at 50% 0%,#232336 0%,#14141f 46%,#0b0b10 78%,#07070a 100%)}
+.bg::after{content:'';position:absolute;inset:0;
+    background:radial-gradient(60% 42% at 50% 108%,rgba(var(--ac,150,165,255),.16),rgba(var(--ac,150,165,255),0) 70%)}
+.vignette{position:fixed;inset:0;pointer-events:none;z-index:3;
+    background:radial-gradient(118% 100% at 50% 46%,rgba(0,0,0,0) 58%,rgba(0,0,0,.42) 100%)}
+
+/* ================= 舞台 ================= */
+.stage{position:fixed;inset:0;z-index:2}
+.ground{position:absolute;left:0;right:0;bottom:0;height:calc(9vh + 26px);pointer-events:none;
+    background:linear-gradient(rgba(0,0,0,0),rgba(0,0,0,.34));
+    border-top:1px solid rgba(255,255,255,.07)}
+.ground::before{content:'';position:absolute;left:0;right:0;top:-1px;height:1px;
+    background:linear-gradient(90deg,rgba(255,255,255,0),rgba(var(--ac,150,165,255),.5),rgba(255,255,255,0))}
+
+/* 每句一个容器；旧句淡出沉底，新句在上方破土 */
+.line{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;
+      transition:opacity .9s ease}
+.line.old{opacity:0}
+.line.old .ch{transition:none}
+.ch{position:absolute;left:0;top:0;display:block;line-height:1;
+    font-weight:700;letter-spacing:0;white-space:pre;
+    color:#f4f4f8;will-change:transform,opacity;
+    /* 字缘微光：贴着字边的冷光晕 + 淡淡描边，颜色跟封面取色走 */
+    text-shadow:0 0 10px rgba(var(--ac,150,165,255),.65),
+                0 0 30px rgba(var(--ac,150,165,255),.30),
+                0 2px 14px rgba(0,0,0,.55);
+    -webkit-text-stroke:.4px rgba(255,255,255,.22)}
+.ch.sung{color:#fff}
+.ch .core{position:absolute;inset:0;color:transparent;
+    background:linear-gradient(180deg,#fff 30%,rgb(var(--ac,150,165,255)) 130%);
+    -webkit-background-clip:text;background-clip:text;opacity:0;transition:opacity .3s ease}
+.ch.sung .core{opacity:1}
+
+/* 破土尘：字落定瞬间溅起的一点微光尘 */
+.mote{position:absolute;width:3px;height:3px;border-radius:50%;pointer-events:none;
+      background:rgb(var(--ac,150,165,255));
+      box-shadow:0 0 6px 1px rgba(var(--ac,150,165,255),.8);
+      opacity:0}
+
+/* 液态高光条：横贯当前句的一条流动亮带 + 句下跟唱进度的液态底线 */
+.shine{position:absolute;left:0;top:0;height:0;pointer-events:none;overflow:visible;z-index:1;
+       opacity:0;transition:opacity .5s ease}
+.shine.on{opacity:1}
+.shine i{position:absolute;left:-14%;top:0;width:128%;height:100%;
+    background:linear-gradient(90deg,rgba(255,255,255,0) 0%,
+      rgba(var(--ac,150,165,255),.06) 22%,rgba(255,255,255,.34) 50%,
+      rgba(var(--ac,150,165,255),.06) 78%,rgba(255,255,255,0) 100%);
+    filter:blur(1px);border-radius:999px;
+    transform:translateX(-38%) scaleX(.72);
+    animation:flow 2.6s ease-in-out infinite alternate}
+@keyframes flow{from{transform:translateX(-38%) scaleX(.72)}to{transform:translateX(38%) scaleX(1.06)}}
+.liquid{position:absolute;left:0;height:5px;border-radius:999px;pointer-events:none;z-index:1;
+    background:linear-gradient(90deg,rgba(var(--ac,150,165,255),.15),#fff 55%,rgba(var(--ac,150,165,255),.85));
+    box-shadow:0 0 14px 2px rgba(var(--ac,150,165,255),.45);
+    transform-origin:left center;transform:scaleX(0);
+    opacity:0;transition:opacity .4s ease}
+.liquid.on{opacity:1}
+.liquid::after{content:'';position:absolute;right:-4px;top:50%;width:11px;height:11px;
+    transform:translateY(-50%);border-radius:50%;
+    background:#fff;box-shadow:0 0 12px 3px rgba(var(--ac,150,165,255),.8)}
+
+/* 上一句留痕 */
+.prev{position:absolute;left:0;right:0;text-align:center;pointer-events:none;
+      font-size:clamp(13px,1.6vw,17px);font-weight:500;letter-spacing:.14em;
+      color:rgba(255,255,255,.34);text-shadow:0 0 12px rgba(0,0,0,.6);
+      opacity:0;transition:opacity .8s ease;white-space:nowrap;overflow:hidden;
+      text-overflow:ellipsis;padding:0 8vw}
+
+/* 左下曲目信息 + 进度 */
+.meta{position:fixed;left:4.5vw;bottom:calc(9vh + 34px);z-index:4;color:#fff;pointer-events:none;
+      opacity:0;transition:opacity 1s ease;max-width:44vw}
+.meta.on{opacity:1}
+.meta__n{font-size:clamp(15px,1.5vw,20px);font-weight:600;letter-spacing:-.2px;
+         white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-shadow:0 1px 10px rgba(0,0,0,.7)}
+.meta__a{font-size:12px;color:rgba(255,255,255,.55);margin-top:3px;
+         white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.meta__p{width:min(19vw,230px);height:2px;background:rgba(255,255,255,.16);margin-top:12px;
+         border-radius:1px;overflow:hidden}
+.meta__p i{display:block;height:100%;background:#fff;border-radius:1px;
+           transform:scaleX(0);transform-origin:left center}
+.meta__t{margin-top:7px;font-size:10.5px;letter-spacing:1px;color:rgba(255,255,255,.55);
+         font-variant-numeric:tabular-nums}
+
+/* 空歌词 */
+.empty{position:fixed;left:0;right:0;top:42%;text-align:center;z-index:4;pointer-events:none;
+       opacity:0;transition:opacity .7s ease}
+.empty.on{opacity:1}
+.empty__t{font-size:15px;color:rgba(255,255,255,.6);letter-spacing:.3em}
+.empty__s{font-size:12px;color:rgba(255,255,255,.32);letter-spacing:.2em;margin-top:10px}
+
+@media (max-aspect-ratio: 9/10){
+  .meta{left:6vw;bottom:calc(9vh + 30px);max-width:72vw}
+  .meta__p{width:44vw}
+}
+@media (prefers-reduced-motion: reduce){
+  .shine i{animation:none}
+  .line{transition:opacity .3s ease}
+}
+</style>
+</head>
+<body>
+
+<div class="bg"></div>
+<div class="stage" id="stage">
+  <div class="ground"></div>
+  <div class="prev" id="prev"></div>
+  <div class="shine" id="shine"><i></i></div>
+  <div class="liquid" id="liquid"></div>
+  <div class="empty" id="empty">
+    <div class="empty__t" id="emptyT">弹簧诗行</div>
+    <div class="empty__s">等 一 句 诗 破 土 而 出</div>
+  </div>
+</div>
+<div class="vignette"></div>
+
+<div class="meta" id="meta">
+  <div class="meta__n" id="mN">—</div>
+  <div class="meta__a" id="mA">—</div>
+  <div class="meta__p"><i id="mBar"></i></div>
+  <div class="meta__t"><span id="mCur">0:00</span><span> / </span><span id="mDur">0:00</span></div>
+</div>
+
+<script>
+(function(){
+"use strict";
+
+/* 可选背景：DOM 形态走挂载层。背景层插在 .bg 之后，字层仍在它上面；
+   选自定义并加载成功后模块才隐藏原生 .bg，失败则原生背景照常显示。 */
+if (window.LIZI_BG) {
+  try { LIZI_BG.mountDOM(document.body, document.querySelector(".bg")); } catch (e) {}
+}
+
+/* ==========================================================
+   663 · 弹簧诗行
+   每字一条独立弹簧（阻尼谐振子，逐字错帧破土回弹），
+   五组空间构图随句轮换，字缘微光 + 液态高光条贴在壁纸背景上。
+   接线照 504/627 抄：init 拿歌词、tick 拿 Player.audio.currentTime、
+   rAF 主循环 + 本地 dt 插值；不建 AudioContext、不碰 audio 元素。
+   ========================================================== */
+
+/* ---------- 1) 自检口 ---------- */
+var S = { lines: [], idx: -1, t: 0, playing: true, frames: 0, js: 0, err: "" };
+var RM = false;
+try { RM = !!(window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches); } catch (e) {}
+
+window.__stage = function(){
+  var i = S.idx;
+  return {
+    lines:   S.lines.length,
+    idx:     i,
+    t:       S.t,
+    playing: S.playing,
+    frames:  S.frames,
+    js:      Math.round(S.js * 100) / 100,
+    err:     S.err,
+    text:    (i >= 0 && S.lines[i] && S.lines[i].text) ? String(S.lines[i].text) : "",
+    gl:      false,
+    rm:      RM
+  };
+};
+
+var lastErrAt = 0;
+function fail(e){
+  try { S.err = String((e && e.message) || e); } catch (_){ S.err = 'error'; }
+  var n = performance.now();
+  if (n - lastErrAt > 1000){ lastErrAt = n; try { console.error(e); } catch (_){} }
+}
+
+/* ---------- 2) ready —— 第一个 rAF 无条件发，全局只发一次 ---------- */
+var readySent = false;
+function sendReady(){
+  if (readySent) return;
+  readySent = true;
+  try { parent.postMessage({ __c100:1, type:"ready" }, "*"); } catch (e){ console.error(e); }
+}
+requestAnimationFrame(sendReady);
+setTimeout(sendReady, 800);
+
+/* ---------- 2.5) 设置面板（宿主画 UI，这里只声明；
+   custom-bg.js 的访问器会把 bg/scrim/bgpick 合并进来，不覆盖自有项） ---------- */
+window.__stagePanel = {
+  title: '弹簧诗行',
+  hint: '调完自动记住，切歌不变。构图每句轮换，也可固定某一组。',
+  items: [
+    { key:'comp',  label:'构图', type:'segment', def:'auto',
+      options:[{v:'auto',t:'随句轮换'},{v:'0',t:'① 中央横排'},{v:'1',t:'② 左上斜排'},
+               {v:'2',t:'③ 右下竖排'},{v:'3',t:'④ 弧形'},{v:'4',t:'⑤ 阶梯'}] },
+    { key:'scale', label:'字号', type:'range', min:0.8, max:1.4, step:0.05, def:1 },
+    { key:'spring',label:'弹簧硬度', type:'range', min:0.6, max:1.8, step:0.1, def:1 },
+    { key:'shine', label:'液态高光', type:'switch', def:true },
+    { key:'meta',  label:'左下歌曲信息', type:'switch', def:true }
+  ]
+};
+var P = { comp:'auto', scale:1, spring:1, shine:true, meta:true };
+
+/* ---------- 3) 工具 ---------- */
+function $(id){ return document.getElementById(id); }
+function clamp(v,a,b){ return v < a ? a : (v > b ? b : v); }
+function pad2(n){ return (n < 10 ? '0' : '') + n; }
+function mmss(s){
+  if (!isFinite(s) || s < 0) s = 0;
+  return Math.floor(s/60) + ':' + pad2(Math.floor(s%60));
+}
+function toRGB(a){
+  if (!Array.isArray(a) || a.length < 3) return null;
+  var r = Math.round(Number(a[0])), g = Math.round(Number(a[1])), b = Math.round(Number(a[2]));
+  if (!isFinite(r) || !isFinite(g) || !isFinite(b)) return null;
+  r = clamp(r,0,255)|0; g = clamp(g,0,255)|0; b = clamp(b,0,255)|0;
+  if (r + g + b < 26) return null;
+  return [r,g,b];
+}
+
+/* ---------- 4) 时间轴（照 627 的 lineTimes / idxAt 抄） ---------- */
+function lineTimes(line){
+  var arr = Array.from(line.text || ''), n = arr.length, out = [], i;
+  var cs = line.chars;
+  if (cs && cs.length){
+    var c0 = cs[0];
+    var rel = !!(c0 && isFinite(Number(c0.t)) && Number(c0.t) < line.t - 0.08);
+    for (i = 0; i < n; i++){
+      var j = cs.length === n ? i : Math.min(cs.length - 1, Math.floor(i * cs.length / n));
+      var rec = cs[j];
+      var ct = (rec && typeof rec === 'object') ? Number(rec.t) : NaN;
+      out.push(isFinite(ct) ? (rel ? line.t + ct : ct) : null);
+    }
+    return out;
+  }
+  var d = line.dur > 0 ? line.dur : 3.4;
+  for (i = 0; i < n; i++) out.push(line.t + d * 0.9 * i / Math.max(1, n));
+  return out;
+}
+function idxAt(t){
+  var a = S.lines, lo = 0, hi = a.length - 1, best = -1;
+  while (lo <= hi){
+    var m = (lo + hi) >> 1;
+    if (a[m].t <= t + 0.02){ best = m; lo = m + 1; } else hi = m - 1;
+  }
+  return best;
+}
+
+/* ---------- 5) 排版：五组空间构图 ---------- */
+var stageEl = $('stage'), prevEl = $('prev'), shineEl = $('shine'), liquidEl = $('liquid');
+var emptyEl = $('empty'), metaEl = $('meta');
+var mBar = $('mBar'), mCur = $('mCur'), mDur = $('mDur');
+var measureCtx = document.createElement('canvas').getContext('2d');
+var songDur = 0, fontPx = 56, lineGap = 0;
+var curLine = null;   /* { el, chars:[{el,x,y,rot,born,settled,...}], times, idx, comp, bbox } */
+var oldLines = [];
+var motes = [];
+
+function fontStr(px){ return '700 ' + px + 'px "SF Pro Text",-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif'; }
+function charW(ch, px){ measureCtx.font = fontStr(px); var w = measureCtx.measureText(ch).width; return (isFinite(w) && w > 0) ? w : px * 0.9; }
+
+function fit(){
+  var W = innerWidth || 1440, H = innerHeight || 900;
+  if (!isFinite(W) || W <= 0) W = 1440;
+  if (!isFinite(H) || H <= 0) H = 900;
+  /* 竖屏字小一点、横屏字大一点；字号上限保证长句不溢出 */
+  fontPx = clamp(Math.min(W, H) * 0.105, 30, 88) * P.scale;
+  lineGap = fontPx * 0.28;
+  if (curLine) layoutLine(curLine, true);
+}
+
+function compOf(idx){
+  if (P.comp !== 'auto'){
+    var v = parseInt(P.comp, 10);
+    if (isFinite(v) && v >= 0 && v <= 4) return v;
+  }
+  return ((idx % 5) + 5) % 5;
+}
+
+/* 按构图算每个字的落点（x,y,rot），单位 px，相对舞台左上角。
+   长句先按宽适配缩字：总宽超过视口 92% 就等比缩小本句字号再排，
+   保证整句始终在屏内（竖屏 390px 上 11 字句也不溢出）。
+   返回 bbox（含本句实际字号 fontPx）。 */
+function layoutChars(chars, comp, W, H, basePx){
+  var n = chars.length, i;
+  var fp = basePx, gap = fp * 0.28;
+  var widths = [], total = 0;
+  function measure(){
+    widths = []; total = 0;
+    for (var k = 0; k < n; k++){ widths[k] = charW(chars[k].ch, fp); total += widths[k]; }
+    total += gap * Math.max(0, n - 1);
+  }
+  measure();
+  if (total > W * 0.92 && total > 0){
+    fp = fp * (W * 0.92) / total;
+    gap = fp * 0.28;
+    measure();
+  }
+  var cx = W / 2, cy = H * 0.46;
+  var x, y;
+  if (comp === 0){
+    /* ① 中央横排 */
+    x = cx - total / 2; y = cy - fp / 2;
+    for (i = 0; i < n; i++){
+      chars[i].x = x; chars[i].y = y; chars[i].rot = 0;
+      x += widths[i] + gap;
+    }
+  } else if (comp === 1){
+    /* ② 左上斜排：从左上向右下爬升 -9° */
+    var ang = -9 * Math.PI / 180, step = total / Math.max(1, n);
+    var x0 = W * 0.10, y0 = H * 0.30;
+    for (i = 0; i < n; i++){
+      chars[i].x = x0 + Math.cos(ang) * step * i - widths[i] / 2;
+      chars[i].y = y0 + Math.sin(ang) * step * i - fp / 2;
+      chars[i].rot = -9;
+    }
+  } else if (comp === 2){
+    /* ③ 右下竖排：自上而下竖着排，落在右半区 */
+    x = W * 0.72; y = H * 0.20;
+    for (i = 0; i < n; i++){
+      chars[i].x = x - widths[i] / 2; chars[i].y = y; chars[i].rot = 0;
+      y += fp * 1.06;
+    }
+  } else if (comp === 3){
+    /* ④ 弧形：字沿一段上凸圆弧排布，切线方向旋转 */
+    var R = Math.max(W, H) * 0.62, span = Math.min(1.15, total / R);
+    var a0 = -span / 2;
+    for (i = 0; i < n; i++){
+      var fi = (n === 1) ? 0.5 : i / (n - 1);
+      var a = a0 + span * fi;
+      chars[i].x = cx + Math.sin(a) * R - widths[i] / 2;
+      chars[i].y = cy - fp / 2 - (Math.cos(a) - Math.cos(span / 2)) * R;
+      chars[i].rot = a * 180 / Math.PI * 0.9;
+    }
+  } else {
+    /* ⑤ 阶梯：每字上下错开一格，左右微摆 */
+    x = cx - total / 2; y = cy - fp / 2;
+    for (i = 0; i < n; i++){
+      chars[i].x = x;
+      chars[i].y = y + ((i % 2 === 0) ? -fp * 0.34 : fp * 0.34);
+      chars[i].rot = (i % 2 === 0) ? -4 : 4;
+      x += widths[i] + gap;
+    }
+  }
+  var minY = Infinity, maxY = -Infinity, minX = Infinity, maxX = -Infinity;
+  for (i = 0; i < n; i++){
+    minY = Math.min(minY, chars[i].y); maxY = Math.max(maxY, chars[i].y + fp);
+    minX = Math.min(minX, chars[i].x); maxX = Math.max(maxX, chars[i].x + widths[i]);
+  }
+  /* 适配后句宽 ≤ 92% 视口，左右不可能同时出界，if/else 足够；
+     上下同理：竖排超长时整体居中到 46% 高度处 */
+  var dx = 0, dy = 0;
+  if (minX < W * 0.04) dx = W * 0.04 - minX;
+  else if (maxX > W * 0.96) dx = W * 0.96 - maxX;
+  if (maxY - minY > H * 0.78) dy = H * 0.46 - (minY + maxY) / 2;
+  else if (minY < H * 0.08) dy = H * 0.08 - minY;
+  else if (maxY > H * 0.86) dy = H * 0.86 - maxY;
+  if (dx || dy) for (i = 0; i < n; i++){ chars[i].x += dx; chars[i].y += dy; }
+  return { minX: minX + dx, maxX: maxX + dx, minY: minY + dy, maxY: maxY + dy, fontPx: fp };
+}
+
+/* ---------- 6) 弹簧：每字一条独立阻尼谐振子 ---------- */
+/* 初始位移在落点下方（土里），初速度向上；k 硬度、c 阻尼取轻欠阻尼，
+   字会冲过落点再回弹 1–2 次才落定。逐字错帧：birth = 字时 + i*45ms。 */
+var STAGGER = 0.045;
+function makeSpring(){
+  return { x: 0, y: 0, vx: 0, vy: 0, born: false, settled: false, puffed: false, bornAt: 0 };
+}
+
+function buildLine(idx){
+  var line = S.lines[idx];
+  if (!line) return null;
+  var comp = compOf(idx);
+  var el = document.createElement('div');
+  el.className = 'line comp-' + comp;
+  var chars = Array.from(line.text || '');
+  var times = lineTimes(line);
+  var W = innerWidth || 1440, H = innerHeight || 900;
+  var objs = [];
+  for (var i = 0; i < chars.length; i++){
+    var sp = document.createElement('span');
+    sp.className = 'ch';
+    sp.textContent = chars[i] === ' ' ? '\u00A0' : chars[i];
+    var core = document.createElement('span');
+    core.className = 'core';
+    core.textContent = sp.textContent;
+    sp.appendChild(core);
+    el.appendChild(sp);
+    var s = makeSpring();
+    s.bornAt = (times[i] != null ? times[i] : line.t) + i * STAGGER;
+    /* 破土初态：在落点下方 34–58% 视口高处，带一点横向散开 */
+    s.y = H * (0.34 + ((i * 37) % 100) / 100 * 0.24);
+    s.x = ((i * 53) % 100 - 50) * 0.4;
+    s.vy = -H * (0.55 + ((i * 29) % 100) / 100 * 0.25);
+    s.vx = ((i * 41) % 100 - 50) * 0.9;
+    objs.push({ el: sp, ch: chars[i], t: times[i], spr: s });
+  }
+  stageEl.appendChild(el);
+  var bbox = layoutChars(objs, comp, W, H, fontPx);
+  var out = { el: el, chars: objs, times: times, idx: idx, comp: comp, bbox: bbox, fontPx: bbox.fontPx, line: line };
+  for (var fs = 0; fs < objs.length; fs++) objs[fs].el.style.fontSize = bbox.fontPx + 'px';
+  /* 已过出生时间的字：直接落定（seek / 切歌中途进场不补播整段弹簧） */
+  for (var j = 0; j < objs.length; j++){
+    if (S.t >= objs[j].spr.bornAt + 0.9){
+      objs[j].spr.born = true; objs[j].spr.settled = true;
+      objs[j].spr.x = 0; objs[j].spr.y = 0; objs[j].spr.vx = 0; objs[j].spr.vy = 0;
+    }
+  }
+  return out;
+}
+
+function retireLine(l){
+  if (!l) return;
+  l.el.classList.add('old');
+  oldLines.push(l);
+  setTimeout(function(){
+    if (l.el.parentNode) l.el.parentNode.removeChild(l.el);
+    var k = oldLines.indexOf(l);
+    if (k >= 0) oldLines.splice(k, 1);
+  }, 1000);
+}
+
+function setIdx(i){
+  if (i === S.idx && curLine) return;
+  var prevIdx = S.idx;
+  S.idx = i;
+  if (curLine) retireLine(curLine);
+  curLine = null;
+  if (i >= 0 && S.lines[i] && S.lines[i].text){
+    curLine = buildLine(i);
+    if (prevIdx >= 0 && S.lines[prevIdx] && S.lines[prevIdx].text){
+      prevEl.textContent = S.lines[prevIdx].text;
+      prevEl.style.top = Math.round((innerHeight || 900) * 0.72) + 'px';
+      prevEl.style.opacity = '1';
+    }
+  }
+  emptyEl.classList.toggle('on', S.lines.length === 0);
+}
+
+function layoutLine(l, refit){
+  if (!l) return;
+  var W = innerWidth || 1440, H = innerHeight || 900;
+  l.bbox = layoutChars(l.chars, l.comp, W, H, fontPx);
+  l.fontPx = l.bbox.fontPx;
+  for (var i = 0; i < l.chars.length; i++){
+    l.chars[i].el.style.fontSize = l.fontPx + 'px';
+    if (l.chars[i].spr.settled){
+      l.chars[i].el.style.transform =
+        'translate(' + l.chars[i].x.toFixed(1) + 'px,' + l.chars[i].y.toFixed(1) + 'px) rotate(' + l.chars[i].rot + 'deg)';
+      l.chars[i].el.style.opacity = '1';
+    }
+  }
+  if (refit) positionFx(l);
+}
+
+/* ---------- 7) 破土尘 ---------- */
+function puff(x, y){
+  if (RM) return;
+  if (motes.length > 40) return;
+  var m = document.createElement('div');
+  m.className = 'mote';
+  m.style.left = x + 'px';
+  m.style.top = y + 'px';
+  stageEl.appendChild(m);
+  motes.push({ el: m, t: 0, vx: (Math.random() - 0.5) * 46, vy: -(18 + Math.random() * 30) });
+}
+
+/* ---------- 8) 液态高光条 + 跟唱进度 ---------- */
+var liveLevel = 0, beatKick = 0;
+function positionFx(l){
+  if (!l || !l.bbox) return;
+  var b = l.bbox;
+  var fp = l.fontPx || fontPx;
+  var padX = fp * 0.35, padY = fp * 0.22;
+  shineEl.style.left = (b.minX - padX) + 'px';
+  shineEl.style.top = (b.minY - padY) + 'px';
+  shineEl.style.width = Math.max(40, b.maxX - b.minX + padX * 2) + 'px';
+  shineEl.style.height = Math.max(24, b.maxY - b.minY + padY * 2) + 'px';
+  shineEl.classList.toggle('on', P.shine && !!l);
+  liquidEl.style.left = (b.minX - padX * 0.5) + 'px';
+  liquidEl.style.top = (b.maxY + fp * 0.30) + 'px';
+  liquidEl.style.width = Math.max(40, b.maxX - b.minX + padX) + 'px';
+  liquidEl.classList.toggle('on', P.shine && !!l);
+  shineEl.style.opacity = P.shine ? String(0.55 + liveLevel * 0.45 + beatKick * 0.3) : '0';
+}
+
+/* ---------- 9) 宿主消息 ---------- */
+function setAccent(a){
+  var c = toRGB(a) || [150, 165, 255];
+  document.documentElement.style.setProperty('--ac', c[0] + ',' + c[1] + ',' + c[2]);
+}
+function onInit(p){
+  p = (p && typeof p === 'object') ? p : {};
+  var song = (p.song && typeof p.song === 'object') ? p.song : {};
+  var name = (song.name == null) ? '' : String(song.name).trim();
+  if (!name) name = '未知歌曲';
+  var ar = song.artists;
+  if (Array.isArray(ar)){
+    ar = ar.filter(function(x){ return x != null && String(x).trim(); })
+           .map(function(x){ return String(x).trim(); }).join(' / ');
+  } else {
+    ar = (ar == null) ? '' : String(ar).trim();
+  }
+  if (!ar) ar = '未知歌手';
+  setAccent(p.accent);
+  $('mN').textContent = name;
+  $('mA').textContent = ar;
+  $('emptyT').textContent = name;
+  metaEl.classList.add('on');
+  syncMeta();
+  var dur = Number(p.duration);
+  songDur = (isFinite(dur) && dur > 0) ? dur : 0;
+  $('mDur').textContent = songDur ? mmss(songDur) : '—';
+  S.lines = (Array.isArray(p.lines) ? p.lines : [])
+    .filter(function(l){ return l && typeof l === 'object'; })
+    .map(function(l){
+      var t = Number(l.t), du = Number(l.dur);
+      return {
+        t: isFinite(t) ? t : 0,
+        dur: isFinite(du) ? du : 0,
+        text: (l.text == null) ? '' : String(l.text),
+        chars: (Array.isArray(l.chars) && l.chars.length) ? l.chars : null
+      };
+    })
+    .sort(function(a, b){ return a.t - b.t; });
+  S.playing = (typeof p.playing === 'boolean') ? p.playing : true;
+  if (curLine){ retireLine(curLine); curLine = null; }
+  prevEl.style.opacity = '0';
+  S.idx = -1;
+  setIdx(idxAt(S.t));
+  S.err = '';
+}
+function onSetting(p){
+  if (!p || typeof p.key !== 'string') return;
+  var k = p.key, v = p.value;
+  /* bg / scrim / bgpick 归 custom-bg.js 自己处理，这里不抢 */
+  if (k === 'bg' || k === 'scrim' || k === 'bgpick') return;
+  if (k === 'comp'){ P.comp = v; if (curLine){ retireLine(curLine); curLine = null; S.idx = -1; setIdx(idxAt(S.t)); } }
+  else if (k === 'scale'){ var sv = Number(v); P.scale = isFinite(sv) ? clamp(sv, 0.5, 2) : 1; fit(); }
+  else if (k === 'spring'){ var pv = Number(v); P.spring = isFinite(pv) ? clamp(pv, 0.3, 2.5) : 1; }
+  else if (k === 'shine'){ P.shine = !!v; if (curLine) positionFx(curLine); }
+  else if (k === 'meta'){ P.meta = !!v; syncMeta(); }
+}
+function syncMeta(){
+  metaEl.style.opacity = P.meta ? '1' : '0';
+}
+
+addEventListener("message", function(ev){
+  var d = ev.data;
+  if (!d || d.__c100 !== 1) return;
+  var p = d.payload || {};
+  try {
+    if (d.type === "init"){
+      onInit(p);
+    } else if (d.type === "tick"){
+      var t = Number(p.time);
+      if (isFinite(t)) S.t = t;                        /* 无条件采纳，只挡 NaN/Infinity */
+      if (typeof p.playing === 'boolean') S.playing = p.playing;
+    } else if (d.type === "beat"){
+      var lv = Number(p.level);
+      if (!isFinite(lv)) lv = 0.5;
+      lv = clamp(lv, 0, 1);
+      if (!S.playing) return;
+      beatKick = Math.max(beatKick, lv);
+      /* 鼓点给还没落定的字一记向上的轻推 */
+      if (curLine && !RM){
+        for (var i = 0; i < curLine.chars.length; i++){
+          var s = curLine.chars[i].spr;
+          if (s.born && !s.settled) s.vy -= 26 * lv;
+        }
+      }
+    } else if (d.type === "live"){
+      var l2 = Number(p.level);
+      liveLevel = isFinite(l2) ? clamp(l2, 0, 1) : 0;
+    } else if (d.type === "setting"){
+      onSetting(p);
+    }
+  } catch (e){ fail(e); }
+});
+
+addEventListener("mousemove", function(){
+  try { parent.postMessage({ __c100:1, type:'activity' }, '*'); } catch (e){}
+}, { passive:true });
+addEventListener("keydown", function(e){
+  if (e.code === 'Space' || e.key === ' '){
+    e.preventDefault();
+    try { parent.postMessage({ __c100:1, type:'key', payload:{ key:'Space' } }, '*'); } catch (_){}
+  }
+});
+
+/* ---------- 10) 主循环：弹簧积分 + 逐字点亮 + 高光跟唱 ---------- */
+var lastNow = performance.now();
+var lastMetaT = 0, lastBar = -1;
+
+function stepSprings(dt){
+  if (!curLine) return;
+  /* 轻欠阻尼：k≈150·硬度，c≈11·√硬度 —— 冲过落点回弹 1–2 次 */
+  var k = 150 * P.spring, c = 11 * Math.sqrt(P.spring);
+  var H = innerHeight || 900;
+  var chars = curLine.chars, i, o, s;
+  for (i = 0; i < chars.length; i++){
+    o = chars[i]; s = o.spr;
+    if (!s.born){
+      if (S.t < s.bornAt) continue;
+      s.born = true;
+      if (RM){ s.settled = true; s.x = 0; s.y = 0; s.vx = 0; s.vy = 0; }
+    }
+    if (s.settled) continue;
+    /* 半隐式欧拉：a = -k·x - c·v（x,y 各自独立弹簧 = 每字一条独立弹簧） */
+    s.vx += (-k * s.x - c * s.vx) * dt;
+    s.vy += (-k * s.y - c * s.vy) * dt;
+    s.x += s.vx * dt;
+    s.y += s.vy * dt;
+    if (Math.abs(s.x) < 0.6 && Math.abs(s.y) < 0.6 && Math.abs(s.vx) < 14 && Math.abs(s.vy) < 14){
+      s.x = 0; s.y = 0; s.vx = 0; s.vy = 0; s.settled = true;
+      if (!s.puffed){ s.puffed = true; puff(o.x + (curLine.fontPx || fontPx) * 0.5, o.y + (curLine.fontPx || fontPx) * 0.92); }
+    }
+  }
+}
+
+function paintChars(){
+  if (!curLine) return;
+  var chars = curLine.chars, i, o, s, op;
+  for (i = 0; i < chars.length; i++){
+    o = chars[i]; s = o.spr;
+    if (!s.born){
+      o.el.style.opacity = '0';
+      continue;
+    }
+    /* 未落定时按位移淡入（离土越近越实），落定后全亮；唱到的字加 .sung 芯光 */
+    op = s.settled ? 1 : clamp(1 - Math.abs(s.y) / ((innerHeight || 900) * 0.5), 0.12, 1);
+    o.el.style.opacity = op.toFixed(3);
+    o.el.style.transform =
+      'translate(' + (o.x + s.x).toFixed(1) + 'px,' + (o.y + s.y).toFixed(1) + 'px)' +
+      ' rotate(' + (o.rot + s.x * 0.02).toFixed(2) + 'deg)';
+    var sung = (o.t != null) ? (S.t >= o.t) : s.settled;
+    if (o.__sung !== sung){
+      o.__sung = sung;
+      o.el.classList.toggle('sung', sung);
+    }
+  }
+}
+
+function frame(now){
+  var js0 = performance.now();
+  try {
+    var dt = (now - lastNow) / 1000;
+    lastNow = now;
+    if (!isFinite(dt) || dt < 0) dt = 0;
+    if (dt > 0.05) dt = 0.05;
+    if (S.playing) S.t += dt;
+    beatKick = Math.max(0, beatKick - dt * 2.2);
+
+    var i = idxAt(S.t);
+    if (i !== S.idx) setIdx(i);
+    if (curLine){
+      stepSprings(dt);
+      paintChars();
+      /* 液态底线宽度 = 本句已唱字数占比 */
+      var n = curLine.chars.length, sung = 0, j;
+      for (j = 0; j < n; j++) if (curLine.chars[j].__sung) sung++;
+      var pr = n ? sung / n : 0;
+      liquidEl.style.transform = 'scaleX(' + pr.toFixed(3) + ')';
+      positionFx(curLine);
+    } else {
+      shineEl.classList.remove('on');
+      liquidEl.classList.remove('on');
+    }
+
+    /* 破土尘 */
+    for (var m = motes.length - 1; m >= 0; m--){
+      var mo = motes[m];
+      mo.t += dt;
+      if (mo.t > 0.55){
+        if (mo.el.parentNode) mo.el.parentNode.removeChild(mo.el);
+        motes.splice(m, 1);
+        continue;
+      }
+      var mx = parseFloat(mo.el.style.left) + mo.vx * dt;
+      var my = parseFloat(mo.el.style.top) + mo.vy * dt;
+      mo.vy += 60 * dt;
+      mo.el.style.left = mx.toFixed(1) + 'px';
+      mo.el.style.top = my.toFixed(1) + 'px';
+      mo.el.style.opacity = String(Math.max(0, 0.9 - mo.t * 1.6).toFixed(2));
+    }
+
+    if (songDur > 0){
+      var p = clamp(S.t / songDur, 0, 1);
+      if (Math.abs(p - lastBar) > 0.0012){
+        lastBar = p;
+        mBar.style.transform = 'scaleX(' + p.toFixed(4) + ')';
+      }
+    }
+    if (now - lastMetaT > 260){
+      lastMetaT = now;
+      mCur.textContent = mmss(S.t);
+    }
+
+    S.frames++;
+  } catch (e){ fail(e); }
+  S.js = performance.now() - js0;
+  requestAnimationFrame(frame);
+}
+
+/* ---------- 11) 启动 ---------- */
+fit();
+addEventListener("resize", fit);
+requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>

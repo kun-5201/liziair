@@ -804,8 +804,14 @@ const Player = (() => {
           reason = '';
           preview = false;
           via = 'lx';
+        } else if (lx && lx.code !== 0 && lx.code !== undefined) {
+          // LX 探活结果记诊断：零自定义源时 code=2「全部音源均失败」是常态，
+          // 每首记一条，正好证明 LX 腿跑过且让路给了平台备用。
+          postDiagAudio(`LX 取链失败：source=${src} id=${track.id ?? track.mid ?? track.hash ?? ''} code=${lx.code} ${lx.error || ''}`);
         }
-      } catch { /* LX 失败就走平台接口 */ }
+      } catch (e) {
+        postDiagAudio(`LX 取链异常：source=${src} id=${track.id ?? track.mid ?? track.hash ?? ''} ${String((e && e.message) || e)}`);
+      }
     }
 
     if (!url) try {
@@ -846,6 +852,7 @@ const Player = (() => {
     if (!url) {
       demo = true;
       url = makeDemoTrack(40, track.id);
+      postDiagAudio(`平台无地址，走演示音：source=${src} id=${track.id ?? track.mid ?? track.hash ?? ''} reason=${reason || 'unavailable'}`);
     }
     return { url, demo, reason, preview, clipStartMs, lxQuality, via: demo ? 'demo' : via };
   }
@@ -879,6 +886,20 @@ const Player = (() => {
       emit('playstate', false);
       return false;
     }
+  }
+
+  /** 诊断上报（与 B 专员约定的接口）：POST /api/diag/log {category:"audio", message}。
+   *  B 的路由还没好时服务端回 404，前端 fire-and-forget、静默吞掉，绝不能影响播放。
+   *  message 只含 MediaError 码 / 上游 host / 状态机 / 原因码，不带直链 query（vkey 之类不进日志）。 */
+  function postDiagAudio(message) {
+    try {
+      fetch('/api/diag/log', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ category: 'audio', message: String(message || '').slice(0, 500) }),
+        keepalive: true,
+      }).catch(() => {});
+    } catch { /* 诊断不上报不能影响播放 */ }
   }
 
   /** <audio> 报错时的真实原因（原来 sourceerror 只发 {}，界面除了「播放失败」
@@ -1143,12 +1164,17 @@ const Player = (() => {
       // 旧行为只发 {}，界面和日志都看不到原因；现在把真实原因带出去。
       if (state.lastFetch && state.lastFetch.via === 'lx' && state.lastFetch.token === state.token) {
         console.warn('[player] LX 地址播放失败，改走平台备用：', detail);
+        postDiagAudio(`LX 地址播放失败，改走平台备用：code=${detail.code} host=${detail.host} ns=${detail.networkState} rs=${detail.readyState}`);
         retryWithPlatform(state.lastFetch.track, state.lastFetch.token).then((ok) => {
-          if (!ok) emit('sourceerror', detail);
+          if (!ok) {
+            postDiagAudio(`平台备用重试失败：code=${detail.code} host=${detail.host} ns=${detail.networkState} rs=${detail.readyState}`);
+            emit('sourceerror', detail);
+          }
         });
         return;
       }
       console.warn('[player] 播放失败：', detail);
+      postDiagAudio(`播放失败：code=${detail.code} host=${detail.host} ns=${detail.networkState} rs=${detail.readyState} via=${(state.lastFetch && state.lastFetch.via) || ''}`);
       emit('sourceerror', detail);
     });
   }

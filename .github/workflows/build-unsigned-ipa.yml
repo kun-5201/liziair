@@ -21,6 +21,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 构建信息（第 6 轮）：把 commit / 构建号 / 日期写进 public/version.json，
+      # 前端设置页「关于 → 构建」显示 commit 短 hash，真机排障先看这里对 hash。
+      # 文件只在构建机上生成，不进 git 提交（前端读不到时显示「未知构建」）。
+      - name: Write build version info
+        run: |
+          printf '{"commit":"%s","build":"%s","date":"%s"}\n' \
+            "$GITHUB_SHA" "$GITHUB_RUN_NUMBER" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > public/version.json
+          cat public/version.json
+          # Cache-bust 核心前端文件：WKWebView 升级安装后缓存保留旧 JS，
+          # 服务端 no-store 只对新响应生效，旧缓存条目不经服务端直接命中；
+          # 带 commit 的 URL 才能让升级后的首次加载必走新文件。
+          # __BUILD__ 占位只在构建机上替换成 commit，不进 git 提交。
+          sed -i '' "s/__BUILD__/$GITHUB_SHA/g" public/index.html public/m/index.html
+          grep -o 'api.js?v=[0-9a-f]*' public/index.html | head -1
+
       # project.yml 是唯一事实来源（XcodeGen）；重新生成 Xcode 工程，
       # 保证 archive 包含 project.yml 里的全部 target 与资源。
       - name: Generate Xcode project (XcodeGen)
@@ -52,6 +68,8 @@ jobs:
           test -d "$APP_PATH/public" || { echo "::error::public/ missing in app bundle"; exit 1; }
           ls "$APP_PATH/public" | head
           test -f "$APP_PATH/public/index.html" || { echo "::error::public/index.html missing"; exit 1; }
+          test -f "$APP_PATH/public/version.json" || { echo "::error::public/version.json missing (build step did not write it)"; exit 1; }
+          cat "$APP_PATH/public/version.json"
           du -sh "$APP_PATH/public"
           echo "--- bundle id / arch ---"
           /usr/libexec/PlistBuddy -c "Print CFBundleIdentifier" "$APP_PATH/Info.plist"

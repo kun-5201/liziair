@@ -10,7 +10,7 @@
 <link rel="stylesheet" href="assets/liquid-glass.css">
 <link rel="stylesheet" href="tokens.css">
     <link rel="stylesheet" href="win-controls.css">
-<link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="app.css?v=__BUILD__">
 <!-- 开场引导：景深 + 粒子指路的独立一层，样式全在 onboard.css，不往 app.css 里加东西 -->
 <link rel="stylesheet" href="onboard.css">
 <!-- 歌单搬运：工具箱里那一项，浮层自己注入，样式独立 -->
@@ -1149,6 +1149,21 @@ python -c "from pedalboard import load_plugin; p=load_plugin(r'C:\Program Files\
              window.__liziNative 存在时取消 hidden） -->
         <button class="setpage__checkupd" id="set-check-update" type="button" hidden>检查更新</button>
       </div>
+      <!-- 构建（第 6 轮）：构建机把 commit 写进 public/version.json，app.js 读出来显示；
+           读不到（本地开发 / 旧包）就显示「未知构建」。真机排障先看这里：hash 对不上
+           最新构建 = 手机上的 JS 还是旧缓存。 -->
+      <div class="setpage__row">
+        <span class="setpage__label">构建</span>
+        <span class="setpage__val" id="set-app-build">未知构建</span>
+      </div>
+      <!-- 诊断日志（第 6 轮）：点「查看」拉 /api/diag/search（最近请求 + 事件 + 封面/
+           音频/探活日志），「复制」进剪贴板；封面失败会记 host + 原因 + 栏位。 -->
+      <div class="setpage__row">
+        <span class="setpage__label">诊断日志</span>
+        <button class="setpage__checkupd" id="set-diag-view" type="button">查看</button>
+        <button class="setpage__checkupd" id="set-diag-copy" type="button">复制</button>
+      </div>
+      <pre id="set-diag-log" hidden style="box-sizing:border-box;width:100%;max-height:220px;overflow:auto;margin:0;padding:8px 10px;border-radius:10px;background:oklch(100% 0 0 / 0.55);font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--ink-3);text-align:left;white-space:pre-wrap;word-break:break-all;"></pre>
       <!-- QQ 群：点整行走 app.js 的 openExternal（桌面交给系统浏览器，安卓走原生桥） -->
       <button class="setpage__row" id="set-qq-group" type="button"
               aria-label="加入 QQ 群：LIZI用户体验群，群号 724899514">
@@ -1710,16 +1725,16 @@ python -c "from pedalboard import load_plugin; p=load_plugin(r'C:\Program Files\
 <script src="hall/circular-carousel.js" defer></script>
 <link rel="stylesheet" href="hall/canvas-reveal.css">
 <script src="hall/canvas-reveal.js"></script>
-<script src="api.js"></script>
+<script src="api.js?v=__BUILD__"></script>
 <!-- 大厅「我的」卡的多平台账号注册表：加平台只改这个文件（接法见文件头注释） -->
 <script src="hall/accounts.js"></script>
 <script src="beat.js"></script>
 <script src="audio/eq-engine.js"></script>
 <script src="audio/eq-ui.js"></script>
 <script src="audio/glide.js" defer></script>
-<script src="player.js"></script>
+<script src="player.js?v=__BUILD__"></script>
 <script src="hall/option-wheel.js"></script>
-<script src="app.js"></script>
+<script src="app.js?v=__BUILD__"></script>
 <script src="ar-pair.js" defer></script>
 <!-- F5 歌声延迟面板：全局一个偏移量，作用于所有舞台的 tick.time -->
 <script src="lyric-delay.js" defer></script>

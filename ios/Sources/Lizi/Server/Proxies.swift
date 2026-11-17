@@ -52,32 +52,69 @@ enum Proxies {
         guard let host = url.host, imageHostAllowed(host) else {
             return .json(403, ["error": "host not allowed"])
         }
-        do {
-            var request = URLRequest(url: url, timeoutInterval: 20)
-            request.setValue("https://music.163.com/", forHTTPHeaderField: "Referer")
-            request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
-            let (data, resp) = try await URLSession.shared.data(for: request)
-            guard let http = resp as? HTTPURLResponse else {
-                return .error(502, "no http response")
+        // http → https：imge.kugou.com / p*.music.126.net 都支持 https（curl 实测 200），
+        // 明文上游在个别网络下会被运营商透明代理干扰，https 更稳；其余 host 不动
+        //（酷我等没验证过 https 是否等价，不乱升）。
+        var fetchURL = url
+        if url.scheme == "http" {
+            let h = host.lowercased()
+            if h.hasSuffix(".kugou.com") || h.hasSuffix(".music.126.net") {
+                var comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
+                comps?.scheme = "https"
+                if let u = comps?.url { fetchURL = u }
             }
-            // 跟随重定向后，再校验一次最终 URL 的 host。
-            if let finalURL = http.url, let finalHost = finalURL.host, !imageHostAllowed(finalHost) {
-                return .json(403, ["error": "redirect host not allowed"])
-            }
-            let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? "image/jpeg"
-            guard contentType.hasPrefix("image/") else {
-                return .json(415, ["error": "not an image"])
-            }
-            if data.count > 10 * 1024 * 1024 {
-                return .json(413, ["error": "image too large"])
-            }
-            return HttpResponse(status: http.statusCode, headers: [
-                "Content-Type": contentType,
-                "Cache-Control": "public, max-age=86400",
-            ], body: data)
-        } catch {
-            return .error(502, String(describing: error))
         }
+        let started = Date()
+        // 网络错 / 超时重试一次（10s 超时 × 2 次，总上限 ~20s，和原来单次 20s 相当）；
+        // 上游 HTTP 错误（403/404 等）不重试，直接记日志回 502。
+        var lastError: Error?
+        for _ in 0..<2 {
+            do {
+                var request = URLRequest(url: fetchURL, timeoutInterval: 10)
+                let ref = imageReferer(host)
+                if !ref.isEmpty {
+                    request.setValue(ref, forHTTPHeaderField: "Referer")
+                }
+                request.setValue(imageUA, forHTTPHeaderField: "User-Agent")
+                let (data, resp) = try await URLSession.shared.data(for: request)
+                guard let http = resp as? HTTPURLResponse else {
+                    return .error(502, "no http response")
+                }
+                // 跟随重定向后，再校验一次最终 URL 的 host。
+                if let finalURL = http.url, let finalHost = finalURL.host, !imageHostAllowed(finalHost) {
+                    return .json(403, ["error": "redirect host not allowed"])
+                }
+                // 先判状态再判 Content-Type：上游 403 常回 HTML 错误页，旧代码
+                // 会报 415「not an image」，掩盖真实原因；现在直接记上游状态。
+                guard (200..<300).contains(http.statusCode) else {
+                    let ms = Int(Date().timeIntervalSince(started) * 1000)
+                    DiagLog.shared.recordLog(category: "cover",
+                        message: "img proxy \(host) upstream HTTP \(http.statusCode) (\(ms)ms)",
+                        fields: ["host": host, "reason": "proxy-status-\(http.statusCode)", "code": http.statusCode, "lane": "proxy"])
+                    return .error(502, "上游 \(host) 返回 HTTP \(http.statusCode)")
+                }
+                let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? "image/jpeg"
+                guard contentType.hasPrefix("image/") else {
+                    return .json(415, ["error": "not an image"])
+                }
+                if data.count > 10 * 1024 * 1024 {
+                    return .json(413, ["error": "image too large"])
+                }
+                return HttpResponse(status: http.statusCode, headers: [
+                    "Content-Type": contentType,
+                    "Cache-Control": "public, max-age=86400",
+                ], body: data)
+            } catch {
+                lastError = error
+                continue
+            }
+        }
+        let ms = Int(Date().timeIntervalSince(started) * 1000)
+        let errText = lastError.map { String(describing: $0) } ?? "unknown error"
+        DiagLog.shared.recordLog(category: "cover",
+            message: "img proxy \(host) fetch failed (\(ms)ms): \(errText)",
+            fields: ["host": host, "reason": "proxy-error", "lane": "proxy"])
+        return .error(502, errText)
     }
 
     private static let imageHostsExact: Set<String> = [
@@ -96,27 +133,94 @@ enum Proxies {
         return imageHostSuffixes.contains { h.hasSuffix($0) }
     }
 
+    /// 封面代理的完整浏览器 UA：裸 "Mozilla/5.0" 在个别 CDN 边缘节点会被当成
+    /// 非浏览器流量；发完整 UA 更稳。
+    private static let imageUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+    /// 各家封面 CDN 的 Referer（第 6 轮）：旧代码不管哪家都发 music.163.com，
+    /// 对酷狗/QQ/酷我属于外站 Referer，个别边缘节点会按防盗链拦掉。
+    /// 本机 curl 上四家 Referer 全回 200（见轮次报告），但边缘节点行为可能
+    /// 按地域不同，这里按各家官网发；返回 "" 表示不发 Referer（空 Referer 各家都放行）。
+    private static func imageReferer(_ host: String) -> String {
+        let h = host.lowercased()
+        if h.hasSuffix(".music.126.net") { return "https://music.163.com/" }
+        if h.hasSuffix(".kugou.com") { return "https://www.kugou.com/" }
+        if h == "y.gtimg.cn" || h.hasSuffix(".y.qq.com") || h.hasSuffix(".qpic.cn")
+            || h.hasSuffix(".qlogo.cn") || h == "music-file.y.qq.com" || h == "qpic.y.qq.com" {
+            return "https://y.qq.com/"
+        }
+        if h.hasSuffix(".kuwo.cn") || h.hasSuffix(".kuwo.com") { return "https://www.kuwo.cn/" }
+        return ""
+    }
+
     /// 2xx 回包的音频校验：上游对坏地址有时回 200 + HTML 错误页（被截断的
     /// PHP 地址、过期 vkey 的 403 页），原样透传给 <audio> 只会让播放器
     /// 解码失败、界面静默无声。2xx 时要求 Content-Type 是音频（audio/*、
     /// video/*、application/octet-stream——酷狗 FLAC 就回这个；206 分片
     /// 缺 Content-Type 也认），且正文非空；否则返回错误文案，由调用方
     /// 换 502 让播放器快速失败、走平台备用重试。非 2xx 原样透传不动。
-    private static func audioBodyError(status: Int, data: Data, contentType: String?) -> String? {
+    /// 兜底（2026-11-18 实测）：Content-Type 不可信时看文件头——QQ 试听
+    /// aqqmusic.tc.qq.com 把真 MP3 标成 application/x-www-form-urlencoded
+    /// （正文 FF FB 帧同步）；小分片（iOS AVFoundation 常先发 Range:
+    /// bytes=0-1 探针，2 字节无法嗅探）看 URL 后缀，且 CT 不是错误页
+    /// 类型（text/*、json、xml）时才放行。
+    private static func audioBodyError(status: Int, data: Data, contentType: String?, url: URL?) -> String? {
         guard (200..<300).contains(status) else { return nil }
         if data.isEmpty { return "上游返回空音频（HTTP \(status)）" }
         let ct = (contentType ?? "").lowercased()
         let audioCT = ct.hasPrefix("audio/") || ct.hasPrefix("video/")
             || ct == "application/octet-stream" || ct == "binary/octet-stream"
         if !audioCT && !(status == 206 && ct.isEmpty) {
+            if looksLikeAudio(data) != nil { return nil }
+            if let url, audioExtensionMIME(url) != nil,
+               !ct.hasPrefix("text/") && !ct.contains("json") && !ct.contains("xml") {
+                return nil
+            }
             return "上游返回的不是音频（HTTP \(status)，Content-Type: \(ct.isEmpty ? "缺失" : ct)）"
         }
         return nil
     }
 
+    /// 文件头嗅探：返回嗅到的音频 MIME，嗅不到返回 nil。
+    /// MP3（ID3 或 FF Ex 帧同步）、FLAC（fLaC）、MP4/M4A（ftyp）、OGG（OggS）。
+    private static func looksLikeAudio(_ data: Data) -> String? {
+        guard data.count >= 4 else { return nil }
+        let b = [UInt8](data.prefix(12))
+        if b[0] == 0x49 && b[1] == 0x44 && b[2] == 0x33 { return "audio/mpeg" }
+        if b[0] == 0xFF && (b[1] & 0xE0) == 0xE0 { return "audio/mpeg" }
+        if b[0] == 0x66 && b[1] == 0x4C && b[2] == 0x61 && b[3] == 0x43 { return "audio/flac" }
+        if b.count >= 8 && b[4] == 0x66 && b[5] == 0x74 && b[6] == 0x79 && b[7] == 0x70 { return "audio/mp4" }
+        if b[0] == 0x4F && b[1] == 0x67 && b[2] == 0x67 && b[3] == 0x53 { return "audio/ogg" }
+        return nil
+    }
+
+    /// 按 URL 后缀给 MIME（小分片探针用）。
+    private static func audioExtensionMIME(_ url: URL) -> String? {
+        switch url.pathExtension.lowercased() {
+        case "mp3": return "audio/mpeg"
+        case "flac": return "audio/flac"
+        case "m4a": return "audio/mp4"
+        case "aac": return "audio/aac"
+        case "ogg", "oga": return "audio/ogg"
+        case "wav": return "audio/wav"
+        default: return nil
+        }
+    }
+
+    /// 下行 Content-Type：上游已是音频 CT 就原样透传；否则用嗅探结果，
+    /// 嗅不到（小分片）用 URL 后缀，再不行才用上游原值。
+    private static func outgoingAudioContentType(data: Data, url: URL, upstreamCT: String?) -> String {
+        let ct = (upstreamCT ?? "").lowercased()
+        if ct.hasPrefix("audio/") || ct.hasPrefix("video/")
+            || ct == "application/octet-stream" || ct == "binary/octet-stream" {
+            return upstreamCT ?? "audio/mpeg"
+        }
+        return looksLikeAudio(data) ?? audioExtensionMIME(url) ?? upstreamCT ?? "audio/mpeg"
+    }
+
     /// /api/<source>/audio?url=：音频代理，转发 Range，返回上游状态码原样。
     static func proxySourceAudio(_ req: HttpRequest, source: String) async -> HttpResponse {
-        guard let raw = req.query["url"], let url = URL(string: raw),
+        guard let raw = req.query["url"], let url = Upstream.url(from: raw),
               let host = url.host,
               (url.scheme == "http" || url.scheme == "https") else {
             return .error(400, "bad url")
@@ -132,11 +236,11 @@ enum Proxies {
             do {
                 let (data, http) = try await Upstream.fetch(url, headers: headers, timeout: 30)
                 if let err = audioBodyError(status: http.statusCode, data: data,
-                                            contentType: http.value(forHTTPHeaderField: "Content-Type")) {
+                                            contentType: http.value(forHTTPHeaderField: "Content-Type"), url: url) {
                     return .error(502, err)
                 }
                 var out: [String: String] = [
-                    "Content-Type": http.value(forHTTPHeaderField: "Content-Type") ?? "audio/mpeg",
+                    "Content-Type": outgoingAudioContentType(data: data, url: url, upstreamCT: http.value(forHTTPHeaderField: "Content-Type")),
                     "Cache-Control": "no-store",
                     "Accept-Ranges": "bytes",
                 ]
@@ -161,11 +265,11 @@ enum Proxies {
         do {
             let (data, http) = try await Upstream.fetch(url, headers: headers, timeout: 30)
             if let err = audioBodyError(status: http.statusCode, data: data,
-                                        contentType: http.value(forHTTPHeaderField: "Content-Type")) {
+                                        contentType: http.value(forHTTPHeaderField: "Content-Type"), url: url) {
                 return .error(502, err)
             }
             var out: [String: String] = [
-                "Content-Type": http.value(forHTTPHeaderField: "Content-Type") ?? "audio/mpeg",
+                "Content-Type": outgoingAudioContentType(data: data, url: url, upstreamCT: http.value(forHTTPHeaderField: "Content-Type")),
                 "Cache-Control": "no-store",
                 "Accept-Ranges": "bytes",
             ]

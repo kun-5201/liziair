@@ -8890,3 +8890,24 @@ body.is-stage .updtoast { bottom: 18px; }
   body.is-now #view-now .now__meta { padding-top: 6px; }
   body.is-now #view-now .now__transport { margin-top: 6px; }
 }
+
+/* ==========================================================================
+   竖屏舞台页顶栏（2026-11-18，第 6 轮第 4 件）
+   --------------------------------------------------------------------------
+   用户截图（竖屏 603 舞台）：.stagebar 顶栏 top:0 + padding-top:16px，
+   返回键 / 迷你播放条 / 设置齿轮 / 形态九宫格的上沿贴着视口顶边，
+   直接撞上状态栏（05:37、4G、16% 电量被挡住/挤在一起）。
+   修：只在竖屏把整条顶栏往下推——上内边距 = 安全区 + 12px 间距，
+   真机灵动岛 safe-area-inset-top ≈ 59px 时上沿 ≈ 71px，状态栏
+   （约 0–54px）完全让开；无头 Chromium 里 env(...) = 0，max 保底 16px，
+   桌面行为与原来一字不差。
+   只写竖屏分支：横屏 @media (max-width:900px) and (orientation:landscape)
+   在上面，第 5 轮刚把横屏控制器往上抬过（控制键 y 276–340、距底边 50px），
+   这里不碰它。index.html 已有 viewport-fit=cover，env() 在真机 WKWebView
+   里能取到非零值。
+   ========================================================================== */
+@media (max-width: 900px) and (orientation: portrait) {
+  body.is-stage .stagebar {
+    padding-top: max(16px, calc(env(safe-area-inset-top, 0px) + 12px));
+  }
+}

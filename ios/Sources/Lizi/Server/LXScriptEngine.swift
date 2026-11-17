@@ -14,9 +14,16 @@ import CryptoKit
 ///   env = "mobile"，version = "2.12.0"（和 KMusic 的 lx-music-mobile/2.12.0 UA 一致）。
 /// 另外补了真实落雪宿主会给、但 KMusic 桥没有的几样（pdone 仓库的源脚本要用，
 /// 没有就加载即崩）：lx.currentScriptInfo（脚本头注释）、atob/btoa、
-/// window/self（= globalThis）、lx.utils.crypto（md5/sha1/sha256）、
-/// setTimeout/setInterval/clearTimeout/clearInterval（JSC 自带没有；
-/// 野花/清凉/星澜/雨凝溪等脚本加载或取歌时就要用）。
+/// window/self（= globalThis）、lx.utils.crypto（md5/sha1/sha256 +
+/// aesEncrypt，杰翔/星澜拼网易 eapi 参数要用；纯 JS 实现，见 utilsJS）、
+/// lx.utils.buffer（真字节数组：utf-8/base64/hex/latin1 互转；旧版只会
+/// base64，杰翔的 bufToString(buf, 'hex') 会拿到错结果）、全局 Buffer
+/// （星海/星澜用 Buffer.from/isBuffer）、setTimeout/setInterval/
+/// clearTimeout/clearInterval（JSC 自带没有；野花/清凉/星澜/雨凝溪等
+/// 脚本加载或取歌时就要用）。
+/// lx.request 回调是 (err, resp, body)：resp 带 statusCode/headers/body/
+/// url；options 的 body/data（POST 体，聚合脚本要发 JSON）、timeout（毫秒）
+/// 会透传；缺了这些聚合脚本发不出 POST、读不到响应头。
 ///
 /// 线程：JSContext 只在 jsQueue 这条串行队列上碰；网络请求走 URLSession，
 /// 回调跳回 jsQueue 再调 JS。JSC 里未处理的 Promise rejection 不会崩 App
@@ -67,7 +74,13 @@ enum LXScriptRuntime {
         lx.setValue("mobile", forProperty: "env")
         lx.setValue("2.12.0", forProperty: "version")
 
-        // lx.request(url, options, cb)：cb(err, resp)，resp.body 已按 JSON 解析过。
+        // lx.request(url, options, cb)：cb(err, resp, body)，resp.body 已按 JSON
+        // 解析过（解析失败时是原始字符串），body（第 3 参）恒为原始字符串；
+        // resp.headers 是响应头（原大小写 + 小写各一份，幻音/杰翔/星海/星澜/
+        // 轻量读它），resp.url 是跟随重定向后的最终地址。
+        // options 透传：body/data（POST 体：字符串直接用，对象转 JSON；聚合
+        // 脚本发 JSON 时必须有它，旧版直接丢弃导致服务端收到空 POST）、
+        // timeout（毫秒，默认 15 秒，夹在 2~30 秒之间）。
         // ctx 只弱引用：实例被删（源被删除/刷新）后，未完成的网络回调不再往已死的
         // JSContext 里调，不留悬空引用。
         let requestBlock: @convention(block) (JSValue?, JSValue?, JSValue?) -> Void = { [weak ctx] urlValue, optionsValue, callbackValue in
@@ -77,6 +90,8 @@ enum LXScriptRuntime {
                   let callback = callbackValue, !callback.isUndefined else { return }
             var method = "GET"
             var headers: [String: String] = [:]
+            var httpBody: Data?
+            var timeout: TimeInterval = 15
             if let options = optionsValue, !options.isUndefined {
                 if let m = options.forProperty("method")?.toString(), !m.isEmpty { method = m }
                 if let h = options.forProperty("headers")?.toDictionary() as? [String: String] {
@@ -84,10 +99,25 @@ enum LXScriptRuntime {
                 } else if let h = options.forProperty("headers")?.toDictionary() {
                     for (k, v) in h { if let ks = k as? String { headers[ks] = "\(v)" } }
                 }
+                // POST 体：body 优先，data 是 axios 风格的别名。
+                let bodyValue = options.forProperty("body")
+                let dataValue = (bodyValue == nil || bodyValue!.isUndefined) ? options.forProperty("data") : bodyValue
+                if let v = dataValue, !v.isUndefined {
+                    if let s = v.toString(), !v.isObject || v.isString {
+                        httpBody = Data(s.utf8)
+                    } else if let dict = v.toDictionary(),
+                              let json = try? JSONSerialization.data(withJSONObject: dict) {
+                        httpBody = json
+                    }
+                }
+                if let ms = options.forProperty("timeout")?.toNumber()?.doubleValue, ms > 0 {
+                    timeout = min(30, max(2, ms / 1000))
+                }
             }
             Task {
                 do {
-                    let (data, resp) = try await Upstream.fetch(url, headers: headers, timeout: 15, method: method)
+                    let (data, resp) = try await Upstream.fetch(url, headers: headers, timeout: timeout, method: method, body: httpBody)
+                    let rawText = String(data: data, encoding: .utf8) ?? ""
                     LXScriptInstance.jsQueue.async { [weak ctx] in
                         guard let ctx else { return }
                         let respObj = JSValue(newObjectIn: ctx)!
@@ -96,9 +126,20 @@ enum LXScriptRuntime {
                            JSONSerialization.isValidJSONObject(obj) {
                             respObj.setValue(JSValue(object: obj, in: ctx) as Any, forProperty: "body")
                         } else {
-                            respObj.setValue(String(data: data, encoding: .utf8) ?? "", forProperty: "body")
+                            respObj.setValue(rawText, forProperty: "body")
                         }
-                        _ = callback.call(withArguments: [JSValue(undefinedIn: ctx)!, respObj])
+                        var headerDict: [String: String] = [:]
+                        for (k, v) in resp.allHeaderFields {
+                            if let ks = k as? String, let vs = v as? String {
+                                headerDict[ks] = vs
+                                headerDict[ks.lowercased()] = vs
+                            }
+                        }
+                        respObj.setValue(headerDict, forProperty: "headers")
+                        if let finalURL = resp.url?.absoluteString {
+                            respObj.setValue(finalURL, forProperty: "url")
+                        }
+                        _ = callback.call(withArguments: [JSValue(undefinedIn: ctx)!, respObj, rawText])
                     }
                 } catch {
                     let message = error.localizedDescription
@@ -158,6 +199,9 @@ enum LXScriptRuntime {
 
         // lx.utils.crypto：md5/sha1/sha256（独家音源这类脚本签名请求要用）。
         // 复用现成的 Native 实现，不在 JS 里重写一遍。
+        // aesEncrypt（data, mode, key, iv）是 utilsJS 里的纯 JS 实现（AES-CBC/ECB，
+        // PKCS7，返回字节 buffer；杰翔/星澜拼网易 eapi 参数要用，缺了取歌时抛
+        // "utils.crypto.aesEncrypt is not a function"）。
         let md5Block: @convention(block) (String) -> String = { NetEaseCrypto.md5Hex($0) }
         let sha1Block: @convention(block) (String) -> String = { s in
             Insecure.SHA1.hash(data: Data(s.utf8)).map { String(format: "%02x", $0) }.joined()
@@ -169,6 +213,9 @@ enum LXScriptRuntime {
         cryptoObj.setValue(JSValue(object: md5Block, in: ctx)!, forProperty: "md5")
         cryptoObj.setValue(JSValue(object: sha1Block, in: ctx)!, forProperty: "sha1")
         cryptoObj.setValue(JSValue(object: sha256Block, in: ctx)!, forProperty: "sha256")
+        if let aesFn = ctx.globalObject?.forProperty("__lxAesEncrypt"), !aesFn.isUndefined {
+            cryptoObj.setValue(aesFn, forProperty: "aesEncrypt")
+        }
         if let utils = lx.forProperty("utils") { utils.setValue(cryptoObj, forProperty: "crypto") }
 
         // atob/btoa（JSC 自带没有；独家音源加载时就要用）与 window/self
@@ -196,70 +243,43 @@ enum LXScriptRuntime {
 
     /// utils.buffer 的 JS 实现（和 /tmp/lx-test/lx-utils.js 同一份逻辑）。
     static let utilsJS = """
-    var __lxB64 = (function () {
-      var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-      function utf8Bytes(str) {
-        var bytes = [];
-        for (var i = 0; i < str.length; i++) {
-          var c = str.charCodeAt(i);
-          if (c < 0x80) bytes.push(c);
-          else if (c < 0x800) { bytes.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f)); }
-          else if (c >= 0xd800 && c < 0xdc00 && i + 1 < str.length) {
-            var c2 = str.charCodeAt(i + 1);
-            if (c2 >= 0xdc00 && c2 < 0xe000) {
-              var cp = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00);
-              bytes.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
-              i++;
-            } else { bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f)); }
-          } else { bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f)); }
-        }
-        return bytes;
-      }
-      function encode(str) {
-        var bytes = utf8Bytes(String(str));
-        var out = '';
-        for (var i = 0; i < bytes.length; i += 3) {
-          var b0 = bytes[i], b1 = bytes[i + 1], b2 = bytes[i + 2];
-          var n = (b0 << 16) | ((b1 || 0) << 8) | (b2 || 0);
-          out += chars[(n >> 18) & 63] + chars[(n >> 12) & 63];
-          out += (b1 === undefined) ? '=' : chars[(n >> 6) & 63];
-          out += (b2 === undefined) ? '=' : chars[n & 63];
-        }
-        return out;
-      }
-      return { encode: encode };
-    })();
-    var __lxBuffer = {
-      from: function (data, enc) { return { __lxBuf: String(data), __enc: enc || 'utf-8' }; },
-      bufToString: function (buf, enc) {
-        var s = (buf && buf.__lxBuf !== undefined) ? buf.__lxBuf : String(buf);
-        if (enc === 'base64') return __lxB64.encode(s);
-        return s;
-      }
-    };
-    // atob/btoa：JSC 自带没有，这里用纯 JS 补（Latin-1 语义，和浏览器一致）。
     var __lxB64Chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-    var __lxAtob = function (s) {
-      var str = String(s).replace(/[^A-Za-z0-9+/=]/g, '');
-      var out = '';
-      for (var i = 0; i < str.length; i += 4) {
-        var n = (__lxB64Chars.indexOf(str[i]) << 18) | (__lxB64Chars.indexOf(str[i + 1]) << 12) |
-                ((str[i + 2] === '=' ? 0 : __lxB64Chars.indexOf(str[i + 2])) << 6) |
-                (str[i + 3] === '=' ? 0 : __lxB64Chars.indexOf(str[i + 3]));
-        out += String.fromCharCode((n >> 16) & 255);
-        if (str[i + 2] !== '=') out += String.fromCharCode((n >> 8) & 255);
-        if (str[i + 3] !== '=') out += String.fromCharCode(n & 255);
-      }
-      return out;
-    };
-    var __lxBtoa = function (s) {
-      var str = String(s);
+    var __lxUtf8Bytes = function (str) {
+      str = String(str);
       var bytes = [];
       for (var i = 0; i < str.length; i++) {
         var c = str.charCodeAt(i);
-        if (c > 0xff) throw new Error('btoa: The string to be encoded contains characters outside of the Latin1 range.');
-        bytes.push(c);
+        if (c < 0x80) bytes.push(c);
+        else if (c < 0x800) { bytes.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f)); }
+        else if (c >= 0xd800 && c < 0xdc00 && i + 1 < str.length) {
+          var c2 = str.charCodeAt(i + 1);
+          if (c2 >= 0xdc00 && c2 < 0xe000) {
+            var cp = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00);
+            bytes.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+            i++;
+          } else { bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f)); }
+        } else { bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f)); }
       }
+      return bytes;
+    };
+    var __lxUtf8Decode = function (bytes) {
+      var out = '';
+      for (var i = 0; i < bytes.length;) {
+        var c = bytes[i];
+        if (c < 0x80) { out += String.fromCharCode(c); i++; }
+        else if ((c & 0xe0) === 0xc0 && i + 1 < bytes.length && (bytes[i + 1] & 0xc0) === 0x80) {
+          out += String.fromCharCode(((c & 0x1f) << 6) | (bytes[i + 1] & 0x3f)); i += 2;
+        } else if ((c & 0xf0) === 0xe0 && i + 2 < bytes.length && (bytes[i + 1] & 0xc0) === 0x80 && (bytes[i + 2] & 0xc0) === 0x80) {
+          out += String.fromCharCode(((c & 0x0f) << 12) | ((bytes[i + 1] & 0x3f) << 6) | (bytes[i + 2] & 0x3f)); i += 3;
+        } else if ((c & 0xf8) === 0xf0 && i + 3 < bytes.length && (bytes[i + 1] & 0xc0) === 0x80 && (bytes[i + 2] & 0xc0) === 0x80 && (bytes[i + 3] & 0xc0) === 0x80) {
+          var cp = ((c & 0x07) << 18) | ((bytes[i + 1] & 0x3f) << 12) | ((bytes[i + 2] & 0x3f) << 6) | (bytes[i + 3] & 0x3f);
+          cp -= 0x10000;
+          out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff)); i += 4;
+        } else { out += '\ufffd'; i++; }
+      }
+      return out;
+    };
+    var __lxBytesToBase64 = function (bytes) {
       var out = '';
       for (var i = 0; i < bytes.length; i += 3) {
         var b0 = bytes[i], b1 = bytes[i + 1], b2 = bytes[i + 2];
@@ -270,6 +290,202 @@ enum LXScriptRuntime {
       }
       return out;
     };
+    var __lxBase64ToBytes = function (str) {
+      var clean = String(str).replace(/[^A-Za-z0-9+/=]/g, '');
+      var bytes = [];
+      for (var i = 0; i < clean.length; i += 4) {
+        var n = (__lxB64Chars.indexOf(clean[i]) << 18) | (__lxB64Chars.indexOf(clean[i + 1]) << 12) |
+                ((clean[i + 2] === '=' ? 0 : __lxB64Chars.indexOf(clean[i + 2])) << 6) |
+                (clean[i + 3] === '=' ? 0 : __lxB64Chars.indexOf(clean[i + 3]));
+        bytes.push((n >> 16) & 255);
+        if (clean[i + 2] !== '=') bytes.push((n >> 8) & 255);
+        if (clean[i + 3] !== '=') bytes.push(n & 255);
+      }
+      return bytes;
+    };
+    var __lxBytesToHex = function (bytes) {
+      var out = '';
+      for (var i = 0; i < bytes.length; i++) { var h = bytes[i].toString(16); out += h.length === 1 ? '0' + h : h; }
+      return out;
+    };
+    var __lxHexToBytes = function (str) {
+      str = String(str).replace(/[^0-9a-fA-F]/g, '');
+      var bytes = [];
+      for (var i = 0; i + 1 < str.length; i += 2) bytes.push(parseInt(str.substr(i, 2), 16));
+      return bytes;
+    };
+    var __lxToBytes = function (data, enc) {
+      if (data && data.__lxBytes !== undefined) return data.__lxBytes.slice();
+      if (data && typeof data.length === 'number' && typeof data !== 'string') {
+        var arr = [];
+        for (var i = 0; i < data.length; i++) arr.push(data[i] & 255);
+        return arr;
+      }
+      var s = String(data == null ? '' : data);
+      enc = (enc || 'utf-8').toLowerCase();
+      if (enc === 'base64') return __lxBase64ToBytes(s);
+      if (enc === 'hex') return __lxHexToBytes(s);
+      if (enc === 'latin1' || enc === 'binary') {
+        var l = [];
+        for (var j = 0; j < s.length; j++) l.push(s.charCodeAt(j) & 255);
+        return l;
+      }
+      return __lxUtf8Bytes(s);
+    };
+    var __lxMakeBuffer = function (bytes) {
+      var buf = { __lxBytes: bytes, length: bytes.length };
+      for (var i = 0; i < bytes.length; i++) buf[i] = bytes[i];
+      buf.toString = function (enc) {
+        enc = (enc || 'utf-8').toLowerCase();
+        if (enc === 'base64') return __lxBytesToBase64(bytes);
+        if (enc === 'hex') return __lxBytesToHex(bytes);
+        if (enc === 'latin1' || enc === 'binary') {
+          var s = '';
+          for (var k = 0; k < bytes.length; k++) s += String.fromCharCode(bytes[k]);
+          return s;
+        }
+        return __lxUtf8Decode(bytes);
+      };
+      return buf;
+    };
+    var __lxBuffer = {
+      from: function (data, enc) { return __lxMakeBuffer(__lxToBytes(data, enc || 'utf-8')); },
+      bufToString: function (buf, enc) {
+        enc = (enc || 'utf-8').toLowerCase();
+        var bytes = __lxToBytes(buf, 'utf-8');
+        if (enc === 'base64') return __lxBytesToBase64(bytes);
+        if (enc === 'hex') return __lxBytesToHex(bytes);
+        if (enc === 'latin1' || enc === 'binary') {
+          var s = '';
+          for (var k = 0; k < bytes.length; k++) s += String.fromCharCode(bytes[k]);
+          return s;
+        }
+        return __lxUtf8Decode(bytes);
+      }
+    };
+    // atob/btoa：JSC 自带没有，这里用纯 JS 补（Latin-1 语义，和浏览器一致）。
+    var __lxAtob = function (s) {
+      var bytes = __lxBase64ToBytes(s);
+      var out = '';
+      for (var i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i]);
+      return out;
+    };
+    var __lxBtoa = function (s) {
+      var str = String(s);
+      var bytes = [];
+      for (var i = 0; i < str.length; i++) {
+        var c = str.charCodeAt(i);
+        if (c > 0xff) throw new Error('btoa: The string to be encoded contains characters outside of the Latin1 range.');
+        bytes.push(c);
+      }
+      return __lxBytesToBase64(bytes);
+    };
+    // Buffer：JSC 自带没有；星海/星澜等脚本用 Buffer.from/isBuffer（有 typeof
+    // 守卫，缺了只会降级，但补上后行为与桌面端一致）。
+    var Buffer = {
+      from: function (data, enc) { return __lxMakeBuffer(__lxToBytes(data, enc || 'utf-8')); },
+      isBuffer: function (v) { return !!(v && v.__lxBytes !== undefined); },
+      alloc: function (size, fill) {
+        var b = [];
+        for (var i = 0; i < size; i++) b.push(fill || 0);
+        return __lxMakeBuffer(b);
+      },
+      byteLength: function (s) { return __lxToBytes(s, 'utf-8').length; },
+      concat: function (list) {
+        var out = [];
+        for (var i = 0; i < list.length; i++) { var b = __lxToBytes(list[i], 'utf-8'); for (var j = 0; j < b.length; j++) out.push(b[j]); }
+        return __lxMakeBuffer(out);
+      }
+    };
+    // AES 加密（与落雪桌面端 utils.crypto.aesEncrypt 同款签名：
+    // aesEncrypt(data, mode, key, iv)，mode 如 'aes-128-ecb' / 'aes-256-cbc'；
+    // 只加密，返回字节 buffer（杰翔/星澜拿它拼网易 eapi 参数，再经
+    // utils.buffer.bufToString(buf, 'hex') 转十六进制）。
+    var __lxAesEncrypt = (function () {
+      function gfMul(a, b) {
+        var p = 0;
+        for (var i = 0; i < 8; i++) {
+          if (b & 1) p ^= a;
+          var hi = a & 0x80;
+          a = (a << 1) & 0xff;
+          if (hi) a ^= 0x1b;
+          b >>= 1;
+        }
+        return p;
+      }
+      function gfInv(a) {
+        if (a === 0) return 0;
+        var r = 1;
+        for (var i = 0; i < 254; i++) r = gfMul(r, a);
+        return r;
+      }
+      var SBOX = [];
+      for (var i = 0; i < 256; i++) {
+        var inv = gfInv(i), s = inv;
+        for (var k = 1; k <= 4; k++) s ^= ((inv << k) | (inv >> (8 - k))) & 0xff;
+        SBOX.push((s ^ 0x63) & 0xff);
+      }
+      var RCON = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36];
+      function expandKey(keyBytes) {
+        var Nk = keyBytes.length / 4, Nr = Nk + 6, w = [];
+        for (var n = 0; n < Nk; n++) w.push(keyBytes.slice(n * 4, n * 4 + 4));
+        for (var m = Nk; m < 4 * (Nr + 1); m++) {
+          var t = w[m - 1].slice();
+          if (m % Nk === 0) t = [SBOX[t[1]] ^ RCON[m / Nk - 1], SBOX[t[2]], SBOX[t[3]], SBOX[t[0]]];
+          else if (Nk > 6 && m % Nk === 4) t = t.map(function (b) { return SBOX[b]; });
+          w.push(w[m - Nk].map(function (b, j) { return b ^ t[j]; }));
+        }
+        return { w: w, Nr: Nr };
+      }
+      function encryptBlock(block, w, Nr) {
+        function addKey(s, round) {
+          for (var c = 0; c < 4; c++) for (var r = 0; r < 4; r++) s[r + 4 * c] ^= w[round * 4 + c][r];
+        }
+        function sub(s) { for (var q = 0; q < 16; q++) s[q] = SBOX[s[q]]; }
+        function shift(s) {
+          var t = s.slice();
+          for (var r = 0; r < 4; r++) for (var c = 0; c < 4; c++) s[r + 4 * c] = t[r + 4 * ((c + r) % 4)];
+        }
+        function mix(s) {
+          for (var c = 0; c < 4; c++) {
+            var a = [s[4 * c], s[4 * c + 1], s[4 * c + 2], s[4 * c + 3]];
+            s[4 * c] = gfMul(a[0], 2) ^ gfMul(a[1], 3) ^ a[2] ^ a[3];
+            s[4 * c + 1] = a[0] ^ gfMul(a[1], 2) ^ gfMul(a[2], 3) ^ a[3];
+            s[4 * c + 2] = a[0] ^ a[1] ^ gfMul(a[2], 2) ^ gfMul(a[3], 3);
+            s[4 * c + 3] = gfMul(a[0], 3) ^ a[1] ^ a[2] ^ gfMul(a[3], 2);
+          }
+        }
+        var s = block.slice();
+        addKey(s, 0);
+        for (var round = 1; round < Nr; round++) { sub(s); shift(s); mix(s); addKey(s, round); }
+        sub(s); shift(s); addKey(s, Nr);
+        return s;
+      }
+      function fit(bytes, len) {
+        var out = [];
+        for (var i = 0; i < len; i++) out.push(i < bytes.length ? bytes[i] & 0xff : 0);
+        return out;
+      }
+      return function (data, mode, key, iv) {
+        var m = String(mode || 'aes-128-cbc').toLowerCase();
+        var bits = m.indexOf('256') >= 0 ? 256 : m.indexOf('192') >= 0 ? 192 : 128;
+        var ecb = m.indexOf('ecb') >= 0;
+        var kb = expandKey(fit(__lxUtf8Bytes(key || ''), bits / 8));
+        var ivb = fit(__lxUtf8Bytes(iv || ''), 16);
+        var plain = __lxUtf8Bytes(data);
+        var pad = 16 - (plain.length % 16);
+        for (var i = 0; i < pad; i++) plain.push(pad);
+        var out = [], prev = ivb.slice();
+        for (var off = 0; off < plain.length; off += 16) {
+          var block = plain.slice(off, off + 16);
+          if (!ecb) block = block.map(function (b, j) { return b ^ prev[j]; });
+          var enc = encryptBlock(block, kb.w, kb.Nr);
+          for (var q = 0; q < 16; q++) out.push(enc[q]);
+          prev = enc;
+        }
+        return __lxMakeBuffer(out);
+      };
+    })();
     """
 }
 
@@ -342,19 +558,54 @@ final class LXScriptInstance {
             .map(\.key).sorted()
     }
 
+    /// 脚本 inited 上报的全部平台（不论有没有 musicUrl 动作）：校验失败时
+    /// 拿来告诉用户脚本到底上报了什么（如只上报了 [git]，那 wy/tx/kg/kw
+    /// 的歌永远走不到它），而不是一句笼统的「没有可用的 musicUrl 音源」。
+    var reportedPlatforms: [String] {
+        sink.initedSources.map(\.key).sorted()
+    }
+
+    /// 是否已注册 request 处理（只在 jsQueue 上读，见 waitForRequestHandler）。
+    private var hasRequestHandlerOnQueue: Bool { sink.requestHandler != nil }
+
     /// 加载脚本：装运行时 + evaluateScript + 校验注册了 request 处理。
     /// 成功后 loaded = true；失败不记 loaded，下次 resolve 会重试加载。
     /// 只能在 jsQueue 之外的线程调（内部 jsQueue.sync）。
+    /// 有的脚本（如独家音源）先拉远程配置再注册 request 处理：evaluateScript
+    /// 刚回来时 handler 还是空的，loadOnQueue 不在这里直接判死刑，load()
+    /// 在外面等一等（最多 5 秒，见 waitForRequestHandler）；同步注册的当场
+    /// 就到，不等。
     func load() throws {
         var loadError: Error?
         Self.jsQueue.sync {
             if loaded { return }
             do {
-                try loadOnQueue()
-                loaded = true
+                try loadOnQueue(requireHandler: false)
             } catch { loadError = error }
         }
         if let loadError { throw loadError }
+        if !hasRequestHandler() {
+            waitForRequestHandler()
+            if !hasRequestHandler() {
+                throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "不是有效的落雪音源脚本：5 秒内没有注册 request 处理"])
+            }
+        }
+        // 只有 handler 就绪才记 loaded；没就绪时不记，下次 resolve 会重试加载。
+        Self.jsQueue.sync { loaded = true }
+    }
+
+    private func hasRequestHandler() -> Bool {
+        Self.jsQueue.sync { self.hasRequestHandlerOnQueue }
+    }
+
+    /// 等 request 处理注册：跟 waitForInited 同款轮询（最多 5 秒；同步注册的
+    /// 当场就到，不等）。只能在 jsQueue 之外调。
+    func waitForRequestHandler(timeout: TimeInterval = 5) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if hasRequestHandler() { return }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
     }
 
     /// 已在 jsQueue 上时用：直接加载，不再 sync（load() 从 jsQueue 里调会死锁）。
@@ -434,10 +685,37 @@ final class LXScriptInstance {
                     guard let ctx = self.context, let handler = self.sink.requestHandler else {
                         throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "落雪脚本未就绪"])
                     }
+                    // musicInfo 只给 songmid 是不够的：脚本按平台读不同字段，
+                    // 缺哪个就直接抛错（溯音/落雪的 kw、mg 分支要求 musicInfo.name，
+                    // 没有就 throw「需要歌曲名」——酷我每首歌都走不到源，这就是
+                    // 「有的音源无法识别」的一半原因）。Router 只传了一个 songId
+                    // 进来（Router.swift 只读，不能改）：按平台把这个 songId
+                    // 别名到脚本要读的字段上——Router 给 kw 传的就是歌名、给 kg
+                    // 传的是 hash 或「歌名 歌手」、给 tx 传 mid、给 wy 传数字 id，
+                    // 正好就是各平台脚本要的东西。只补别名，不改 songmid 本身；
+                    // singer/albumName 上游没传进来，留空（脚本里都是 `|| ''`）。
+                    var musicInfo: [String: Any] = ["songmid": songId, "songId": songId, "source": source]
+                    switch source {
+                    case "kw", "mg":
+                        musicInfo["name"] = songId
+                    case "kg":
+                        if songId.count == 32 && songId.allSatisfy({ $0.isHexDigit }) {
+                            musicInfo["hash"] = songId
+                        } else {
+                            musicInfo["name"] = songId
+                        }
+                    case "tx":
+                        musicInfo["mid"] = songId
+                    case "wy":
+                        musicInfo["id"] = songId
+                        musicInfo["songid"] = songId
+                    default:
+                        break
+                    }
                     let payload: [String: Any] = [
                         "action": "musicUrl",
                         "source": source,
-                        "info": ["musicInfo": ["songmid": songId], "type": quality],
+                        "info": ["musicInfo": musicInfo, "type": quality],
                     ]
                     guard let payloadValue = JSValue(object: payload, in: ctx) else {
                         throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "请求构造失败"])
@@ -473,7 +751,7 @@ final class LXScriptInstance {
 
     // MARK: - 加载脚本（只在 jsQueue 上跑）
 
-    private func loadOnQueue() throws {
+    private func loadOnQueue(requireHandler: Bool = true) throws {
         guard let ctx = JSContext() else {
             throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "JSContext 创建失败"])
         }
@@ -491,12 +769,19 @@ final class LXScriptInstance {
         if let exc = ctx.exception {
             throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "运行时安装失败：\(exc)"])
         }
-        ctx.evaluateScript(scriptText)
+        // BOM（U+FEFF）JSC 当空白处理，本来就能跑；这里去掉只是为了让
+        // header 解析和后续处理干净，行为不变。
+        let text = scriptText.hasPrefix("\u{FEFF}") ? String(scriptText.dropFirst()) : scriptText
+        ctx.evaluateScript(text)
         if let exc = ctx.exception {
             throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "落雪脚本加载失败：\(exc)"])
         }
-        guard freshSink.requestHandler != nil else {
-            throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "不是有效的落雪音源脚本：没有注册 request 处理"])
+        // load() 从外面等（requireHandler: false），见 load() 注释；
+        // loadAssumingOnQueue 在 jsQueue 上等不了，这里直接判。
+        if requireHandler {
+            guard freshSink.requestHandler != nil else {
+                throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "不是有效的落雪音源脚本：没有注册 request 处理"])
+            }
         }
     }
 }

@@ -11,6 +11,21 @@ final class DiagLog {
     private(set) var lastSearch: [String: Any] = [:]
     private var requests: [[String: Any]] = []
     private var events: [String] = []
+    /// 前端上报的诊断日志（第 6 轮）：audio（播放失败 detail）/ cover（封面失败
+    /// host+原因+栏位）/ probe（探活结果）。最近 100 条，设置页可查看/复制。
+    private var logs: [[String: Any]] = []
+
+    func recordLog(category: String, message: String, fields: [String: Any] = [:]) {
+        lock.lock(); defer { lock.unlock() }
+        var e: [String: Any] = [
+            "ts": Int(Date().timeIntervalSince1970 * 1000),
+            "category": category,
+            "message": message,
+        ]
+        for (k, v) in fields { e[k] = v }
+        logs.append(e)
+        if logs.count > 100 { logs.removeFirst(logs.count - 100) }
+    }
 
     func recordSearch(_ d: [String: Any]) {
         lock.lock(); defer { lock.unlock() }
@@ -31,6 +46,6 @@ final class DiagLog {
 
     func json() -> [String: Any] {
         lock.lock(); defer { lock.unlock() }
-        return ["lastSearch": lastSearch, "requests": requests, "events": events]
+        return ["lastSearch": lastSearch, "requests": requests, "events": events, "logs": logs]
     }
 }

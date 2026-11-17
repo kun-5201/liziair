@@ -223,15 +223,23 @@ final class LocalHttpServer {
                     for pair in qs.split(separator: "&") {
                         let kv = pair.split(separator: "=", maxSplits: 1)
                         if kv.count == 2 {
-                            let k = String(kv[0]).removingPercentEncoding ?? String(kv[0])
-                            let v = String(kv[1]).removingPercentEncoding ?? String(kv[1])
+                            // query 里 + 代表空格（表单编码习惯，URLSearchParams
+                            // 把空格编成 +）：先把 + 还原成空格再解 %XX。
+                            // 注意顺序：%2B 在整条解码那步已变成 +，分不清是空格
+                            // 还是字面 +（见 217 行），字面 + 极少见，接受这个 trade-off；
+                            // 双编码的音频直链值里没有字面 +（原 + 是 %2B 形态），不受影响。
+                            let kd = String(kv[0]).replacingOccurrences(of: "+", with: " ")
+                            let vd = String(kv[1]).replacingOccurrences(of: "+", with: " ")
+                            let k = kd.removingPercentEncoding ?? kd
+                            let v = vd.removingPercentEncoding ?? vd
                             query[k] = v
                         } else if kv.count == 1 {
-                            query[String(kv[0])] = ""
+                            let kd = String(kv[0]).replacingOccurrences(of: "+", with: " ")
+                            query[kd.removingPercentEncoding ?? kd] = ""
                         }
                     }
                 }
-                // 相对路径里的 + 号在 query 里代表空格（表单编码习惯）
+                // query 里的 + 已在上面按对解码前还原成空格（表单编码习惯）。
                 return HttpRequest(method: method, path: path, query: query, headers: headers, body: Data(body))
             }
             let chunk = try await receive(conn, 65536)

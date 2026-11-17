@@ -18,8 +18,11 @@ import CryptoKit
 /// 导入源，管理界面（开关/删除/自动切换）照常好用。
 ///
 /// 导入校验（import-url / import-file / 刷新 / 补绑 URL 共用）：
-///   脚本必须在独立 JSContext 里跑起来、注册 request 处理、inited 上报至少一个
-///   带 musicUrl 动作的平台；不合格抛「不是有效的落雪音源脚本」，前端弹提示。
+///   脚本必须在独立 JSContext 里跑起来、注册 request 处理（异步注册的等
+///   5 秒）、inited 上报至少一个带 musicUrl 动作的平台；不合格抛带步骤的
+///   具体原因（加载异常 / 5 秒没注册 / 5 秒没上报平台及实际报了什么），
+///   前端原样显示，并记一条诊断日志（category probe）。不做「必须包含
+///   musicUrl 字面量」的文本预检——混淆过的真源字面量不存在。
 
 struct LXSourceMeta: Codable {
     var id: String
@@ -72,11 +75,15 @@ enum LXSourceStore {
 
     /// GitHub 链接转 raw：github.com/user/repo/blob/branch/path
     ///   → raw.githubusercontent.com/user/repo/branch/path；
-    /// 已是 raw 的、或其它地址，原样返回。
+    /// Gitee 同理：gitee.com/user/repo/blob/branch/path
+    ///   → gitee.com/user/repo/raw/branch/path（直接拉 blob 页会拿到
+    ///   HTML，校验必失败；raw 302 到 raw.giteeusercontent.com，
+    ///   URLSession 会跟随）。jsdelivr（cdn.jsdelivr.net/gh/…、/npm/…）
+    /// 和直链 .js 本来就是文件地址，原样返回。
     static func githubRawURL(_ raw: String) -> String {
         let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URL(string: s), let host = url.host?.lowercased() else { return s }
-        if host == "raw.githubusercontent.com" { return s }
+        if host == "raw.githubusercontent.com" || host == "raw.giteeusercontent.com" { return s }
         if host == "github.com" {
             let parts = url.pathComponents.filter { $0 != "/" }
             if parts.count >= 5 && (parts[2] == "blob" || parts[2] == "raw") {
@@ -84,7 +91,37 @@ enum LXSourceStore {
                 return "https://raw.githubusercontent.com/\(parts[0])/\(parts[1])/\(rest)"
             }
         }
+        if host == "gitee.com" {
+            let parts = url.pathComponents.filter { $0 != "/" }
+            if parts.count >= 5 && parts[2] == "blob" {
+                let rest = parts.dropFirst(3).joined(separator: "/")
+                return "https://gitee.com/\(parts[0])/\(parts[1])/raw/\(rest)"
+            }
+        }
         return s
+    }
+
+    /// 导入失败记诊断日志（第 6 轮约定：category 只用 probe，message 以
+    /// "lx-source-import: " 开头；host/reason/lane 照约定填；路由见
+    /// Router.swift /api/diag/log，日志存在 DiagLog.logs 里，设置页可看）。
+    /// 服务端直接调 recordLog（不走 HTTP，避免自己调自己）；前端 app.js
+    /// 再按同一约定 POST 一次（用户在界面上看到的失败也会留下记录）。
+    static func diagLog(sourceName: String, step: String, reason: String, host: String) {
+        DiagLog.shared.recordLog(category: "probe",
+            message: "lx-source-import: \(sourceName) \(step)失败：\(reason)",
+            fields: ["host": host, "reason": step, "lane": "lx-source-import"])
+    }
+
+    /// 脚本下载的 UA：有的源站（如 gitee 镜像、部分私人服务器）不认
+    /// URLSession 默认 UA，直接 403；浏览器 UA 能过。
+    static let scriptDownloadHeaders = ["User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"]
+
+    /// 拉到的脚本字节 → 字符串：UTF-8 优先，失败再试 GB18030（有的作者
+    /// 用 GBK 存 .js；旧版 UTF-8 解不开直接报「脚本为空」，误导用户）。
+    /// 两种都解不开才返回 nil。
+    static func decodeScriptData(_ data: Data) -> String? {
+        if let s = String(data: data, encoding: .utf8) { return s }
+        return String(data: data, encoding: String.Encoding(rawValue: 0x80000632))
     }
 
     /// 脚本头注释里的 @name / @version / @author（只看前 4KB）。
@@ -174,18 +211,45 @@ final class LXSourceRegistry {
         let raw = LXSourceStore.githubRawURL(urlString)
         guard let url = URL(string: raw), let scheme = url.scheme?.lowercased(),
               scheme == "http" || scheme == "https" else {
+            LXSourceStore.diagLog(sourceName: urlString, step: "fetch", reason: "脚本 URL 无效", host: "")
             throw NSError(domain: "LXSources", code: 400, userInfo: [NSLocalizedDescriptionKey: "脚本 URL 无效"])
         }
-        let (data, resp) = try await Upstream.fetch(url, timeout: 30)
-        guard resp.statusCode == 200 else {
-            throw NSError(domain: "LXSources", code: 400, userInfo: [NSLocalizedDescriptionKey: "拉取脚本失败（HTTP \(resp.statusCode)）"])
-        }
-        guard let script = String(data: data, encoding: .utf8), !script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw NSError(domain: "LXSources", code: 400, userInfo: [NSLocalizedDescriptionKey: "拉取到的脚本为空"])
-        }
         let fallbackName = url.deletingPathExtension().lastPathComponent
+        let script = try await fetchScript(url: url, displayName: fallbackName.isEmpty ? urlString : fallbackName)
         return try importScript(script: script, nameHint: fallbackName.isEmpty ? nil : fallbackName,
                                 origin: "url", sourceUrl: raw)
+    }
+
+    /// 拉取脚本（import-url / bind-url / refresh 共用）：带浏览器 UA、
+    /// HTTP 状态、UTF-8/GB18030 解码；哪一步失败就报哪一步，并记诊断日志。
+    /// 返回解码后的脚本；失败抛带步骤的错误，前端直接显示。
+    private func fetchScript(url: URL, displayName: String) async throws -> String {
+        let host = url.host ?? ""
+        let data: Data
+        let resp: HTTPURLResponse
+        do {
+            (data, resp) = try await Upstream.fetch(url, headers: LXSourceStore.scriptDownloadHeaders, timeout: 30)
+        } catch {
+            let reason = "拉取脚本失败（网络错误：\(error.localizedDescription)）"
+            LXSourceStore.diagLog(sourceName: displayName, step: "fetch", reason: reason, host: host)
+            throw NSError(domain: "LXSources", code: 400, userInfo: [NSLocalizedDescriptionKey: reason])
+        }
+        guard resp.statusCode == 200 else {
+            let reason = "拉取脚本失败（HTTP \(resp.statusCode)）"
+            LXSourceStore.diagLog(sourceName: displayName, step: "fetch", reason: reason, host: host)
+            throw NSError(domain: "LXSources", code: 400, userInfo: [NSLocalizedDescriptionKey: reason])
+        }
+        guard let script = LXSourceStore.decodeScriptData(data) else {
+            let reason = "拉取到的脚本无法读取（不是 UTF-8/GBK 编码）"
+            LXSourceStore.diagLog(sourceName: displayName, step: "decode", reason: reason, host: host)
+            throw NSError(domain: "LXSources", code: 400, userInfo: [NSLocalizedDescriptionKey: reason])
+        }
+        guard !script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            let reason = "拉取到的脚本为空"
+            LXSourceStore.diagLog(sourceName: displayName, step: "decode", reason: reason, host: host)
+            throw NSError(domain: "LXSources", code: 400, userInfo: [NSLocalizedDescriptionKey: reason])
+        }
+        return script
     }
 
     /// 本地文件导入：前端读文件内容 POST 上来（支持多选，前端逐个调）。
@@ -201,19 +265,14 @@ final class LXSourceRegistry {
               scheme == "http" || scheme == "https" else {
             throw NSError(domain: "LXSources", code: 400, userInfo: [NSLocalizedDescriptionKey: "脚本 URL 无效"])
         }
-        let (data, resp) = try await Upstream.fetch(url, timeout: 30)
-        guard resp.statusCode == 200 else {
-            throw NSError(domain: "LXSources", code: 400, userInfo: [NSLocalizedDescriptionKey: "拉取脚本失败（HTTP \(resp.statusCode)）"])
-        }
-        guard let script = String(data: data, encoding: .utf8), !script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw NSError(domain: "LXSources", code: 400, userInfo: [NSLocalizedDescriptionKey: "拉取到的脚本为空"])
-        }
+        let displayName = ioQueue.sync { LXSourceStore.loadManifest().first(where: { $0.id == id })?.name } ?? id
+        let script = try await fetchScript(url: url, displayName: displayName)
         return try ioQueue.sync {
             var manifest = LXSourceStore.loadManifest()
             guard let i = manifest.firstIndex(where: { $0.id == id }) else {
                 throw NSError(domain: "LXSources", code: 404, userInfo: [NSLocalizedDescriptionKey: "源不存在"])
             }
-            let validated = try validate(script: script)
+            let validated = try validate(script: script, displayName: displayName)
             var meta = manifest[i]
             meta.name = validated.name
             meta.version = validated.version
@@ -270,17 +329,11 @@ final class LXSourceRegistry {
         guard let url = URL(string: sourceUrl) else {
             throw NSError(domain: "LXSources", code: 400, userInfo: [NSLocalizedDescriptionKey: "绑定的 URL 无效"])
         }
-        let (data, resp) = try await Upstream.fetch(url, timeout: 30)
-        guard resp.statusCode == 200 else {
-            throw NSError(domain: "LXSources", code: 400, userInfo: [NSLocalizedDescriptionKey: "拉取脚本失败（HTTP \(resp.statusCode)）"])
-        }
-        guard let script = String(data: data, encoding: .utf8), !script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw NSError(domain: "LXSources", code: 400, userInfo: [NSLocalizedDescriptionKey: "拉取到的脚本为空"])
-        }
+        let script = try await fetchScript(url: url, displayName: meta.name)
         let newHash = LXSourceStore.sha256Hex(script)
         if newHash == meta.sha256 {
             // 内容没变：仍校验一次能跑（脚本可能已坏），坏了就报错、不动文件。
-            let validated = try validate(script: script)
+            let validated = try validate(script: script, displayName: meta.name)
             _ = validated
             return (meta, false)
         }
@@ -289,7 +342,7 @@ final class LXSourceRegistry {
             guard let i = manifest.firstIndex(where: { $0.id == id }) else {
                 throw NSError(domain: "LXSources", code: 404, userInfo: [NSLocalizedDescriptionKey: "源不存在"])
             }
-            let validated = try validate(script: script)
+            let validated = try validate(script: script, displayName: meta.name)
             var updated = manifest[i]
             updated.name = validated.name
             updated.version = validated.version
@@ -359,7 +412,7 @@ final class LXSourceRegistry {
     /// 上游无视 Range 回 200 整包时会把整个文件（上百 MB 的 FLAC）拉下来探活。
     /// 跟随重定向（URLSession 默认）。
     static func audioURLReachable(_ urlString: String, timeout: TimeInterval = 8) async -> Bool {
-        guard let url = URL(string: urlString),
+        guard let url = Upstream.url(from: urlString),
               url.scheme == "http" || url.scheme == "https" else { return false }
         // 非 throwing task group：两个子任务都不抛错（bytes 失败自己吞掉变 false，
         // sleep 用 try?），先回来哪个算哪个，另一个取消。
@@ -403,26 +456,50 @@ final class LXSourceRegistry {
     /// 校验一个脚本：跑起来、注册 request 处理、inited 至少上报一个 musicUrl 平台。
     /// 返回解析出的元数据字段 + 已加载的实例（调用方落盘成功后再挂进注册表，
     /// 避免坏脚本占住实例槽位）。
-    private func validate(script: String) throws -> (name: String, version: String, author: String, platforms: [String], instance: LXScriptInstance) {
-        guard script.utf8.count <= LXSourceStore.maxScriptBytes else {
-            throw NSError(domain: "LXSources", code: 400, userInfo: [NSLocalizedDescriptionKey: "脚本过大（超过 1MB）"])
+    /// 注意：这里故意不用「脚本必须包含 musicUrl 字面量」这种文本预检——
+    /// 混淆过的真源（野花/野草/独家音源）把 'musicUrl' 拆成 \x 转义或远程
+    /// 下发，字面量根本不存在；跑起来 + inited 上报才是真正的校验。
+    /// 失败时报错写清步骤和原因（加载异常原文 / 5 秒没注册处理 / 5 秒没上报
+    /// musicUrl 平台 + 实际报了什么平台），前端原样显示，不再只给一句
+    /// 「不是有效的落雪音源脚本」；同时记一条诊断日志（category probe，
+    /// message 以 "lx-source-import: " 开头，见 LXSourceStore.diagLog）。
+    /// 平台 id 归一化：有的脚本用长名（kuwo/netease/qq/kugou/migu），取歌链
+    /// 只认短名（kw/wy/tx/kg/mg），这里统一映射，免得「源在列表里、歌永远
+    /// 走不到它」。
+    private func validate(script: String, displayName: String? = nil) throws -> (name: String, version: String, author: String, platforms: [String], instance: LXScriptInstance) {
+        let label = displayName ?? LXSourceStore.headerValue(script, "name") ?? "自定义源"
+        func fail(_ step: String, _ reason: String) -> Error {
+            LXSourceStore.diagLog(sourceName: label, step: step, reason: reason, host: "")
+            return NSError(domain: "LXSources", code: 400, userInfo: [NSLocalizedDescriptionKey: reason])
         }
-        guard script.contains("musicUrl") else {
-            throw NSError(domain: "LXSources", code: 400, userInfo: [NSLocalizedDescriptionKey: "不是有效的落雪音源脚本"])
+        guard script.utf8.count <= LXSourceStore.maxScriptBytes else {
+            throw fail("validate-size", "脚本过大（超过 1MB）")
+        }
+        guard !script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw fail("validate-empty", "脚本内容为空")
         }
         let instance = LXScriptInstance(script: script)
         do {
             try instance.load()
         } catch {
-            throw NSError(domain: "LXSources", code: 400, userInfo: [NSLocalizedDescriptionKey: "不是有效的落雪音源脚本：\(error.localizedDescription)"])
+            throw fail("validate-load", "脚本加载失败：\(error.localizedDescription)")
         }
         // 有的脚本先拉远程配置再发 inited（如 juhe），load() 返回时 platforms
         // 还是空的；等一等（最多 5 秒，同步发 inited 的当场就到，不等）。
         instance.waitForInited()
-        let platforms = instance.platforms
-        guard !platforms.isEmpty else {
-            throw NSError(domain: "LXSources", code: 400, userInfo: [NSLocalizedDescriptionKey: "不是有效的落雪音源脚本：没有可用的 musicUrl 音源"])
+        let rawPlatforms = instance.platforms
+        guard !rawPlatforms.isEmpty else {
+            let reported = instance.reportedPlatforms
+            let reason: String
+            if reported.isEmpty {
+                reason = "脚本 5 秒内没有上报任何平台（没有发 inited，或远程配置拉取失败）"
+            } else {
+                reason = "脚本没有可用的 musicUrl 音源（只上报了 \(reported.joined(separator: "、"))，都没有 musicUrl 动作）"
+            }
+            throw fail("validate-no-musicUrl", reason)
         }
+        let alias: [String: String] = ["kuwo": "kw", "netease": "wy", "qq": "tx", "kugou": "kg", "migu": "mg"]
+        let platforms = Array(Set(rawPlatforms.map { alias[$0] ?? $0 })).sorted()
         let name = LXSourceStore.headerValue(script, "name")
         let version = LXSourceStore.headerValue(script, "version") ?? ""
         let author = LXSourceStore.headerValue(script, "author") ?? ""
@@ -430,7 +507,7 @@ final class LXSourceRegistry {
     }
 
     private func importScript(script: String, nameHint: String?, origin: String, sourceUrl: String?) throws -> LXSourceMeta {
-        let validated = try validate(script: script)
+        let validated = try validate(script: script, displayName: nameHint)
         let id = UUID().uuidString.lowercased()
         let meta = LXSourceMeta(
             id: id,

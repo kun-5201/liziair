@@ -45,22 +45,127 @@
     cookieInput: $('cookie-input'), cookieImport: $('cookie-import'), cookieMsg: $('cookie-msg'),
   };
 
-  /* 图片直连兜底（2026-11-18 首页无封面）：封面统一走 /api/img 代理，但真机
-     网络下代理拉上游失败/超时时整张封面就没了（推荐栏全是「无封面」占位）。
-     捕获阶段监听所有 <img> 的 error：src 是 /api/img?url=... 的，重试一次
-     直链——酷狗/QQ/酷我 CDN 允许无 Referer 热链（实测 200），网易云有防盗
-     链、直连大概率也失败，但不比占位更差。只重试一次
-     （dataset.imgFallback 防循环），代理本身成功时绝不触发。 */
+  /* 诊断上报（第 6 轮）：POST /api/diag/log，body { category, message, ...fields }。
+     category 约定：audio（播放专员的 player.js 用）/ cover（封面）/ probe（探活）。
+     任何失败都静默降级，绝不影响正常流程；也挂到 window 上供 player.js 复用
+     （player.js 先于本文件加载，运行时再取，用不到就自己按同一约定 fetch）。 */
+  function diagLog(category, message, fields) {
+    try {
+      const body = Object.assign({ category: String(category || 'cover'), message: String(message || '') }, fields || {});
+      fetch('/api/diag/log', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        keepalive: true,
+      }).catch(() => { /* 诊断本身失败就静默丢掉 */ });
+    } catch { /* 静默降级 */ }
+  }
+  try { window.__liziDiagLog = diagLog; } catch { /* 忽略 */ }
+
+  /* 封面加载链（2026-11-18 第 6 轮，重写第 5 轮的 img error 监听）：
+     断点清单（证据见轮次报告）——
+     1) 推荐栏/歌单/曲目行/封面流/移动端环形带都是 <img>，走 API.img（/api/img 代理），
+        第 5 轮监听能覆盖它们；但海报（#hall-hero-art）与播放页背景（#now-bg）是
+        background-image，没有 error 事件，<img> 兜底换了直链、背景还挂在坏代理上；
+     2) 移动端 ring.js 的 error 处理器会给卡加 .is-empty（环形卡上叠「无封面」字样），
+        直链后来加载成功也只加 .is-on、不清 .is-empty，字样一直压在真封面上；
+        跑马带克隆（circular-carousel.js）同理留 .hcc__art--empty；
+     3) 代理本身：固定 Referer https://music.163.com/ 发给所有 CDN、UA 只有裸 "Mozilla/5.0"、
+        http:// 上游不升级 https、非 2xx 先判 Content-Type 会把上游 403 报成 415，
+        失败响应无错误信息可查。代理侧的修在 Proxies.proxyImage。
+     链路：代理 → 直链（一次）→ 明确占位（data: SVG 灰底 + ♪，不循环）。
+     每次失败记诊断：host + 原因（proxy-failed / direct-failed）+ 栏位（lane）。 */
+  const COVER_PH = 'data:image/svg+xml;utf8,' + encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="240" height="240">'
+    + '<rect width="240" height="240" fill="#ddd9d2"/>'
+    + '<text x="50%" y="58%" font-size="84" text-anchor="middle" fill="#b9b4ac">♪</text></svg>');
+  const coverEscRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  function coverDirectOf(proxySrc) {
+    if (!proxySrc) return '';
+    const i = proxySrc.indexOf('/api/img?url=');
+    if (i === -1) return '';
+    let direct = '';
+    try { direct = decodeURIComponent(proxySrc.slice(i + '/api/img?url='.length)); } catch { return ''; }
+    return /^https?:\/\//.test(direct) ? direct : '';
+  }
+  function coverHostOf(url) {
+    try { return new URL(url, location.href).hostname || 'unknown'; } catch { return 'unknown'; }
+  }
+  /* 栏位：下一张真机截图只看日志就能定位是哪一栏的封面挂了。 */
+  function coverLaneOf(img) {
+    if (!img || !img.closest) return 'other';
+    if (img.closest('#hall-marq')) return 'marq';
+    if (img.closest('#hall-hero')) return 'hero';
+    if (img.closest('#coverflow')) return 'coverflow';
+    if (img.closest('.mring__card, .mcard')) return 'ring';
+    if (img.id === 'now-art' || img.id === 'dock-cover' || img.id === 'np-cover'
+      || img.id === 'stage-cover' || img.closest('#view-now') || img.closest('.disc')) return 'now';
+    if (img.classList && img.classList.contains('track__cover')) return 'track';
+    if (img.closest('#playlists')) return 'playlist';
+    if (img.closest('#view-browse, #view-album, #view-artist')) return 'browse';
+    return 'other';
+  }
+  /* 把与某张坏图同源的 background-image 一并换掉（海报底图、播放页背景、飞行动画替身层）。
+     re 匹配相对或绝对形式的同一代理地址；replacement 用函数，避免 URL 里的 $ 被转义。 */
+  function coverSyncBackgrounds(re, replacement) {
+    if (!re) return;
+    document.querySelectorAll('[style]').forEach((el) => {
+      const bg = el.style.backgroundImage || '';
+      if (!bg) return;
+      const next = bg.replace(re, () => replacement);
+      if (next !== bg) el.style.backgroundImage = next;
+    });
+  }
   document.addEventListener('error', (e) => {
     const img = e.target;
-    if (!img || img.tagName !== 'IMG' || img.dataset.imgFallback) return;
+    if (!img || img.tagName !== 'IMG') return;
     const src = img.getAttribute('src') || '';
-    if (!src.startsWith('/api/img?url=')) return;
-    let direct = '';
-    try { direct = decodeURIComponent(src.slice('/api/img?url='.length)); } catch { return; }
-    if (!/^https?:\/\//.test(direct)) return;
+    const lane = coverLaneOf(img);
+    /* 同一个 <img> 被复用又赋了新代理地址（切歌时 #now-art / 海报封面会这样）：
+       旧的兜底标记作废，按新的代理失败重新走一遍；否则新地址一错就被当成
+       「直链失败」直接换占位，等于只给每张图一次机会。 */
+    if (src.indexOf('/api/img?url=') !== -1 && (img.dataset.imgFallback || img.dataset.coverFailed)) {
+      delete img.dataset.imgFallback;
+      delete img.dataset.coverFailed;
+    }
+    if (img.dataset.coverFailed) return;               // 已是占位图还失败：不再重试
+    if (img.dataset.imgFallback) {
+      /* 直链也失败了：记 host + 原因，换明确占位，不循环重试。 */
+      const direct = src;
+      img.dataset.coverFailed = '1';
+      diagLog('cover', 'cover fail host=' + coverHostOf(direct) + ' reason=direct-failed lane=' + lane,
+        { host: coverHostOf(direct), reason: 'direct-failed', lane });
+      if (direct) coverSyncBackgrounds(new RegExp(coverEscRe(direct), 'g'), COVER_PH);
+      img.src = COVER_PH;
+      return;
+    }
+    if (src.indexOf('/api/img?url=') === -1) return;
+    const direct = coverDirectOf(src);
+    if (!direct) return;
+    const enc = src.slice(src.indexOf('/api/img?url=') + '/api/img?url='.length);
     img.dataset.imgFallback = '1';
+    diagLog('cover', 'cover fail host=' + coverHostOf(direct) + ' reason=proxy-failed lane=' + lane,
+      { host: coverHostOf(direct), reason: 'proxy-failed', lane });
+    /* 海报底图 / 播放页背景 / 飞行动画用的是同一代理地址（绝对或相对形式），一并换直链。 */
+    coverSyncBackgrounds(new RegExp('(?:https?://[^\'\"\\s)]+)?/api/img\\?url=' + coverEscRe(enc), 'g'), direct);
     img.src = direct;
+  }, true);
+  /* 直链兜底成功后：清掉 ring.js / circular-carousel.js 留下的「无封面」空态，
+     否则「无封面」字样会一直压在已经加载出来的真封面上。 */
+  document.addEventListener('load', (e) => {
+    const img = e.target;
+    if (!img || img.tagName !== 'IMG' || !img.dataset.imgFallback) return;
+    /* 占位图（data: SVG）本身的 load 不算恢复：它加载成功不代表封面回来了，
+       不能清掉 coverFailed 标记（否则「直链失败 → 占位」的计数会丢）。 */
+    if ((img.getAttribute('src') || '').startsWith('data:')) return;
+    try {
+      const card = img.closest ? img.closest('.mring__card, .mcard') : null;
+      if (card) card.classList.remove('is-empty');
+      const art = img.closest ? img.closest('.marq__art') : null;
+      if (art) art.classList.remove('hcc__art--empty');
+      img.classList.remove('hcc__img--fail');
+      delete img.dataset.coverFailed;
+    } catch { /* 清理失败不影响显示 */ }
   }, true);
 
   /* ================================================================== *
@@ -14454,6 +14559,38 @@
       '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
     }[c]));
     const setState = (msg) => { if (stateEl) stateEl.textContent = msg || ''; };
+    const hostOf = (u) => { try { return new URL(u).host || ''; } catch { return ''; } };
+    /* 导入失败记诊断日志（第 6 轮约定，见 Router.swift /api/diag/log）：
+       category 只用 probe（audio/cover/probe 三种，缺 category/message
+       回 400）；message 以 "lx-source-import: " 开头；host 是脚本 URL 的
+       host、本地文件填 "local-file"；reason 是步骤（import-url/import-file/
+       bind-url）；lane 固定 "lx-source-import"。失败一律静默，不阻塞界面。
+       服务端 LXSources.swift 也会直接记一条（同一条日志），两边都记是
+       为了界面上看到的失败（比如服务端没回包）也能留下记录。 */
+    const reportImportFail = (name, step, host, detail) => {
+      try {
+        fetch('/api/diag/log', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            category: 'probe',
+            message: `lx-source-import: ${name} ${step}失败：${detail}`,
+            host, reason: step, lane: 'lx-source-import',
+          }),
+        }).catch(() => { /* 路由不存在/服务异常时静默 */ });
+      } catch { /* fetch 本身抛错也静默 */ }
+    };
+    /* 读本地 .js：UTF-8 优先（strict，遇到非法字节就抛），失败再试 GBK
+       （有的作者用 GBK 存 .js；旧版 f.text() 直接按 UTF-8 容错解码，中文
+       全变 U+FFFD，脚本必失败）。TextDecoder('gbk') WKWebView 自带。 */
+    const readScriptFile = async (f) => {
+      const buf = await f.arrayBuffer();
+      try {
+        return new TextDecoder('utf-8', { fatal: true }).decode(buf);
+      } catch {
+        return new TextDecoder('gbk').decode(buf);
+      }
+    };
     const setAutoUI = (on) => {
       if (autoBtn) autoBtn.setAttribute('aria-checked', on ? 'true' : 'false');
     };
@@ -14560,8 +14697,16 @@
         try {
           const d = await API.lxSourcesBindUrl(t.dataset.rebindOk, url);
           if (d && d.code === 0) { rebindId = null; setState(`已绑定 URL：${(d.source && d.source.name) || ''}`); refreshList(); }
-          else setState('绑定失败：' + ((d && d.error) || '未知错误'));
-        } catch (err) { setState('绑定失败：' + (err && err.message || err)); }
+          else {
+            const errText = (d && d.error) || '未知错误';
+            setState('绑定失败：' + errText);
+            reportImportFail(url, 'bind-url', hostOf(url), errText);
+          }
+        } catch (err) {
+          const errText = (err && err.message) || String(err);
+          setState('绑定失败：' + errText);
+          reportImportFail(url, 'bind-url', hostOf(url), errText);
+        }
         t.disabled = false;
       }
     });
@@ -14576,8 +14721,16 @@
           if (urlInput) urlInput.value = '';
           setState(`已导入 ${(d.source && d.source.name) || ''}`);
           refreshList();
-        } else setState('导入失败：' + ((d && d.error) || '未知错误'));
-      } catch (err) { setState('导入失败：' + (err && err.message || err)); }
+        } else {
+          const errText = (d && d.error) || '未知错误';
+          setState('导入失败：' + errText);
+          reportImportFail(url, 'import-url', hostOf(url), errText);
+        }
+      } catch (err) {
+        const errText = (err && err.message) || String(err);
+        setState('导入失败：' + errText);
+        reportImportFail(url, 'import-url', hostOf(url), errText);
+      }
       importUrlBtn.disabled = false;
     });
 
@@ -14592,11 +14745,19 @@
         const fails = [];
         for (const f of files) {
           try {
-            const text = await f.text();
+            const text = await readScriptFile(f);
             const d = await API.lxSourcesImportFile(f.name, text);
             if (d && d.code === 0) ok++;
-            else fails.push(`${f.name}：${(d && d.error) || '未知错误'}`);
-          } catch (err) { fails.push(`${f.name}：${err && err.message || err}`); }
+            else {
+              const errText = (d && d.error) || '未知错误';
+              fails.push(`${f.name}：${errText}`);
+              reportImportFail(f.name, 'import-file', 'local-file', errText);
+            }
+          } catch (err) {
+            const errText = (err && err.message) || String(err);
+            fails.push(`${f.name}：${errText}`);
+            reportImportFail(f.name, 'import-file', 'local-file', errText);
+          }
         }
         setState(`已导入 ${ok} 个` + (fails.length ? `；失败 ${fails.length} 个：${fails.join('；')}` : ''));
         importFileBtn.disabled = false;
@@ -14615,6 +14776,111 @@
     });
 
     refreshList();
+  })();
+
+  /* 设置页：构建信息 + 诊断日志查看（第 6 轮）。
+     - 构建：读构建时生成的 /version.json（{ commit, build, date }），在「关于」里
+       显示 commit 短 hash。version.json 不进 git、只在构建机上生成；读不到
+       （本地开发 / 旧包）就显示「未知构建」，不报错。绝对路径 /version.json：
+       /m/ 页相对路径会错到 /m/version.json。
+       #set-app-version 本身不动（桌面壳的 version() 还在写它），构建另起一行。
+     - 诊断：GET /api/diag/search 渲染进 <pre>（最近请求 + 事件 + cover/audio/probe
+       日志）；「复制」把同一份文本进剪贴板。两个按钮失败都静默（留一行字说明）。 */
+  (function initBuildAndDiag() {
+    const buildEl = document.getElementById('set-app-build');
+    if (buildEl) {
+      fetch('/version.json', { cache: 'no-store' })
+        .then((r) => (r && r.ok ? r.json() : null))
+        .then((d) => {
+          if (!d || !d.commit) { buildEl.textContent = '未知构建'; return; }
+          const short = String(d.commit).slice(0, 7);
+          const when = d.date ? ' · ' + String(d.date).slice(0, 10) : '';
+          const run = d.run ? ' · #' + d.run : '';
+          buildEl.textContent = short + when + run;
+          buildEl.title = 'commit ' + String(d.commit);
+        })
+        .catch(() => { buildEl.textContent = '未知构建'; });
+    }
+    const viewBtn = document.getElementById('set-diag-view');
+    const copyBtn = document.getElementById('set-diag-copy');
+    const pre = document.getElementById('set-diag-log');
+    if (!viewBtn || !pre) return;
+    let cachedText = '';
+    async function loadDiagText() {
+      const r = await fetch('/api/diag/search', { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const d = await r.json();
+      const lines = [];
+      const logs = (d && d.logs) || [];
+      lines.push('诊断日志（' + logs.length + ' 条，最新在后）');
+      logs.forEach((e) => {
+        const t = e && e.ts ? new Date(e.ts).toLocaleTimeString('zh-CN', { hour12: false }) : '';
+        const extra = [];
+        if (e && e.host) extra.push('host=' + e.host);
+        if (e && e.reason) extra.push('reason=' + e.reason);
+        if (e && e.lane) extra.push('lane=' + e.lane);
+        if (e && e.code !== undefined && e.code !== null && e.code !== '') extra.push('code=' + e.code);
+        lines.push('[' + (t || '??:??:??') + '] [' + ((e && e.category) || '?') + '] ' + ((e && e.message) || '')
+          + (extra.length ? ' (' + extra.join(' ') + ')' : ''));
+      });
+      const reqs = (d && d.requests) || [];
+      if (reqs.length) {
+        lines.push('');
+        lines.push('最近请求（' + reqs.length + ' 条）：');
+        reqs.forEach((q) => lines.push('  ' + q.method + ' ' + q.path + ' → ' + q.status + '（' + q.ms + 'ms）'));
+      }
+      const evs = (d && d.events) || [];
+      if (evs.length) {
+        lines.push('');
+        lines.push('事件：');
+        evs.forEach((s) => lines.push('  ' + s));
+      }
+      if (d && d.lastSearch && Object.keys(d.lastSearch).length) {
+        lines.push('');
+        lines.push('最近搜索：' + JSON.stringify(d.lastSearch));
+      }
+      return lines.join('\n');
+    }
+    viewBtn.addEventListener('click', async () => {
+      if (!pre.hidden) {
+        pre.hidden = true;
+        viewBtn.textContent = '查看';
+        return;
+      }
+      viewBtn.textContent = '加载中…';
+      try {
+        cachedText = await loadDiagText();
+        pre.textContent = cachedText;
+        pre.hidden = false;
+        viewBtn.textContent = '收起';
+      } catch (err) {
+        pre.textContent = '诊断读不到：' + ((err && err.message) || err) + '（本地服务可能没起来）';
+        pre.hidden = false;
+        viewBtn.textContent = '收起';
+      }
+    });
+    if (copyBtn) {
+      copyBtn.addEventListener('click', async () => {
+        try {
+          if (!cachedText) cachedText = await loadDiagText();
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(cachedText);
+          } else {
+            const ta = document.createElement('textarea');
+            ta.value = cachedText;
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            ta.remove();
+          }
+          copyBtn.textContent = '已复制';
+          setTimeout(() => { copyBtn.textContent = '复制'; }, 1500);
+        } catch {
+          copyBtn.textContent = '复制失败';
+          setTimeout(() => { copyBtn.textContent = '复制'; }, 1500);
+        }
+      });
+    }
   })();
 
   /* 设置 → 本地音乐：导入按钮（走 Hall.importLocal，弹原生文件选择器）。

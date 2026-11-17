@@ -57,6 +57,9 @@ enum StaticFiles {
                         "Content-Type": type,
                         "Accept-Ranges": "bytes",
                         "Content-Range": "bytes \(s)-\(e)/\(data.count)",
+                        // 同 200 分支：Range 分片也不缓存（见下）。
+                        "Cache-Control": "no-store",
+                        "Pragma": "no-cache",
                     ], body: slice)
                 }
             }
@@ -65,6 +68,12 @@ enum StaticFiles {
         return HttpResponse(status: 200, headers: [
             "Content-Type": type,
             "Accept-Ranges": "bytes",
+            // 升级重装后 WKWebView 的 HTTP 缓存仍在（同包名覆盖安装不清空
+            // Library/Caches）：静态资源绝不能被缓存，否则旧 api.js /
+            // player.js / app.js 会一直跑，服务端修了也看不到。no-store
+            // 是最彻底的——每次都回源取包内最新文件。
+            "Cache-Control": "no-store",
+            "Pragma": "no-cache",
         ], body: data)
     }
 
@@ -101,6 +110,20 @@ enum StaticFiles {
 
 /// 上游请求小工具（URLSession，带超时；对标 server.mjs 的 fetch 行为）。
 enum Upstream {
+    /// 直链转 URL：先原样试；含空格 / {} / | 等非法字符时 URL(string:) 会回 nil，
+    /// 这时只把非法字符做 % 编码（保留 :/?#[]@!$&'()*+,;= 结构字符和已有的 %
+    /// 转义），再试一次。两次都 nil 才返回 nil（调用方按原有 400 / false 处理）。
+    /// 背景：LX 脚本返回的直链偶有中文文件名或空格（如 .../周杰伦 - 晴天.mp3），
+    /// 直接 URL(string:) 失败会让探活判死、代理回 400，明明是活链。
+    static func url(from raw: String) -> URL? {
+        if let u = URL(string: raw) { return u }
+        var allowed = CharacterSet.urlFragmentAllowed
+        allowed.insert(charactersIn: "%")
+        guard let encoded = raw.addingPercentEncoding(withAllowedCharacters: allowed),
+              let u = URL(string: encoded) else { return nil }
+        return u
+    }
+
     static func fetch(_ url: URL, headers: [String: String] = [:], timeout: TimeInterval = 20,
                       method: String = "GET", body: Data? = nil) async throws -> (Data, HTTPURLResponse) {
         var req = URLRequest(url: url, timeoutInterval: timeout)

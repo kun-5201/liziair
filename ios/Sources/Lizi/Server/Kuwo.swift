@@ -111,10 +111,14 @@ enum KuwoDES {
         var nStr = nameCodes.map { String($0) }.joined()
         let r = nStr.count / 5
         let chars = Array(nStr)
-        guard 5 * r < chars.count else {
-            throw NSError(domain: "Kuwo", code: -1, userInfo: [NSLocalizedDescriptionKey: "酷我 Secret 算法参数异常"])
-        }
-        let o = Int(String([chars[r], chars[2 * r], chars[3 * r], chars[4 * r], chars[5 * r]])) ?? 0
+        // JS 原实现里 chars[5*r] 越界时是 undefined，join 时直接丢掉这一位，
+        // 而不是整个算法抛错；当前首页 token 名（45 字符 → nStr 长 105，r=21，
+        // 5r=105 恰好越界）会让旧 guard 直接抛错，www()（搜索/歌单/playUrl）全死。
+        // 按 JS 语义补齐：只有第 5 个采样点可能越界（r/2r/3r/4r 恒在界内）。
+        // 实测：该变体 secret 被上游接受（榜单回真实数据），其他变体均 illegal。
+        var samples = [chars[r], chars[2 * r], chars[3 * r], chars[4 * r]]
+        if 5 * r < chars.count { samples.append(chars[5 * r]) }
+        let o = Int(String(samples)) ?? 0
         let l = (name.count + 1) / 2
         let c = 2147483647
         let d = Int.random(in: 0..<100_000_000)

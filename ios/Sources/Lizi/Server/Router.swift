@@ -18,6 +18,33 @@ final class LiziRouter {
         if path == "/api/health" { return .json(200, ["ok": true]) }
         if path == "/api/diag/search" { return .json(200, DiagLog.shared.json()) }
 
+        // ---- 前端诊断上报（第 6 轮）：POST /api/diag/log，JSON body
+        // { category: "audio" | "cover" | "probe", message: string,
+        //   host?: string, reason?: string, lane?: string, code?: number|string,
+        //   detail?: string }。category/message 必填；其余字段原样存进日志，
+        // 设置页「诊断日志」可查看/复制。失败一律静默，前端不阻塞。
+        // player.js 按同一约定 POST 音频失败（MediaError 码、上游 host、
+        // networkState/readyState）和探活结果；app.js 封面失败走同一路由。
+        if path == "/api/diag/log" && req.method == "POST" {
+            let category = req.string("category")
+            let message = req.string("message")
+            guard !category.isEmpty, !message.isEmpty else {
+                return .json(400, ["code": 400, "error": "category and message required"])
+            }
+            var fields: [String: Any] = [:]
+            for k in ["host", "reason", "lane", "detail"] {
+                let v = req.string(k)
+                if !v.isEmpty { fields[k] = v }
+            }
+            if let code = req.params["code"] as? NSNumber { fields["code"] = code }
+            else {
+                let codeStr = req.string("code")
+                if !codeStr.isEmpty { fields["code"] = codeStr }
+            }
+            DiagLog.shared.recordLog(category: category, message: message, fields: fields)
+            return .json(200, ["code": 0])
+        }
+
         // ---- Wallpaper Engine 壁纸（wallpaper-api.mjs）----
         // 主播放器界面不依赖它（只给 658 形态 iframe 用）；v1 先返回 404，见规格文档。
         if path == "/api/wallpaper" || path.hasPrefix("/api/wallpaper/") {
