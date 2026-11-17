@@ -89,10 +89,10 @@
   --shell-max: 1480px;
   --gutter: var(--sp-7);
   --side-w: 268px;
-  --player-h: 92px;
-  --topbar-h: 64px;
+  --player-h: calc(92px + env(safe-area-inset-bottom, 0px));
+  --topbar-h: calc(64px + env(safe-area-inset-top, 0px));
 }
 
 @media (max-width: 900px) {
-  :root { --gutter: var(--sp-4); --side-w: 232px; --player-h: 104px; }
+  :root { --gutter: var(--sp-4); --side-w: 232px; --player-h: calc(104px + env(safe-area-inset-bottom, 0px)); }
 }

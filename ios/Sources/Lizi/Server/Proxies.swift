@@ -17,9 +17,12 @@ enum Proxies {
         // QQ 用 proxyQQAudio 同款白名单（见下方 qqAudioHosts）。
         "qq": [],
         // 落雪：解析出的地址来自各家 CDN（server.mjs 的 AUDIO_HOSTS.lx）。
-        "lx": [".music.126.net", ".126.net", ".163.com", ".qqmusic.qq.com", ".tc.qq.com",
-               ".kuwo.cn", ".kuwo.com", ".kugou.com", ".kgmusic.cn", ".kglink.com",
-               ".migu.cn", ".music.migu.cn"],
+        // 自定义源时代静态白名单兜不住：脚本会返回任意 CDN（长青海棠网、
+        // 环音、聚合的 IP 直连……），白名单一拦就 403、播不出声。
+        // lx 代理只放行 http/https（上面已校验），不限域名：本地服务只绑
+        // 127.0.0.1，只有本 App 自己能调；脚本本身走 lx.request 也能任意
+        // 拉取，白名单对 lx 没有实际防护意义。其它平台的白名单保持不变。
+        "lx": [],
     ]
 
     /// QQ 音频代理的域名白名单（server.mjs 的 proxyQQAudio：/(^|\.)qq\.com$/i，仅腾讯域名）。
@@ -124,9 +127,11 @@ enum Proxies {
             }
         }
         allow = audioHosts[source] ?? []
-        guard !allow.isEmpty else { return .error(403, "no audio for source \(source)") }
-        guard hostAllowed(host, suffixes: allow) else {
-            return .error(403, "host not allowed: \(host)")
+        if source != "lx" {
+            guard !allow.isEmpty else { return .error(403, "no audio for source \(source)") }
+            guard hostAllowed(host, suffixes: allow) else {
+                return .error(403, "host not allowed: \(host)")
+            }
         }
         var headers: [String: String] = ["User-Agent": "Mozilla/5.0"]
         if let ref = audioReferer[source], !ref.isEmpty { headers["Referer"] = ref }

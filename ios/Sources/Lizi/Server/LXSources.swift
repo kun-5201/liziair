@@ -6,8 +6,10 @@ import CryptoKit
 /// 持久化（重启后仍在）：
 ///   脚本文件  Application Support/lx-sources/<id>.js
 ///   元数据    同目录 manifest.json（[LXSourceMeta]）
-///   自动切换开关  UserDefaults "lxAutoSwitch"（默认关，和 lxApiUrl 同一模式）
-/// 内置 public/落雪音源.js 不在这里管，仍走 LXScriptEngine.shared。
+///   自动切换开关  UserDefaults "lxAutoSwitch"（默认关）
+/// 内置落雪音源.js 已删（用户 2026-11-18 要求删掉「落雪音源」）：取歌链只走
+/// 自定义源，没有内置解析、没有自定义 LX 服务器；拿不到就抛错，
+/// 由 player.js 走平台接口备用。
 ///
 /// 内置源仓库（pdone/lx-music-source，20 个，含 suyin 溯音音源——用户
 /// 2026-11-17 21:00 明确说「都加」，推翻了之前「溯音不打包」的规矩，按最新
@@ -118,11 +120,8 @@ enum LXSourceStore {
 // MARK: - 注册表
 
 /// 自定义源注册表：单例；清单读写在 ioQueue 上，运行实例在 instancesLock 后。
-/// 取歌链（resolveMusicUrl）：启用的自定义源（列表顺序，只试它声明覆盖的平台）
-///   → 内置落雪音源.js → 自定义 LX 服务器（LXResolver.externalApiURL）
-///   → 全部失败抛错，由 player.js 走平台接口备用。
-/// 自动切换开关：开 = 逐个试全部启用的自定义源；关 = 只试第一个可用候选
-///   （其余自定义源跳过，内置源和自定义服务器这两级既有兜底照常走）。
+/// 取歌链（resolveMusicUrl）：启用的自定义源（列表顺序，只试它声明覆盖的平台）。
+/// 自动切换开关：开 = 逐个试全部启用的自定义源；关 = 只试第一个可用候选。
 final class LXSourceRegistry {
     static let shared = LXSourceRegistry()
 
@@ -470,36 +469,70 @@ final class LXSourceRegistry {
 
     // MARK: - 取歌链
 
-    /// 取歌：自定义源（列表顺序）→ 内置落雪音源.js → 自定义 LX 服务器 → 抛错。
-    /// 返回 (url, 实际档位, via)。via：custom:<id> / lx-script / external。
+    /// 取歌：只试启用的自定义源（列表顺序）。返回 (url, 实际档位, via)。
+    /// via：custom:<id>。没有内置落雪音源.js、没有自定义 LX 服务器——用户
+    /// 2026-11-18 要求删掉「落雪音源」，链路改成 自定义源 → 平台接口备用
+    /// （平台备用在 player.js，不在这里）。
+    /// 每个候选 URL 先校验（Range 取 1 字节、8 秒上限，跟随重定向）：
+    /// 有的脚本只拼 URL 不验证上游（长青直接拼 PHP 地址），返回的地址
+    /// 可能是死的；校验不过就试下一个候选，别把死链交给播放器。
+    /// 整条链路 30 秒总期限：超时就抛错走平台备用，别吃掉前端 60 秒超时。
     func resolveMusicUrl(source: String, songId: String, quality: String, autoSwitch: Bool) async throws -> (String, String, String) {
-        var lastError: Error?
-        let candidates = list().filter { $0.enabled && $0.platforms.contains(source) }
-        let tryList = autoSwitch ? candidates : Array(candidates.prefix(1))
-        for meta in tryList {
-            do {
-                let inst = try instance(for: meta)
-                let (url, tier) = try await inst.resolveMusicUrl(source: source, songId: songId, quality: quality)
-                return (url, tier, "custom:\(meta.id)")
-            } catch {
-                lastError = error
+        try await withThrowingTaskGroup(of: (String, String, String).self) { group in
+            group.addTask {
+                var lastError: Error?
+                let candidates = self.list().filter { $0.enabled && $0.platforms.contains(source) }
+                let tryList = autoSwitch ? candidates : Array(candidates.prefix(1))
+                for meta in tryList {
+                    do {
+                        let inst = try self.instance(for: meta)
+                        let (url, tier) = try await inst.resolveMusicUrl(source: source, songId: songId, quality: quality)
+                        if await Self.audioURLReachable(url) {
+                            return (url, tier, "custom:\(meta.id)")
+                        }
+                        lastError = NSError(domain: "LXSources", code: 2, userInfo: [NSLocalizedDescriptionKey: "音源 \(meta.name) 返回的地址打不开"])
+                    } catch {
+                        lastError = error
+                    }
+                }
+                throw lastError ?? NSError(domain: "LXSources", code: 2, userInfo: [NSLocalizedDescriptionKey: "全部音源均失败"])
             }
+            group.addTask {
+                try await Task.sleep(nanoseconds: 30_000_000_000)
+                throw NSError(domain: "LXSources", code: -1, userInfo: [NSLocalizedDescriptionKey: "落雪解析超时（30 秒）"])
+            }
+            guard let r = try await group.next() else {
+                throw NSError(domain: "LXSources", code: 2, userInfo: [NSLocalizedDescriptionKey: "落雪解析无返回"])
+            }
+            group.cancelAll()
+            return r
         }
+    }
+
+    /// 校验音频直链是否真的能打开：Range 取 1 字节，只等响应头（不下载正文）。
+    /// 跟随重定向（URLSession 默认）；2xx 即算通。
+    static func audioURLReachable(_ urlString: String, timeout: TimeInterval = 8) async -> Bool {
+        guard let url = URL(string: urlString),
+              url.scheme == "http" || url.scheme == "https" else { return false }
         do {
-            let r = try await LXScriptEngine.shared.resolveMusicUrl(source: source, songId: songId, quality: quality)
-            return (r.0, r.1, "lx-script")
-        } catch {
-            lastError = error
-        }
-        if !LXResolver.externalApiURL.isEmpty {
-            do {
-                let r = try await LXResolver.resolveViaExternalServer(source: source, songId: songId, quality: quality)
-                return (r.0, r.1, "external")
-            } catch {
-                lastError = error
+            return try await withThrowingTaskGroup(of: Bool.self) { group in
+                group.addTask {
+                    var req = URLRequest(url: url, timeoutInterval: timeout)
+                    req.setValue("bytes=0-1", forHTTPHeaderField: "Range")
+                    req.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+                    let (_, resp) = try await URLSession.shared.bytes(for: req)
+                    guard let http = resp as? HTTPURLResponse else { return false }
+                    return (200..<300).contains(http.statusCode)
+                }
+                group.addTask {
+                    try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                    return false
+                }
+                return await group.next() ?? false
             }
+        } catch {
+            return false
         }
-        throw lastError ?? NSError(domain: "LXSources", code: 2, userInfo: [NSLocalizedDescriptionKey: "全部音源均失败"])
     }
 
     // MARK: - 内部

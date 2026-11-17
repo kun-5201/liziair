@@ -2,27 +2,25 @@ import Foundation
 import JavaScriptCore
 import CryptoKit
 
-/// 落雪音源脚本引擎：用 JavaScriptCore 跑落雪 LX Music 源脚本（KMusic 的 落雪音源.js v1.0.3，
-/// 或用户在「自定义源管理」里导入的任意源脚本），取歌走脚本的 musicUrl。
+/// 落雪音源脚本引擎：用 JavaScriptCore 跑用户在「自定义源管理」里导入的
+/// LX Music 源脚本，取歌走脚本的 musicUrl。
 ///
 /// 一个脚本 = 一个独立 JSContext（LXScriptInstance），互不串台；所有 JSContext
 /// 只在同一条串行队列 jsQueue 上碰。lx 运行时（request / on / send / utils /
-/// EVENT_NAMES / console）的装配只有一份（LXScriptRuntime.install），内置源和
-/// 自定义源共用，不复制粘贴两份。
+/// EVENT_NAMES / console）的装配只有一份（LXScriptRuntime.install）。
 ///
 /// lx 运行时照 KMusic 二进制里的桥来：
 ///   exp.musicUrl(source, musicInfo, quality)、exp.sources、actions；
 ///   env = "mobile"，version = "2.12.0"（和 KMusic 的 lx-music-mobile/2.12.0 UA 一致）。
 /// 另外补了真实落雪宿主会给、但 KMusic 桥没有的几样（pdone 仓库的源脚本要用，
 /// 没有就加载即崩）：lx.currentScriptInfo（脚本头注释）、atob/btoa、
-/// window/self（= globalThis）、lx.utils.crypto（md5/sha1/sha256）。
-/// 自定义服务器（LX_API_URL）不经过这里，见 LXSourceRegistry 的取歌链。
-/// kg/kw/mg 内置脚本里没有，仍走 LXResolver 内置解析；脚本全部档位失败时也回退
-/// 到内置解析，别让一次上游故障直接断播。
+/// window/self（= globalThis）、lx.utils.crypto（md5/sha1/sha256）、
+/// setTimeout/setInterval/clearTimeout/clearInterval（JSC 自带没有；
+/// 野花/清凉/星澜/雨凝溪等脚本加载或取歌时就要用）。
 ///
 /// 线程：JSContext 只在 jsQueue 这条串行队列上碰；网络请求走 URLSession，
 /// 回调跳回 jsQueue 再调 JS。JSC 里未处理的 Promise rejection 不会崩 App
-/// （脚本加载时的 checkUpdate 失败就是这么走的）。
+/// （脚本加载时的 checkUpdate 失败就是这么走的）.
 
 // MARK: - lx 运行时装配（内置源 / 自定义源共用，只有一份）
 
@@ -176,6 +174,24 @@ enum LXScriptRuntime {
         // atob/btoa（JSC 自带没有；独家音源加载时就要用）与 window/self
         //（六音读 window.console；都指向 globalThis）。
         ctx.evaluateScript("var atob = __lxAtob; var btoa = __lxBtoa; var window = globalThis; var self = globalThis;")
+
+        // setTimeout/setInterval/clearTimeout/clearInterval（JSC 自带没有；
+        // 野花/清凉/星澜/雨凝溪等脚本加载或取歌时就要用）。回调一律跳回 jsQueue
+        // 再调 JS；取消后不再触发；fn 弱引用，上下文释放后自动停。
+        let timers = LXTimerState()
+        let setTimeoutBlock: @convention(block) (JSValue?, Double) -> Double = { [weak ctx] fn, ms in
+            guard let ctx, let fn, !fn.isUndefined else { return 0 }
+            return timers.schedule(ctx: ctx, fn: fn, ms: ms, repeats: false)
+        }
+        let setIntervalBlock: @convention(block) (JSValue?, Double) -> Double = { [weak ctx] fn, ms in
+            guard let ctx, let fn, !fn.isUndefined else { return 0 }
+            return timers.schedule(ctx: ctx, fn: fn, ms: ms, repeats: true)
+        }
+        let clearTimeoutBlock: @convention(block) (Double) -> Void = { id in timers.cancel(id: id) }
+        ctx.setObject(JSValue(object: setTimeoutBlock, in: ctx)!, forKeyedSubscript: "setTimeout" as NSString)
+        ctx.setObject(JSValue(object: setIntervalBlock, in: ctx)!, forKeyedSubscript: "setInterval" as NSString)
+        ctx.setObject(JSValue(object: clearTimeoutBlock, in: ctx)!, forKeyedSubscript: "clearTimeout" as NSString)
+        ctx.setObject(JSValue(object: clearTimeoutBlock, in: ctx)!, forKeyedSubscript: "clearInterval" as NSString)
     }
 
     /// utils.buffer 的 JS 实现（和 /tmp/lx-test/lx-utils.js 同一份逻辑）。
@@ -255,6 +271,43 @@ enum LXScriptRuntime {
       return out;
     };
     """
+}
+
+// MARK: - 定时器（setTimeout/setInterval，JSC 自带没有）
+
+/// 每个 JSContext 一份（install() 里创建，block 捕获它）：回调跳回 jsQueue 再调 JS。
+final class LXTimerState {
+    private let lock = NSLock()
+    private var nextId: Double = 1
+    private var cancelled: Set<Double> = []
+
+    func schedule(ctx: JSContext, fn: JSValue, ms: Double, repeats: Bool) -> Double {
+        lock.lock()
+        let id = nextId
+        nextId += 1
+        lock.unlock()
+        fire(ctx: ctx, fn: fn, ms: ms, repeats: repeats, id: id)
+        return id
+    }
+
+    private func fire(ctx: JSContext, fn: JSValue, ms: Double, repeats: Bool, id: Double) {
+        let delay = max(0, ms) / 1000.0
+        LXScriptInstance.jsQueue.asyncAfter(deadline: .now() + delay) { [weak self, weak ctx, weak fn] in
+            guard let self, let ctx, let fn else { return }
+            self.lock.lock()
+            let dead = self.cancelled.contains(id)
+            self.lock.unlock()
+            guard !dead else { return }
+            _ = fn.call(withArguments: [])
+            if repeats { self.fire(ctx: ctx, fn: fn, ms: ms, repeats: repeats, id: id) }
+        }
+    }
+
+    func cancel(id: Double) {
+        lock.lock()
+        cancelled.insert(id)
+        lock.unlock()
+    }
 }
 
 // MARK: - 单脚本实例（一个源脚本 = 一个独立 JSContext）
@@ -444,47 +497,6 @@ final class LXScriptInstance {
         }
         guard freshSink.requestHandler != nil else {
             throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "不是有效的落雪音源脚本：没有注册 request 处理"])
-        }
-    }
-}
-
-// MARK: - 内置源（Bundle 里的 public/落雪音源.js v1.0.3）
-
-/// 内置落雪音源：注册表里的 "builtin" 项。tx/wy 走脚本；kg/kw/mg 脚本没有，
-/// 引擎内部走内置解析；脚本全挂时也回退内置解析。
-final class LXScriptEngine {
-    static let shared = LXScriptEngine()
-
-    static let scriptTiers = LXScriptInstance.scriptTiers
-    static let scriptSources = ["wy", "tx"]
-
-    private let builtin: LXScriptInstance
-
-    private init() {
-        let script = Bundle.main.resourceURL
-            .flatMap { try? String(contentsOf: $0.appendingPathComponent("public/落雪音源.js"), encoding: .utf8) } ?? ""
-        builtin = LXScriptInstance(script: script)
-    }
-
-    /// 按档位从高到低回退，返回 (url, 实际档位)。
-    func resolveMusicUrl(source: String, songId: String, quality: String) async throws -> (String, String) {
-        guard !songId.isEmpty else {
-            throw NSError(domain: "LXScript", code: 6, userInfo: [NSLocalizedDescriptionKey: "缺少歌曲 ID"])
-        }
-        // 脚本只支持 tx/wy；kg/kw/mg 直接走内置解析。
-        guard Self.scriptSources.contains(source) else {
-            return try await LXResolver.resolveMusicUrl(source: source, songId: songId, quality: quality)
-        }
-        do {
-            try builtin.load()
-            return try await builtin.resolveMusicUrl(source: source, songId: songId, quality: quality)
-        } catch let scriptError {
-            // 脚本全部档位失败，回退内置解析（oiapi 备用）。
-            do {
-                return try await LXResolver.resolveMusicUrl(source: source, songId: songId, quality: quality)
-            } catch {
-                throw scriptError
-            }
         }
     }
 }

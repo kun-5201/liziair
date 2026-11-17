@@ -82,15 +82,11 @@ final class WebHost: NSObject, ObservableObject, WKUIDelegate {
     }
 
     func start() {
+        // 幂等：onAppear 可能多次触发；重复启动会建一个新端口的服务、丢掉
+        // 旧服务，页面还指着旧端口，后续 /api 请求全变 Load failed。
+        guard server == nil else { return }
         failed = false
         do {
-            // 外部 LX 服务地址（设置页「落雪音源」里填，存 UserDefaults；默认内置解析）。
-            if let lxURL = UserDefaults.standard.string(forKey: "lxApiUrl"), !lxURL.isEmpty {
-                LXResolver.externalApiURL = lxURL
-            }
-            if let lxKey = UserDefaults.standard.string(forKey: "lxApiKey") {
-                LXResolver.externalApiKey = lxKey
-            }
             let server = try LocalHttpServer(router: router)
             self.server = server
             server.start()

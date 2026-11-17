@@ -69,7 +69,7 @@ img { display: block; }
 .ico--solid { fill: currentColor; stroke: none; }
 .defs { position: absolute; width: 0; height: 0; overflow: hidden; }
 .muted { color: var(--ink-3); }
-.hint { color: var(--ink-3); font-size: var(--text-sm); padding: var(--sp-5) var(--sp-3); text-align: center; margin: 0; }
+.hint { color: var(--ink-3); font-size: var(--text-sm); padding: var(--sp-5) var(--sp-3); text-align: center; margin: 0; white-space: pre-line; }
 .time { font-family: var(--font-mono); font-size: var(--text-xs); color: var(--ink-3); font-variant-numeric: tabular-nums; flex: none; width: 38px; text-align: center; }
 code { font-family: var(--font-mono); font-size: 0.92em; background: oklch(21% 0.022 270 / 0.06); padding: 1px 5px; border-radius: 5px; }
 
@@ -172,15 +172,23 @@ code { font-family: var(--font-mono); font-size: 0.92em; background: oklch(21% 0
   box-shadow: none;
   transition: box-shadow .35s cubic-bezier(0.32, 0.72, 0, 1);
 }
-/* 滚起来之后：给一条极淡的分隔线 + 柔和投影，让玻璃"浮"在内容上方 */
+/* 滚起来之后：给一条极淡的分隔线 + 柔和投影，让玻璃"浮"在内容上方；
+   再给近不透明底 + 模糊——顶栏本身是透明玻璃，滚动时卡片会从底下透出来，
+   看着像标题栏和卡片重叠（用户截图就是这么坏的）。 */
 .topbar.is-stuck {
   border-bottom: 1px solid oklch(21% 0.022 270 / 0.05);
   box-shadow: 0 14px 30px -20px oklch(18% 0.012 270 / 0.6);
+  background: color-mix(in oklab, var(--paper-2) 88%, transparent);
+  -webkit-backdrop-filter: blur(24px) saturate(1.1);
+  backdrop-filter: blur(24px) saturate(1.1);
 }
 
 .topbar__inner {
   position: relative;
   height: 100%;
+  box-sizing: border-box;
+  /* 顶栏高含安全区（刘海/灵动岛）；内容只占下面 64px，别顶进刘海里 */
+  padding-top: env(safe-area-inset-top, 0px);
   display: flex; align-items: center; justify-content: space-between;
   gap: var(--sp-4);
   padding-inline: var(--gutter);
@@ -1202,13 +1210,20 @@ button.setpage__row[aria-expanded="true"]:hover .setpage__caret { transform: rot
 .tracks { list-style: none; margin: 0; padding: 0; }
 
 /* ---- 音源切换（搜索结果页顶部一行）：细线 + 小字，只有当前音源是墨色 ---- */
+/* 390px 宽放不下 6 个页签：横向滚动，按钮不换行不压缩（之前 flex 默认收缩，
+   「全部」竖排两行、「网易云」竖排三行）。 */
 .src-switch {
   display: flex; align-items: baseline; gap: var(--sp-4);
   max-width: 1600px; margin: 0 auto var(--sp-2);
   padding: 0 var(--gutter) var(--sp-2);
   border-bottom: 1px solid var(--rule);
+  overflow-x: auto; overflow-y: hidden;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
 }
+.src-switch::-webkit-scrollbar { display: none; }
 .src-switch__b {
+  flex: none; white-space: nowrap;
   padding: 0 0 3px; border: 0; border-bottom: 1px solid transparent;
   background: transparent; cursor: pointer;
   font-size: var(--text-sm); color: var(--ink-3);
@@ -2009,6 +2024,9 @@ body.now-enter .drawer__body > *:nth-child(3) { animation-delay: 420ms; }
 }
 .player__inner {
   height: 100%;
+  box-sizing: border-box;
+  /* 播放条高含底部安全区（Home 指示条）；内容只占上面部分，别压到指示条 */
+  padding-bottom: env(safe-area-inset-bottom, 0px);
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr) minmax(0, 1fr);
   align-items: center; gap: var(--sp-6);
@@ -8001,10 +8019,12 @@ body.pbn-off #player { display: none !important; }
   .setconsole__layout { display: block; }
   .setnav {
     position: sticky;
-    /* 吸附基准是滚动容器 #view-settings 的内容盒：它的 padding-top 已经
-       (顶栏高 + sp-5) 让出了顶栏。这里再写 top:calc(--topbar-h + 6px)
-       等于又叠了 84px，整条会吸到屏幕中间压住卡片。top:0 才是贴住内容顶边。 */
-    top: 0;
+    /* 吸顶位置：Chrome 里 sticky 的 top 是相对滚动容器内容盒顶算的，
+       视觉位置 = top + 容器 padding-top；容器 padding-top 是
+       (topbar-h + sp-5)，所以 top 写 -sp-5，吸住时正好贴在顶栏下沿
+       （64px 处，和 scrollToSection 假定的位置一致；写 top:0 会吸到 84px，
+       写 top:var(--topbar-h) 会吸到 148px，都留一条缝让卡片从缝里漏出来）。 */
+    top: calc(var(--sp-5) * -1);
     z-index: 6;
     flex-direction: row;
     gap: 4px;
@@ -8013,6 +8033,9 @@ body.pbn-off #player { display: none !important; }
     overflow-x: auto;
     overflow-y: hidden;
     scrollbar-width: none;
+    /* 横向滚动时 chip 别贴边停（「本地音…」被截一半就是贴边停的）；JS 滚到
+       活动 chip 时留 12px 空气。 */
+    scroll-padding-inline: 12px;
     border: 1px solid var(--rule);
     border-radius: 999px;
     /* 不用 backdrop-filter：大面积模糊在这个应用里会掉帧，近不透明底就够 */

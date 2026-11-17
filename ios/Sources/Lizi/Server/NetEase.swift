@@ -33,11 +33,12 @@ final class NetEaseService {
         var setCookies: [String]
     }
 
-    private func fetchUpstream(_ url: URL, headers: [String: String], body: Data) async throws -> UpstreamResult {
+    private func fetchUpstream(_ url: URL, headers: [String: String], body: Data,
+                               timeout: TimeInterval = 15, attempts: Int = 2) async throws -> UpstreamResult {
         var lastError: Error?
-        for attempt in 0..<2 {
+        for attempt in 0..<max(1, attempts) {
             do {
-                var req = URLRequest(url: url, timeoutInterval: 15)
+                var req = URLRequest(url: url, timeoutInterval: timeout)
                 req.httpMethod = "POST"
                 for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
                 req.httpBody = body
@@ -62,7 +63,7 @@ final class NetEaseService {
                                       setCookies: setCookies)
             } catch {
                 lastError = error
-                if attempt < 1 {
+                if attempt < max(1, attempts) - 1 {
                     try? await Task.sleep(nanoseconds: UInt64(400 * (attempt + 1)) * 1_000_000)
                 }
             }
@@ -78,7 +79,8 @@ final class NetEaseService {
     }
 
     /// weapi 请求：POST https://music.163.com/weapi + apiPath。
-    func weapiRequest(_ apiPath: String, _ payload: [String: Any]) async throws -> UpstreamResult {
+    func weapiRequest(_ apiPath: String, _ payload: [String: Any],
+                      timeout: TimeInterval = 15, attempts: Int = 2) async throws -> UpstreamResult {
         var obj = payload
         obj["csrf_token"] = session.csrf
         guard let enc = NetEaseCrypto.weapi(obj) else {
@@ -94,12 +96,13 @@ final class NetEaseService {
             "X-Forwarded-For": "118.88.88.88",
         ]
         let body = formBody([("params", enc.params), ("encSecKey", enc.encSecKey), ("csrf_token", session.csrf)])
-        return try await fetchUpstream(url, headers: headers, body: body)
+        return try await fetchUpstream(url, headers: headers, body: body, timeout: timeout, attempts: attempts)
     }
 
     /// eapi 请求：签名路径 /api + apiPath，实际打到 https://music.163.com/eapi + apiPath。
     /// checkToken 为 true 时先取易盾 token 加 X-antiCheatToken 头（取不到就不带，继续请求）。
-    func eapiRequest(_ apiPath: String, _ payload: [String: Any], checkToken: Bool = false) async throws -> UpstreamResult {
+    func eapiRequest(_ apiPath: String, _ payload: [String: Any], checkToken: Bool = false,
+                     timeout: TimeInterval = 15, attempts: Int = 2) async throws -> UpstreamResult {
         let signedPath = apiPath.hasPrefix("/api") ? apiPath : "/api" + apiPath
         guard let params = NetEaseCrypto.eapi(apiPath: signedPath, object: payload, csrf: session.csrf) else {
             throw NSError(domain: "NetEase", code: -2, userInfo: [NSLocalizedDescriptionKey: "eapi encrypt failed"])
@@ -116,7 +119,7 @@ final class NetEaseService {
             headers["X-antiCheatToken"] = token
         }
         let body = formBody([("params", params)])
-        return try await fetchUpstream(url, headers: headers, body: body)
+        return try await fetchUpstream(url, headers: headers, body: body, timeout: timeout, attempts: attempts)
     }
 
     /// 易盾反作弊 token v3（包里 register_checktoken_v3 的做法）：
@@ -346,10 +349,16 @@ extension NetEaseService {
 
         do {
             let result: UpstreamResult
+            // 搜索要快：上游慢网时别重试、别拖到前端 60 秒超时才掐掉——
+            // 单次 10 秒上限，失败就回 502，前端显示明确原因。
+            // 其它接口保持 15 秒 × 2 次。
+            let isSearch = hit.key == "search"
+            let reqTimeout: TimeInterval = isSearch ? 10 : 15
+            let reqAttempts = isSearch ? 1 : 2
             if hit.route.channel == "eapi" {
-                result = try await eapiRequest(apiPath, payload)
+                result = try await eapiRequest(apiPath, payload, timeout: reqTimeout, attempts: reqAttempts)
             } else {
-                result = try await weapiRequest(apiPath, payload)
+                result = try await weapiRequest(apiPath, payload, timeout: reqTimeout, attempts: reqAttempts)
             }
             let normalized = await normalize(routeKey: hit.key, data: result.json, payload: payload)
             return .json(200, normalized)
@@ -410,9 +419,20 @@ extension NetEaseService {
             let result = dict(data, "result")
             var tracks = arr(result, "songs").compactMap { toTrack($0) }
             // 任一缺封面就批量查详情补封面（失败不影响搜索本身）。
+            // 补封面是锦上添花：6 秒拿不到就直接返回搜索结果，别让它把
+            // 搜索拖到前端 60 秒超时（慢网下这一步曾让整条搜索超时）。
             if tracks.contains(where: { str($0, "cover").isEmpty }) {
                 let ids = tracks.compactMap { $0["id"] as? Int }
-                let details = await fetchTrackDetails(ids)
+                let details = await withTaskGroup(of: [[String: Any]].self) { group in
+                    group.addTask { await self.fetchTrackDetails(ids) }
+                    group.addTask {
+                        try? await Task.sleep(nanoseconds: 6_000_000_000)
+                        return []
+                    }
+                    let first = await group.next() ?? []
+                    group.cancelAll()
+                    return first
+                }
                 var byId: [Int: [String: Any]] = [:]
                 for d in details {
                     if let id = d["id"] as? Int, byId[id] == nil { byId[id] = d }

@@ -794,10 +794,6 @@ python -c "from pedalboard import load_plugin; p=load_plugin(r'C:\Program Files\
           <svg class="setnav__ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8.5" r="3.5"/><path d="M5 20c.9-3.3 3.5-5 7-5s6.1 1.7 7 5"/></svg>
           <span class="setnav__label">平台账号</span>
         </button>
-        <button class="setnav__item" type="button" data-sec="set-sec-lx">
-          <svg class="setnav__ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V6l10-2v11"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="16.5" cy="15" r="2.5"/></svg>
-          <span class="setnav__label">落雪音源</span>
-        </button>
         <button class="setnav__item" type="button" data-sec="set-sec-source">
           <svg class="setnav__ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l9 5-9 5-9-5 9-5z"/><path d="M3.5 13.5L12 18l8.5-4.5"/><path d="M3.5 17.5L12 22l8.5-4.5"/></svg>
           <span class="setnav__label">自定义源管理</span>
@@ -919,22 +915,10 @@ python -c "from pedalboard import load_plugin; p=load_plugin(r'C:\Program Files\
       </button>
     </section>
 
-    <!-- ---------- 落雪音源 ---------- -->
-      <section class="setpage__sec setcard setcard--wide" id="set-sec-lx" aria-labelledby="setpage-h-lx">
-        <h2 class="setpage__h" id="setpage-h-lx">落雪音源</h2>
-      <p class="setpage__note">播放地址优先走落雪（内置解析，或下面填你自己的落雪服务器）；落雪拿不到时再走平台接口。搜索与歌词仍走平台接口。</p>
-      <div class="setpage__row lx-set__row">
-        <span class="setpage__label">落雪服务器</span>
-        <input class="lx-set__input" id="lx-server-url" type="url" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="留空用内置解析，如 http://192.168.1.2:3000">
-        <button class="setpage__act" id="lx-server-save" type="button">保存</button>
-      </div>
-      <p class="setpage__note" id="lx-server-state" role="status">当前：内置解析</p>
-      </section>
-
     <!-- ---------- 自定义源管理 ---------- -->
       <section class="setpage__sec setcard setcard--wide" id="set-sec-source" aria-labelledby="setpage-h-source">
         <h2 class="setpage__h" id="setpage-h-source">自定义源管理</h2>
-      <p class="setpage__note">导入落雪音源脚本（LX Music 源），播放时按列表顺序依次尝试；内置落雪音源仍可用，搜索与歌词仍走平台接口。</p>
+      <p class="setpage__note">导入落雪音源脚本（LX Music 源），播放时按列表顺序依次尝试；拿不到时走平台接口。搜索与歌词仍走平台接口。</p>
       <div class="setpage__row setpage__row--switch">
         <span class="setpage__label-group">
           <span class="setpage__label">自动切换音源</span>

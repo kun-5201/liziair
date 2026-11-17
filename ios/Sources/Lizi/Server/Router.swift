@@ -30,29 +30,10 @@ final class LiziRouter {
         if path == "/api/lx/song/url" { return await handleLxSongUrl(req) }
         if path == "/api/lx/health" {
             return .json(200, ["code": 0, "sources": ["wy", "tx", "kg", "kw", "mg"],
-                              "tiers": LXScriptEngine.scriptTiers,
-                              "via": LXResolver.externalApiURL.isEmpty ? "lx-script" : "external"])
+                              "tiers": LXScriptInstance.scriptTiers,
+                              "via": "custom"])
         }
         if path == "/api/lx/audio" { return await Proxies.proxySourceAudio(req, source: "lx") }
-
-        // ---- 落雪设置：自定义服务器地址（设置页用；存 UserDefaults，重启仍生效；留空 = 内置解析）----
-        if path == "/api/settings/lx" {
-            if req.method == "POST" {
-                let url = req.string("url").trimmingCharacters(in: .whitespacesAndNewlines)
-                if !url.isEmpty {
-                    guard url.hasPrefix("http://") || url.hasPrefix("https://") else {
-                        return .json(400, ["code": 400, "error": "地址须以 http:// 或 https:// 开头"])
-                    }
-                    UserDefaults.standard.set(url, forKey: "lxApiUrl")
-                    LXResolver.externalApiURL = url
-                } else {
-                    UserDefaults.standard.removeObject(forKey: "lxApiUrl")
-                    LXResolver.externalApiURL = ""
-                }
-            }
-            return .json(200, ["code": 200, "url": LXResolver.externalApiURL,
-                                "via": LXResolver.externalApiURL.isEmpty ? "builtin" : "external"])
-        }
 
         // ---- 自定义源管理（设置 → 自定义源管理；见 LXSources.swift）----
         // 失败一律回 200 + { code:400, error }（不回 HTTP 400），前端 api.js 的
@@ -227,7 +208,7 @@ final class LiziRouter {
         let quality = req.string("quality", "master")
         do {
             // 取歌链（LXSourceRegistry）：启用的自定义源（列表顺序，只试它声明覆盖
-            // 的平台）→ 内置落雪音源.js → 自定义 LX 服务器 → 失败抛错，
+            // 的平台），每个候选 URL 校验能打开才返回；全部失败抛错，
             // 由 player.js 走平台接口备用。自动切换开关控制是否多源重试。
             let r = try await LXSourceRegistry.shared.resolveMusicUrl(
                 source: lxSource, songId: songId, quality: quality,

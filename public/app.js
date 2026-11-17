@@ -3821,7 +3821,9 @@
     if (!sec || !settingsView) return;
     const vr = settingsView.getBoundingClientRect();
     const sr = sec.getBoundingClientRect();
-    const topbar = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--topbar-h')) || 64;
+    /* 量顶栏实高，别 parse --topbar-h：它是 calc(64px + env(...))，真机上
+       parseFloat 只读到 64，少算刘海那 47px，卡片标题会滚到导航条下面去。 */
+    const topbar = (el.topbar ? el.topbar.getBoundingClientRect().height : 0) || 64;
     /* 窄屏 chips 是横向吸顶的，再多让出它的高度，否则卡片标题会被压在 chips 下面 */
     const navRow = setNav && getComputedStyle(setNav).flexDirection === 'row';
     const navH = navRow ? setNav.getBoundingClientRect().height + 8 : 0;
@@ -13304,7 +13306,16 @@
       }
     }
     hint(`全部 · ${okCount}/${SEARCH_SOURCES.length} 个音源有结果 · ${all.length} 首`);
-    if (!all.length) { emptyList('全部音源都没有结果'); return; }
+    if (!all.length) {
+      /* 一家都没回来时也别只留一句「都没有结果」：把每家的失败原因列出来，
+         不然用户分不清是搜不到还是请求挂了（网易 Load failed 就是这么被吞掉的）。 */
+      const lines = ['全部音源都没有结果'];
+      for (const r of results) {
+        lines.push(`${srcLabel(r.id)}：${r.error ? '失败：' + r.error : '没有结果'}`);
+      }
+      emptyList(lines.join('\n'));
+      return;
+    }
     renderTracks(all, headings);
   }
 
@@ -14233,36 +14244,6 @@
         try { native.openExternal(SPONSOR_URL); return; } catch { /* 桥调用失败退回 window.open */ }
       }
       window.open(SPONSOR_URL, '_blank', 'noopener');
-    });
-  })();
-
-  /* 设置 → 落雪音源：自定义服务器地址（GET/POST /api/settings/lx，
-     存 UserDefaults，重启仍生效；留空 = 内置解析；保存后立即生效）。 */
-  (function initLxSettings() {
-    const input = document.getElementById('lx-server-url');
-    const saveBtn = document.getElementById('lx-server-save');
-    const state = document.getElementById('lx-server-state');
-    if (!input || !saveBtn) return;
-    const showState = (url) => {
-      if (state) state.textContent = url ? `当前：自定义服务器 ${url}` : '当前：内置解析';
-    };
-    fetch('/api/settings/lx', { cache: 'no-store' })
-      .then((r) => r.json()).then((d) => {
-        if (d && typeof d.url === 'string') { input.value = d.url; showState(d.url); }
-      }).catch(() => { /* 读不到就保持默认显示 */ });
-    saveBtn.addEventListener('click', async () => {
-      const url = input.value.trim();
-      saveBtn.disabled = true;
-      try {
-        const r = await fetch('/api/settings/lx', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url }),
-        });
-        const d = await r.json();
-        if (d && d.code === 200) { showState(d.url || ''); if (state) state.textContent += '（已保存）'; }
-        else if (state) state.textContent = '保存失败：' + ((d && d.error) || '未知错误');
-      } catch (e) { if (state) state.textContent = '保存失败：' + (e && e.message || e); }
-      saveBtn.disabled = false;
     });
   })();
 
