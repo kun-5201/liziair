@@ -784,6 +784,11 @@ const Player = (() => {
     let lxQuality = '';
     let clipStartMs = 0;
 
+    /* 本地文件：地址就是本机 /api/local/file，不走 LX、不走平台接口。 */
+    if (src === 'local') {
+      return { url: API.localFile(track.id), demo: false, reason: '', preview: false, clipStartMs: 0, lxQuality: '' };
+    }
+
     /* 落雪优先：netease / qq / kugou / kuwo 先试 LX 解析（内置，或设置里填的自建服务器），
        拿到真地址就直接用；LX 拿不到再走平台接口。lx.quality 是实际拿到的档位，界面按它显示。 */
     if (src === 'netease' || src === 'qq' || src === 'kugou' || src === 'kuwo') {
@@ -851,13 +856,14 @@ const Player = (() => {
     state.lyricIndex = -1;
     emit('lyric', { lines: [], active: -1 });
 
-    // 歌词先拉，别等音频（QQ 认 songmid，其它边车认自己的 id）
-    const lyricReq = isQQ
+    // 歌词先拉，别等音频（QQ 认 songmid，其它边车认自己的 id）。
+    // 本地文件没有在线歌词：不发请求（否则会打到 /api/local/lyric 再被转走），歌词区保持空白。
+    const lyricReq = src === 'local' ? null : (isQQ
       ? API.qqLyric(track.mid || track.id)
       : isOther
         ? API.srcLyric(track)
-        : API.lyric(track.id);
-    lyricReq
+        : API.lyric(track.id));
+    if (lyricReq) lyricReq
       .then((d) => {
         if (token !== state.token) return;
         const { lines, format } = parseLyrics(d);

@@ -21,7 +21,7 @@ const API = (() => {
       method,
       headers: method === 'POST' ? { 'Content-Type': 'application/json' } : undefined,
       body,
-      signal: timeout(20000),
+      signal: timeout(60000),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return res.json();
@@ -37,7 +37,7 @@ const API = (() => {
     for (const [k, v] of Object.entries(params || {})) if (v !== undefined && v !== null) url.searchParams.set(k, v);
     let res;
     try {
-      res = await fetch(url, { signal: timeout(20000) });
+      res = await fetch(url, { signal: timeout(60000) });
     } catch (e) {
       return { code: 0, ok: false, error: String(e.message) };
     }
@@ -62,7 +62,7 @@ const API = (() => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(params || {}),
-        signal: timeout(20000),
+        signal: timeout(60000),
       });
     } catch (e) {
       return { code: 0, ok: false, message: String(e.message) };
@@ -135,6 +135,8 @@ const API = (() => {
     qqQrKey: (channel = 'qqmusic') => call('qq/login/qr/key', { channel }, 'GET'),
     /** 801 等待 / 802 待确认 / 803 成功 / 800 过期 */
     qqQrCheck: (key) => call('qq/login/qr/check', { key }, 'GET'),
+    /** 取消旧的扫码会话（关掉它的 MQTT 驱动）：换一张/关面板时调，别留着旧驱动空跑 */
+    qqQrCancel: (key) => call('qq/login/qr/cancel', { key }, 'GET'),
     qqLogout: () => call('qq/logout', {}, 'GET'),
     qqSearch: (s, limit = 20) => call('qq/search', { s, limit }, 'GET'),
     qqSongUrl: (mid, quality = '128') => call('qq/song/url', { mid, quality }, 'GET'),
@@ -258,5 +260,14 @@ const API = (() => {
 
     /** 所有非网易云音源的音频都走各自代理（服务端按源做域名白名单 + 转发 Range） */
     srcAudio: (src, u) => (u ? `/api/${src}/audio?url=${encodeURIComponent(u)}` : ''),
+
+    /* ------------------------------------------------------------------
+       本地音乐（文件 App 导入；只在 iOS 壳里有，原生桥 liziNative 负责弹选择器）
+       list 回 { code:0, tracks:[{id, source:'local', name, artists:[], duration, size}] }，
+       duration 是毫秒，和其它音源的 track.duration 单位一致。
+       ------------------------------------------------------------------ */
+    localList: () => call('local/list', {}, 'GET'),
+    localFile: (id) => `/api/local/file?id=${encodeURIComponent(id)}`,
+    localDelete: (id) => call('local/delete', { id }),
   };
 })();

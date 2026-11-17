@@ -25,7 +25,7 @@ final class NetEaseService {
     static let neteaseUA = "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Safari/537.36 Chrome/91.0.4472.164 NeteaseMusicDesktop/3.1.17.204416"
     static let baseURL = "https://music.163.com"
 
-    // MARK: - 传输层（fetchUpstream：15 秒超时，最多 3 次，间隔 400/800ms）
+    // MARK: - 传输层（fetchUpstream：15 秒超时，最多 2 次，间隔 400ms；前端 60 秒超时内必须回）
 
     struct UpstreamResult {
         var status: Int
@@ -35,7 +35,7 @@ final class NetEaseService {
 
     private func fetchUpstream(_ url: URL, headers: [String: String], body: Data) async throws -> UpstreamResult {
         var lastError: Error?
-        for attempt in 0..<3 {
+        for attempt in 0..<2 {
             do {
                 var req = URLRequest(url: url, timeoutInterval: 15)
                 req.httpMethod = "POST"
@@ -62,7 +62,7 @@ final class NetEaseService {
                                       setCookies: setCookies)
             } catch {
                 lastError = error
-                if attempt < 2 {
+                if attempt < 1 {
                     try? await Task.sleep(nanoseconds: UInt64(400 * (attempt + 1)) * 1_000_000)
                 }
             }

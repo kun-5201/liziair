@@ -43,6 +43,8 @@ final class WebHost: NSObject, ObservableObject, WKUIDelegate {
     let webView: WKWebView
     /// 歌词灵动岛：网页播放状态 → Live Activity。
     private let islandCoordinator = LiziIslandCoordinator()
+    /// 本地音乐导入：前端 liziNative.postMessage({type:'importLocal'}) → 文件选择器。
+    private let localBridge = LocalFilesBridge()
     @Published var failed = false
     @Published var errorMessage = ""
 
@@ -56,11 +58,15 @@ final class WebHost: NSObject, ObservableObject, WKUIDelegate {
         config.mediaTypesRequiringUserActionForPlayback = []
         // 歌词灵动岛桥：注入 JS 每秒把播放状态 postMessage 到原生端。
         config.userContentController.add(islandCoordinator.bridge, name: "liziBridge")
+        // 本地音乐导入桥：前端点「导入本地音乐」时 postMessage 到原生端弹文件选择器。
+        config.userContentController.add(localBridge, name: "liziNative")
         let islandScript = WKUserScript(source: LiziIslandJS.script, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
         config.userContentController.addUserScript(islandScript)
         self.webView = WKWebView(frame: .zero, configuration: config)
         self.webView.scrollView.bounces = false
         super.init()
+        // 导入桥要拿 webView 发导入完成事件（弱引用，不成环）。
+        self.localBridge.webView = self.webView
         // window.open（设置页 QQ 群 / 赞助行）交给系统浏览器/对应 App 打开；
         // 不设 uiDelegate 时 WKWebView 会直接丢弃新窗口请求，按钮点了没反应。
         self.webView.uiDelegate = self

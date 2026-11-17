@@ -30,8 +30,8 @@ final class LiziRouter {
         if path == "/api/lx/song/url" { return await handleLxSongUrl(req) }
         if path == "/api/lx/health" {
             return .json(200, ["code": 0, "sources": ["wy", "tx", "kg", "kw", "mg"],
-                              "tiers": LXResolver.tiers,
-                              "via": LXResolver.externalApiURL.isEmpty ? "builtin" : "external"])
+                              "tiers": LXScriptEngine.scriptTiers,
+                              "via": LXResolver.externalApiURL.isEmpty ? "lx-script" : "external"])
         }
         if path == "/api/lx/audio" { return await Proxies.proxySourceAudio(req, source: "lx") }
 
@@ -94,6 +94,22 @@ final class LiziRouter {
             return .json(200, netease.lastQrCheckPayload())
         }
 
+        // ---- 本地音乐（文件 App 导入；必须在通用 /api/ 转发之前，
+        // 不然 /api/local/* 会被当成网易云接口转走）----
+        if path == "/api/local/list" {
+            let tracks = LocalMusic.list().map { LocalMusic.trackJSON($0) }
+            return .json(200, ["code": 0, "tracks": tracks])
+        }
+        if path == "/api/local/file" {
+            return LocalMusic.serveFile(id: req.string("id"), rangeHeader: req.headers["range"])
+        }
+        if path == "/api/local/delete" && req.method == "POST" {
+            guard LocalMusic.delete(id: req.string("id")) else {
+                return .json(404, ["code": 404, "error": "本地文件不存在"])
+            }
+            return .json(200, ["code": 0])
+        }
+
         // ---- 网易云接口转发 ----
         if path.hasPrefix("/api/") {
             return await netease.handleApi(req)
@@ -131,10 +147,12 @@ final class LiziRouter {
             if !LXResolver.externalApiURL.isEmpty {
                 r = try await LXResolver.resolveViaExternalServer(source: lxSource, songId: songId, quality: quality)
             } else {
-                r = try await LXResolver.resolveMusicUrl(source: lxSource, songId: songId, quality: quality)
+                // 脚本引擎（KMusic 落雪音源.js，tx/wy 走脚本；kg/kw/mg 脚本没有，
+                // 引擎内部走内置解析；脚本全挂时也回退内置解析）。
+                r = try await LXScriptEngine.shared.resolveMusicUrl(source: lxSource, songId: songId, quality: quality)
             }
             return .json(200, ["code": 0, "url": r.0, "quality": r.1, "lxSource": lxSource,
-                                "via": LXResolver.externalApiURL.isEmpty ? "builtin" : "external"])
+                                "via": LXResolver.externalApiURL.isEmpty ? "lx-script" : "external"])
         } catch {
             return .json(200, ["code": 2, "error": error.localizedDescription])
         }

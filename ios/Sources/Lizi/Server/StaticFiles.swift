@@ -37,6 +37,37 @@ enum StaticFiles {
         "map": "application/json; charset=utf-8",
     ]
 
+    static func mimeType(forExtension ext: String) -> String {
+        mime[ext.lowercased()] ?? "application/octet-stream"
+    }
+
+    /// 把一段已读入内存的数据按 HTTP Range 发出去。
+    /// serve(path:) 和 /api/local/file 共用同一套 Range 代码，不各写一套。
+    static func serveData(_ data: Data, type: String, rangeHeader: String?) -> HttpResponse {
+        // Range: bytes=start-end（单段即可，<audio> 拖进度只发单段）。
+        if let rangeHeader, rangeHeader.hasPrefix("bytes=") {
+            let spec = rangeHeader.dropFirst("bytes=".count)
+            let parts = spec.split(separator: "-", maxSplits: 1).map(String.init)
+            if parts.count == 2, let start = Int(parts[0]) {
+                let end = Int(parts[1]) ?? (data.count - 1)
+                let s = max(0, start), e = min(data.count - 1, end)
+                if s <= e {
+                    let slice = data.subdata(in: s..<(e + 1))
+                    return HttpResponse(status: 206, headers: [
+                        "Content-Type": type,
+                        "Accept-Ranges": "bytes",
+                        "Content-Range": "bytes \(s)-\(e)/\(data.count)",
+                    ], body: slice)
+                }
+            }
+            return HttpResponse(status: 416, headers: ["Content-Range": "bytes */\(data.count)"], body: Data())
+        }
+        return HttpResponse(status: 200, headers: [
+            "Content-Type": type,
+            "Accept-Ranges": "bytes",
+        ], body: data)
+    }
+
     /// GET / 或 /xxx.html 等。支持 Range（音频/大文件拖进度用）。
     /// `..` 越界回 403；目录补 index.html；缺文件回 404 纯文本（与 server.mjs 一致）。
     static func serve(path: String, rangeHeader: String?) -> HttpResponse {
@@ -64,29 +95,7 @@ enum StaticFiles {
             return .text(404, "404")
         }
         let ext = fileURL.pathExtension.lowercased()
-        let type = mime[ext] ?? "application/octet-stream"
-        // Range: bytes=start-end（单段即可，<audio> 拖进度只发单段）。
-        if let rangeHeader, rangeHeader.hasPrefix("bytes=") {
-            let spec = rangeHeader.dropFirst("bytes=".count)
-            let parts = spec.split(separator: "-", maxSplits: 1).map(String.init)
-            if parts.count == 2, let start = Int(parts[0]) {
-                let end = Int(parts[1]) ?? (data.count - 1)
-                let s = max(0, start), e = min(data.count - 1, end)
-                if s <= e {
-                    let slice = data.subdata(in: s..<(e + 1))
-                    return HttpResponse(status: 206, headers: [
-                        "Content-Type": type,
-                        "Accept-Ranges": "bytes",
-                        "Content-Range": "bytes \(s)-\(e)/\(data.count)",
-                    ], body: slice)
-                }
-            }
-            return HttpResponse(status: 416, headers: ["Content-Range": "bytes */\(data.count)"], body: Data())
-        }
-        return HttpResponse(status: 200, headers: [
-            "Content-Type": type,
-            "Accept-Ranges": "bytes",
-        ], body: data)
+        return serveData(data, type: mimeType(forExtension: ext), rangeHeader: rangeHeader)
     }
 }
 

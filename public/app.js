@@ -356,6 +356,28 @@
   /* ================================================================== *
    * 渲染
    * ================================================================== */
+  /** 侧栏歌单：网易云（已登录）+ 酷狗（已登录）拼在一起；一家失败不影响另一家。
+      酷狗歌单项自带 source:'kugou'，点开走 openKugouPlaylist。 */
+  async function loadSidebarPlaylists() {
+    const all = [];
+    if (profile && profile.userId) {
+      try {
+        const lists = await API.userPlaylists(profile.userId);
+        const mine = lists.playlists.filter((p) => !p.subscribed);
+        const sub = lists.playlists.filter((p) => p.subscribed);
+        all.push(...mine, ...sub);
+      } catch { /* 网易云拉不到就只显示酷狗 */ }
+    }
+    try {
+      const kg = await API.srcStatus('kugou');
+      if (kg && kg.loggedIn) {
+        const kd = await API.kugouUserPlaylists();
+        for (const p of (kd && kd.playlists) || []) if (p && p.id) all.push(p);
+      }
+    } catch { /* 酷狗没登录或拉不到就不显示 */ }
+    renderPlaylists(all);
+  }
+
   function renderPlaylists(lists) {
     el.playlists.innerHTML = '';
     if (!lists.length) {
@@ -369,7 +391,7 @@
       b.innerHTML = `<img src="${API.img(p.cover, 80)}" alt="" loading="lazy">
         <span class="pl__text"><span class="pl__name"></span><span class="pl__count">${p.trackCount} 首</span></span>`;
       b.querySelector('.pl__name').textContent = p.name;
-      b.addEventListener('click', () => openPlaylist(p));
+      b.addEventListener('click', () => (p.source === 'kugou' ? openKugouPlaylist(p) : openPlaylist(p)));
       el.playlists.appendChild(b);
     }
   }
@@ -3139,6 +3161,7 @@
     /** 关掉设置面板就收二维码、停轮询（不然收起来之后还在后台打接口） */
     function pause() {
       stop();
+      if (key) { const oldKey = key; key = ''; API.qqQrCancel(oldKey).catch(() => {}); }
       wrap.hidden = true;
       paint();
     }
@@ -3170,6 +3193,9 @@
 
     async function startQr(auto = false) {
       stop();
+      // 换一张之前先取消旧会话（关掉它的 MQTT 驱动），不然旧驱动一直跑到 180 秒过期。
+      // 不等它回来（fire-and-forget），别拖慢新码。
+      if (key) { const oldKey = key; key = ''; API.qqQrCancel(oldKey).catch(() => {}); }
       refreshing = 0;
       wrap.hidden = false;
       box.innerHTML = '<span>正在获取二维码…</span>';
@@ -6026,6 +6052,27 @@
     }
   }
 
+  /** 侧栏点酷狗歌单：走酷狗歌单曲目接口（和 openPlaylist 同一套展示）。 */
+  async function openKugouPlaylist(p) {
+    el.playlists.querySelectorAll('.pl').forEach((b) => b.classList.toggle('is-active', b.dataset.id === String(p.id)));
+    el.plName.textContent = p.name;
+    el.plSub.textContent = '正在载入…';
+    el.tracks.innerHTML = '<p class="hint">正在载入曲目…</p>';
+    if (p.cover) { el.plCover.src = API.img(p.cover, 160); el.plCover.hidden = false; }
+    else el.plCover.hidden = true;
+
+    try {
+      const d = await API.kugouPlaylistTracks(p.id);
+      const tr = (d && d.tracks) || [];
+      el.plName.textContent = p.name;
+      el.plSub.textContent = `${tr.length} 首` + ((d && d.error) ? ` · ${d.error}` : '');
+      renderTracks(tr);
+    } catch (e) {
+      el.plSub.textContent = '载入失败：' + e.message;
+      el.tracks.innerHTML = '<p class="hint">载入失败，请确认服务端在运行</p>';
+    }
+  }
+
   /* ================================================================== *
    * 大厅（V4 巨幅封面）
    *   上半：巨幅封面 = **上一首播放的歌**（存 localStorage，重启还在）
@@ -6127,6 +6174,7 @@
       lyrics: $('hall-hero-lyrics'), rows: $('hall-hero-rows'), note: $('hall-hero-note'),
       lock: $('hall-hero-lock'),
       tools: $('hall-tools'), me: $('hall-me'),
+      local: $('hall-local'),           // 本地音乐推荐区（文件 App 导入，见 paintLocal）
       rail: $('hall-rail'), plat: $('hall-plat'),
       platBar: $('hall-plat-bar'),
       srcMenu: $('hall-src-menu'),          // 左上角「每日推荐」的悬停来源浮层
@@ -7704,6 +7752,7 @@
     async function cardQrStart(id) {
       const seq = ++cardQrSeq;
       const cell = cardQrEl;
+      const prevQrKey = cardQrKey;   // 换码前记下旧 key，qq 分支里取消它（关旧驱动）
       cardQrExpired = 0;
       cardQrKey = '';
       cardQrSrc = '';
@@ -7727,6 +7776,7 @@
           /* 边车没给 qrimg 时退回把登录链接画成二维码（和弹窗同一条兜底） */
           src = d.qrimg || `https://api.qrserver.com/v1/create-qr-code/?size=180x180&margin=0&data=${encodeURIComponent('https://music.163.com/login?codekey=' + d.key)}`;
         } else if (id === 'qq') {
+          if (prevQrKey) API.qqQrCancel(prevQrKey).catch(() => {});
           const d = await API.qqQrKey();
           if (seq !== cardQrSeq) return;
           if (!d || !d.key || !d.qrimg) {
@@ -11600,6 +11650,103 @@
       else meRefreshGrid(token, accounts);
     }
 
+    /* ---------- 本地音乐（文件 App 导入；iOS 壳专属） ----------
+       列表走 /api/local/list；点一行 = 整张本地列表进队列从那首播；
+       没文件时只留一个导入按钮。导入由原生桥 liziNative 弹系统文件选择器，
+       完成时原生发 lizi:local-imported 事件，这里只刷新列表。
+       桌面浏览器没有原生桥：导入按钮静默不做事（不报错）。 */
+    let localTracks = [];              // 最近一次 /api/local/list 的结果（已按导入时间倒序）
+    let localLoading = false;
+    let localBound = false;            // #hall-local 上的事件委托只绑一次
+
+    function localBridge() {
+      try {
+        const w = window.webkit && window.webkit.messageHandlers;
+        return (w && w.liziNative) || null;
+      } catch { return null; }
+    }
+
+    function requestLocalImport() {
+      const h = localBridge();
+      if (!h) return;                  // 没有原生桥（桌面浏览器）就静默跳过
+      try { h.postMessage({ type: 'importLocal' }); } catch { /* 桥调用失败也静默 */ }
+    }
+
+    async function paintLocal() {
+      const box = H.local;
+      if (!box) return;
+      if (localLoading) return;
+      localLoading = true;
+      let tracks = [];
+      try {
+        const d = await API.localList();
+        if (d && d.code === 0 && Array.isArray(d.tracks)) tracks = d.tracks;
+      } catch { /* 服务端没起来 / 老版本：当作空列表 */ }
+      localLoading = false;
+      /* 内部统一用字符串 artists（artistLinks / document.title 都按字符串拼）；
+         API 给的是数组，元数据里有歌手就拼出来，没有就标「本地音乐」。 */
+      localTracks = tracks.map((t) => ({
+        id: t.id,
+        source: 'local',
+        name: t.name || '',
+        artists: (t.artists && t.artists.length ? t.artists.join(' / ') : '本地音乐'),
+        duration: t.duration || 0,
+        size: t.size || 0,
+      }));
+      const n = localTracks.length;
+      const head = `<div class="hall-cell__h"><b>本地音乐</b><span>${n ? n + ' 首' : '文件 App 导入'}</span></div>`;
+      if (!n) {
+        box.innerHTML = head + `<div class="local-empty">
+          <p>还没导入本地音频。在文件 App 里选音频文件，导入后出现在这里。</p>
+          <button class="local-import" type="button" data-local-import="1">导入本地音乐</button>
+        </div>`;
+      } else {
+        box.innerHTML = head + `<div class="local-list">` + localTracks.map((t, i) => `
+          <div class="local-row" data-i="${i}" role="button" tabindex="0">
+            <span class="local-row__i">${String(i + 1).padStart(2, '0')}</span>
+            <span class="local-row__t">
+              <span class="local-row__n">${esc(t.name)}</span>
+              <span class="local-row__a">${esc(t.artists)}</span>
+            </span>
+            <span class="local-row__d">${t.duration ? fmtTime(t.duration / 1000) : ''}</span>
+            <button class="local-row__del" type="button" data-local-del="${i}" title="删除" aria-label="删除 ${esc(t.name)}">×</button>
+          </div>`).join('') + `</div>
+          <button class="local-import" type="button" data-local-import="1">导入本地音乐</button>`;
+      }
+      /* 设置页「本地音乐」的数量文案顺手一起更新（那块卡片由 initLocalSettings 接线）。 */
+      const countEl = document.getElementById('set-local-count');
+      if (countEl) countEl.textContent = n ? `已导入 ${n} 首` : '未导入';
+      if (!localBound) {
+        localBound = true;
+        box.addEventListener('click', (e) => {
+          if (e.target.closest('[data-local-import]')) { requestLocalImport(); return; }
+          const del = e.target.closest('[data-local-del]');
+          if (del) {
+            e.stopPropagation();
+            const t = localTracks[Number(del.dataset.localDel)];
+            if (!t) return;
+            API.localDelete(t.id).catch(() => {}).finally(() => paintLocal());
+            return;
+          }
+          const row = e.target.closest('.local-row');
+          if (row) {
+            const i = Number(row.dataset.i);
+            if (Number.isInteger(i) && localTracks[i]) Player.playQueue(localTracks, i);
+          }
+        });
+        box.addEventListener('keydown', (e) => {
+          if ((e.key === 'Enter' || e.key === ' ') && e.target.classList.contains('local-row')) {
+            e.preventDefault();
+            const i = Number(e.target.dataset.i);
+            if (Number.isInteger(i) && localTracks[i]) Player.playQueue(localTracks, i);
+          }
+        });
+      }
+    }
+
+    /* 原生导入完成事件：刷新本地列表（设置页的数量文案由 paintLocal 顺手更新）。 */
+    window.addEventListener('lizi:local-imported', () => { paintLocal(); });
+
     /** 并发查 6 家真实状态，回来后整体重画一次 */
     async function meRefreshGrid(token, accounts) {
       const rows = await Promise.all(accounts.map(async (a) => {
@@ -12150,6 +12297,7 @@
         if (H.hero) H.hero.classList.remove('is-away');
         if (mounted) {
           paintHero();
+          paintLocal();                    // 回大厅也刷新一次（可能刚在设置页导入过）
           resyncHover();
           meAttach();                    // 上次离开大厅时摘掉了，回来要接上
           measureMePin();
@@ -12192,6 +12340,7 @@
         paintTools();
         paintSideRail();                 // 铺色态左侧竖向 Rubber Segment（幂等，只建一次）
         paintMe();                       // 里面会 restoreHallTheme 决定要不要直接进铺色态
+        paintLocal();                    // 本地音乐推荐区（文件 App 导入）
         paintDaily();                    // 每日推荐数据 → 跑马带
         resyncHover();
         /* 等 app 自己画完、量完，再兜两次：开场残留的隐藏类 / 半切铺色态 */
@@ -12228,6 +12377,10 @@
       syncPlayButton: syncHeroPlay,
       /** 登录状态变了要把「我的」重画一遍 */
       refreshMe() { if (mounted) paintMe(true); },   // 登录/退出：跳过缓存，立刻重查
+      /** 本地音乐：设置页导入按钮 / 导入完成事件调这里刷新列表 */
+      refreshLocal() { paintLocal(); },
+      /** 本地音乐：弹系统文件选择器（没有原生桥时静默跳过） */
+      importLocal() { requestLocalImport(); },
       /** 设置页拖速度滑杆时调；下一帧 tick 就用新速度，不用切视图 */
       setMarqSpeed(v) { marqSpeedPx = marqSpeedOf(v); },
       /** 平台品牌底色：设置页平台行的小色块复用大厅这套 PLAT_BG，别另抄 hex */
@@ -12890,10 +13043,7 @@
     profile = s.profile;
     /* 顶栏登录位删掉后，设置页账号块不再靠 MutationObserver 跟着刷新 */
     paintAccount();
-    const lists = await API.userPlaylists(profile.userId);
-    const mine = lists.playlists.filter((p) => !p.subscribed);
-    const sub = lists.playlists.filter((p) => p.subscribed);
-    renderPlaylists([...mine, ...sub]);
+    loadSidebarPlaylists();    // 网易云 + 酷狗（各家已登录才拉），不阻塞
     Hall.refreshMe();          // 大厅那张个人主页卡要立刻换成你自己的
   }
 
@@ -13702,13 +13852,10 @@
       if (s.loggedIn) {
         profile = s.profile;
         paintAccount();        // 启动时同步设置页账号块（顶栏登录位已删）
-        const lists = await API.userPlaylists(profile.userId);
-        const mine = lists.playlists.filter((p) => !p.subscribed);
-        const sub = lists.playlists.filter((p) => p.subscribed);
-        renderPlaylists([...mine, ...sub]);
         Hall.refreshMe();
       }
     } catch { /* 匿名可用 */ }
+    loadSidebarPlaylists();    // 网易云 + 酷狗（各家已登录才拉），不阻塞大厅
 
     if (!profile) {
       // 主面板默认展示卡力老虎的歌（用户指定），拿不到再退回搜索热歌
@@ -14060,7 +14207,7 @@
   (function initQqGroupRow() {
     const row = document.getElementById('set-qq-group');
     if (!row) return;
-    const QQ_GROUP_URL = 'https://qm.qq.com/q/nITZnfZadc';
+    const QQ_GROUP_URL = 'https://qm.qq.com/q/U6XytT33mC';
     row.addEventListener('click', () => {
       const native = window.__liziNative;
       if (native && typeof native.openExternal === 'function') {
@@ -14111,6 +14258,16 @@
         else if (state) state.textContent = '保存失败：' + ((d && d.error) || '未知错误');
       } catch (e) { if (state) state.textContent = '保存失败：' + (e && e.message || e); }
       saveBtn.disabled = false;
+    });
+  })();
+
+  /* 设置 → 本地音乐：导入按钮（走 Hall.importLocal，弹原生文件选择器）。
+     数量文案（#set-local-count）由 Hall.paintLocal 顺手更新，这里只接按钮。 */
+  (function initLocalSettings() {
+    const btn = document.getElementById('set-local-import');
+    if (!btn) return;
+    btn.addEventListener('click', () => {
+      try { Hall.importLocal(); } catch { /* 没有原生桥就静默跳过 */ }
     });
   })();
 })();

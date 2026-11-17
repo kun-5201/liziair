@@ -53,6 +53,9 @@ targets:
         ITSAppUsesNonExemptEncryption: false
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
+          # 落雪脚本的取歌接口是明文 http 裸 IP（220.167.101.253:6001），
+          # 不放开 ATS 的话 URLSession 会直接拦掉；酷狗内置解析也有 http 接口。
+          NSAllowsArbitraryLoads: true
         CFBundleURLTypes:
           - CFBundleURLName: com.lty5201.lizi
             CFBundleURLSchemes:

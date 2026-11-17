@@ -212,7 +212,7 @@ actor QQService {
     // MARK: musicu 客户端
 
     /// 核心 musicu 调用：POST {comm, req_0:{module,method,param}}。
-    /// 只读请求最多重试 2 次（退避 200*2^attempt ms + 抖动）；global code / req_0.code /
+    /// 只读请求最多 2 次（退避 200*2^attempt ms + 抖动）；global code / req_0.code /
     /// subcode 任一非 0 即抛 QQUpstreamError。
     private func musicu(comm: [String: Any], module: String, method: String, param: [String: Any],
                         headers: [String: String]? = nil, readOnly: Bool = true,
@@ -222,7 +222,7 @@ actor QQService {
             throw QQUpstreamError(code: -1, message: "musicu 请求构造失败")
         }
         var lastError: Error = QQUpstreamError(code: -1, message: "musicu 请求失败")
-        let attempts = readOnly ? 3 : 1
+        let attempts = readOnly ? 2 : 1
         for attempt in 0..<attempts {
             if attempt > 0 {
                 let backoff = Double(200 * (1 << (attempt - 1))) + Double.random(in: 0...200)
@@ -684,6 +684,9 @@ extension QQService {
             var first: MqttOutcome = .closed
             if let o = await group.next() { first = o }
             group.cancelAll()
+            // receive 循环正停在 ws.receive() 里，Task 取消唤不醒它；
+            // 不在这里关 socket，群组要等服务端关连接才退（Linux 对照实测：hang）。
+            ws.cancel()
             return first
         }
         ws.cancel()
