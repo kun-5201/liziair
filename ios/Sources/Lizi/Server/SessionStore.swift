@@ -176,6 +176,27 @@ final class SessionStore {
         }
     }
 
+    /// 解析 Set-Cookie 头值（纯函数，不碰共享状态）：URLSession 会把多条
+    /// Set-Cookie 拼成一条（", " 连接），直接按 ';' 切会把非首位 cookie 的键
+    /// 解析成 ", MUSIC_U" 这类带前导逗号的键。复用 splitSetCookie 的逗号感知
+    /// 切分，再取每段第一个 ';' 之前的 K=V。供 NetEase.extractCookie 的
+    /// set-cookie 分支用；body.cookie / 用户粘贴的串是 ';' 分隔，不走这里。
+    static func parseSetCookieStrings(_ values: [String]) -> [String: String] {
+        var out: [String: String] = [:]
+        for raw in values {
+            for part in splitSetCookie(raw) {
+                let kv = part.split(separator: ";", maxSplits: 1).first ?? ""
+                let pair = kv.split(separator: "=", maxSplits: 1)
+                guard pair.count == 2 else { continue }
+                let k = pair[0].trimmingCharacters(in: .whitespaces)
+                let v = pair[1].trimmingCharacters(in: .whitespaces)
+                guard !k.isEmpty, !v.isEmpty else { continue }
+                out[k] = v
+            }
+        }
+        return out
+    }
+
     private static func splitSetCookie(_ s: String) -> [String] {
         // 在 ", " 后跟 token= 的位置切分；Expires=Thu, 01 Jan ... 里的逗号后面跟的是日期，不含 =，不会被切。
         var out: [String] = []

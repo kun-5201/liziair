@@ -621,8 +621,13 @@ extension QQService {
     // MARK: MQTT 驱动
 
     /// 等 SUBACK 就绪（轮询标志，最多 20 秒）。
-    private func waitListenerReady(key: String) async -> Bool {
-        for _ in 0..<200 {
+    /// 等监听器就绪：SUBACK 正常 1 秒内就到。只等 3 秒——以前等满 20 秒才回，
+    /// 前端 60 秒超时 + 用户反复点，会把一次登录放大成好几个并发会话
+    /// （内存临界的真机上这就是压垮的稻草）。3 秒没到也不算失败：驱动还
+    /// 在后台连，check 轮询会在监听器失败时立刻报 800 + 原因，前端自动换码。
+    private func waitListenerReady(key: String, maxWaitMs: Int = 3000) async -> Bool {
+        let iterations = max(1, maxWaitMs / 100)
+        for _ in 0..<iterations {
             guard let s = qrSessions[key] else { return false }
             if s.listenerReady { return true }
             if s.listenerFailed != nil { return false }
@@ -665,7 +670,10 @@ extension QQService {
               let url = URL(string: "wss://mu.y.qq.com\(path)") else {
             return (true, nil)
         }
-        var req = URLRequest(url: url, timeoutInterval: 30)
+        // 握手 10 秒：黑洞网络下 30 秒才失败，驱动在后台挂着、前端又看不到
+        // 码，用户会反复点。10 秒失败后 failSession 会标失败，check 轮询
+        // 下一轮就报 800 + 原因，前端自动换码。
+        var req = URLRequest(url: url, timeoutInterval: 10)
         req.setValue("mqtt", forHTTPHeaderField: "Sec-WebSocket-Protocol")
         let ws = URLSession.shared.webSocketTask(with: req)
         if var s = qrSessions[key] { s.wsTask = ws; qrSessions[key] = s }
@@ -964,7 +972,10 @@ extension QQService {
     private func refreshAndroidSession() async throws {
         var d = loadDevice()
         let param: [String: Any] = ["uid": d["sessionUid"] ?? "", "vkey": 0, "caller": 0]
-        let data = try await musicuAuth(module: "music.getSession.session", method: "GetSession", param: param)
+        // 登录链路单次 10 秒：默认 25 秒 × 2 次重试 × 两次 musicu 调用，
+        // 慢网下拿码请求能拖过前端 60 秒超时，前端 abort、用户重拍，
+        // 并发会话越攒越多。10 秒对正常调用（1–3 秒）绰绰有余。
+        let data = try await musicuAuth(module: "music.getSession.session", method: "GetSession", param: param, timeout: 10)
         guard let session = data["session"] as? [String: Any] else {
             throw QQUpstreamError(code: -1, message: "GetSession 返回缺 session")
         }
@@ -1032,7 +1043,7 @@ extension QQService {
         }
         let data = try await musicuAuth(module: "music.login.LoginServer", method: "CreateQRCode",
                                         param: ["tmeAppID": "qqmusic", "ct": 11, "cv": 14090008],
-                                        commOverride: ["ct": 23, "cv": 0])
+                                        commOverride: ["ct": 23, "cv": 0], timeout: 10)
         let qrcodeId = scStr(data, "qrcodeID")
         guard !qrcodeId.isEmpty else {
             throw QQAuthError(502, "二维码生成失败（上游没给图片）")
@@ -1052,11 +1063,15 @@ extension QQService {
         qrSessions[key] = s
         s.driverTask = Task { await self.runMqttDriver(key: key) }
         qrSessions[key] = s
-        guard await waitListenerReady(key: key) else {
-            let reason = qrSessions[key]?.listenerFailed ?? "MQTT 监听器启动超时"
-            // 超时也走 failSession：它会取消 ws + driver，不让驱动空跑到 180 秒。
-            await failSession(key: key, reason: reason)
-            throw QQAuthError(502, reason)
+        // 监听器只等 3 秒就回码：SUBACK 正常 <1 秒；3 秒还没到就先把码给
+        // 用户、驱动后台继续连——check 轮询会在监听器失败时立刻报 800 +
+        // 原因，前端自动换码。以前等满 20 秒才回，慢网下整个拿码请求能拖
+        // 到 60 秒以上，前端 abort、用户重拍，并发会话越攒越多。
+        // 只有监听器已经明确失败（listenerFailed 非空）才立刻报错。
+        let ready = await waitListenerReady(key: key)
+        if !ready, let failed = qrSessions[key]?.listenerFailed {
+            await failSession(key: key, reason: failed)
+            throw QQAuthError(502, failed)
         }
         return img
     }

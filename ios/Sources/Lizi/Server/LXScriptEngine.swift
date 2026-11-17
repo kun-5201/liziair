@@ -22,7 +22,7 @@ import CryptoKit
 /// 回调跳回 jsQueue 再调 JS。JSC 里未处理的 Promise rejection 不会崩 App
 /// （脚本加载时的 checkUpdate 失败就是这么走的）.
 
-// MARK: - lx 运行时装配（内置源 / 自定义源共用，只有一份）
+// MARK: - lx 运行时装配（自定义源共用，只有一份；内置源已删）
 
 /// lx.send('inited') 带回来的 sources、lx.on('request') 注册的处理函数。
 /// 引用类型：装配时挂进 JS 的 block 直接写它，实例从它读。

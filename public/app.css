@@ -8147,10 +8147,17 @@ body.pbn-off #player { display: none !important; }
 .hall-hero-grip { display: none; }
 
 @media (max-width: 1280px) and (pointer: coarse) {
-  /* 海报允许真的收成 0 高；sync.js 只改 flex 比例，min-height 兜底在这里让开 */
-  #view-hall.is-plat-mode .hall-hero,
+  /* 海报允许真的收成 0 高；sync.js 只改 flex 比例，min-height 兜底在这里让开。
+     但 rail / plat 不能也 min-height: 0：flex 会把它们压到比内容还矮，
+     海报一拉长（抓手拖动 applyHeroH），面板就被压成一条、本地音乐那块
+     顶上来盖住下面的内容，整页 scrollHeight == clientHeight、根本滚不动
+     （2026-11-18 横屏录屏实测）。rail / plat 恢复内容最小高度
+     （min-height: auto，flex 默认值）：压不下去时整页变高、改走滚动，
+     而不是把内容压扁叠在一起。折叠态（is-hero-folded）里海报是 0 高，
+     rail / plat 有整页高度，下面那两条 min-height: 0 不受影响。 */
+  #view-hall.is-plat-mode .hall-hero { min-height: 0; }
   #view-hall.is-plat-mode .hall-rail,
-  #view-hall.is-plat-mode .hall-plat { min-height: 0; }
+  #view-hall.is-plat-mode .hall-plat { min-height: auto; }
 
   /* 折叠海报：海报 0 高 → 轨道和面板整整多出原来的海报高度。
      20px 的上边距原样保留，正好当抓手条，不额外占高度。 */
@@ -8673,14 +8680,9 @@ body.is-stage .updtoast { bottom: 18px; }
 /* 自定义源管理（设置 → 自定义源管理）：列表行 / URL 标记 / 蓝色重绑链接 / 行内补绑表单 */
 .lx-src__row { flex-wrap: wrap; gap: 10px; }
 .lx-src__badge { display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 999px; background: oklch(21% 0.022 270 / .08); font-size: 11px; font-weight: var(--fw-med); color: var(--ink-2); vertical-align: 1px; }
-.lx-src__badge--builtin { background: oklch(70% 0.12 150 / .18); color: oklch(45% 0.12 150); }
 .lx-src__rebind { padding: 0; border: 0; background: transparent; cursor: pointer; font: inherit; font-size: 13px; color: #2563eb; }
 .lx-src__rebind:hover { text-decoration: underline; }
 .lx-src__rebind-form { display: flex; gap: 10px; padding: 0 0 var(--sp-3); }
-/* 内置源仓库：折叠区块 + 导入失败原因（红字，点重试可再加一次） */
-.lx-src__repo { padding: var(--sp-2) 0; }
-.lx-src__repo summary { cursor: pointer; }
-.lx-src__repo-error { font-size: 13px; color: #c0392b; }
 
 /* ==========================================================================
    窄屏播放页（≤900px，含 iPhone 390×844）—— 2026-11-18 重排
@@ -8844,4 +8846,47 @@ body.is-stage .updtoast { bottom: 18px; }
   body.touch-ui.is-now #view-now #ntr-mode .ico {
     width: 20px; height: 20px;
   }
+}
+
+/* ==========================================================================
+   横屏播放页（≤900px 且 landscape，iPhone 横屏约 844×390）—— 2026-11-18
+   --------------------------------------------------------------------------
+   纵向只有 390px：竖屏那套舞台上内边距 64px + 封面流 254px + 下内边距 62px
+   就把传输键顶到 y≈412（视口底 390），四个键只剩上面一小截。
+   只缩纵向尺寸：上内边距清零、下内边距收到 8px、封面流按比例收小
+   （188→140，歌词拉起 148→110；两侧偏移与纵深同比例缩），歌名/控制
+   的间距收紧。目标：传输键下沿 ≤ dock 热区上沿（≈316px），与底边留空隙；
+   横向布局、竖屏数值、封面流 3D 结构一律不动。
+   上内边距必须 !important：触屏那套有条 padding-top: 64px !important
+  （防封面被顶栏按钮压住）；横屏下返回/控制在左右两端、封面在正中，
+   横向不撞，清零是安全的。
+   ========================================================================== */
+@media (max-width: 900px) and (orientation: landscape) {
+  body.is-now #view-now .now__stage,
+  body.touch-ui.is-now #view-now .now__stage,
+  body.touch-ui.is-now:not([class*="now-layout-"]) #view-now .now__stage {
+    padding-top: 0 !important;
+    /* 下沿钉在舞台底上沿 30px：传输键下沿 = 舞台底(≈370) - 30 = 340，
+       离 dock 进度线(≈353)留 13px、离视口底留 50px；竖屏那套 62px 在
+       横屏下会把内容顶出舞台（总高超 24px），30px 是量出来的刚好值。 */
+    padding-bottom: max(30px, env(safe-area-inset-bottom));
+  }
+  body.is-now #view-now .cf { margin-top: 0; }
+  body.is-now #view-now .cf__track { height: 184px; }
+  body.is-now #view-now .cf__item { width: 140px; }
+  body.is-now #view-now .cf__item[data-off="-1"] { transform: translateX(calc(-50% - 96px)) translateZ(-80px) rotateY(40deg); }
+  body.is-now #view-now .cf__item[data-off="1"]  { transform: translateX(calc(-50% + 96px)) translateZ(-80px) rotateY(-40deg); }
+  body.is-now #view-now .cf__item[data-off="-2"] { transform: translateX(calc(-50% - 168px)) translateZ(-150px) rotateY(50deg); }
+  body.is-now #view-now .cf__item[data-off="2"]  { transform: translateX(calc(-50% + 168px)) translateZ(-150px) rotateY(-50deg); }
+
+  /* 歌词拉起：封面流再收一档 */
+  body.is-now #view-now.is-lyrics-open .cf__track { height: 154px; }
+  body.is-now #view-now.is-lyrics-open .cf__item { width: 110px; }
+  body.is-now #view-now.is-lyrics-open .cf__item[data-off="-1"] { transform: translateX(calc(-50% - 76px)) translateZ(-70px) rotateY(40deg); }
+  body.is-now #view-now.is-lyrics-open .cf__item[data-off="1"]  { transform: translateX(calc(-50% + 76px)) translateZ(-70px) rotateY(-40deg); }
+  body.is-now #view-now.is-lyrics-open .cf__item[data-off="-2"] { transform: translateX(calc(-50% - 131px)) translateZ(-120px) rotateY(50deg); }
+  body.is-now #view-now.is-lyrics-open .cf__item[data-off="2"]  { transform: translateX(calc(-50% + 131px)) translateZ(-120px) rotateY(-50deg); }
+
+  body.is-now #view-now .now__meta { padding-top: 6px; }
+  body.is-now #view-now .now__transport { margin-top: 6px; }
 }

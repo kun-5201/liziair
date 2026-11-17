@@ -45,6 +45,24 @@
     cookieInput: $('cookie-input'), cookieImport: $('cookie-import'), cookieMsg: $('cookie-msg'),
   };
 
+  /* 图片直连兜底（2026-11-18 首页无封面）：封面统一走 /api/img 代理，但真机
+     网络下代理拉上游失败/超时时整张封面就没了（推荐栏全是「无封面」占位）。
+     捕获阶段监听所有 <img> 的 error：src 是 /api/img?url=... 的，重试一次
+     直链——酷狗/QQ/酷我 CDN 允许无 Referer 热链（实测 200），网易云有防盗
+     链、直连大概率也失败，但不比占位更差。只重试一次
+     （dataset.imgFallback 防循环），代理本身成功时绝不触发。 */
+  document.addEventListener('error', (e) => {
+    const img = e.target;
+    if (!img || img.tagName !== 'IMG' || img.dataset.imgFallback) return;
+    const src = img.getAttribute('src') || '';
+    if (!src.startsWith('/api/img?url=')) return;
+    let direct = '';
+    try { direct = decodeURIComponent(src.slice('/api/img?url='.length)); } catch { return; }
+    if (!/^https?:\/\//.test(direct)) return;
+    img.dataset.imgFallback = '1';
+    img.src = direct;
+  }, true);
+
   /* ================================================================== *
    * 歌手页 / 专辑页
    *
@@ -3480,6 +3498,7 @@
     let expired = 0;        // 连续过期次数，连换 3 次就停手
     let spotifyTries = 0;
     let loginSeq = 0;       // 登录流程代次：stop() 一次就作废所有在飞的 await 收尾
+    let qrStarting = false; // 拿码请求在飞时再点「登录/换一张」直接忽略，别起第二个会话（和 QQ 弹窗同一做法）
 
     for (const s of SOURCES) {
       rows[s.id] = {
@@ -3590,6 +3609,9 @@
     }
 
     async function startQr(id) {
+      if (qrStarting) return;   // 已有一个拿码请求在飞，再点直接忽略，别起第二个会话
+      qrStarting = true;
+      try {
       stop();
       active = id;
       expired = 0;
@@ -3624,6 +3646,9 @@
       qr.status.textContent = `用 ${meta(id).label} App 扫码`;
       timer = setInterval(() => check(id), 2200);
       paint(id);
+      } finally {
+        qrStarting = false;
+      }
     }
 
     async function check(id) {
@@ -7724,6 +7749,10 @@
     let cardQrKey = '';
     let cardQrExpired = 0;
     let cardQrBusy = false;
+    let cardQrStarting = false; // 拿码请求在飞时再点卡片直接忽略，别起第二个会话
+    /* 未知状态码（500 / 风控 / 空响应）的连续次数：和登录弹窗的 QR_FAIL_LIMIT
+       一样，3 次才停轮询——单次上游抖动不该直接杀掉还在等的扫码。 */
+    let cardQrFails = 0;
 
     /** 只画背面的二维码小块。o = { src, logo, ph, msg, kind } */
     function cardQrPaint(cell, o) {
@@ -7753,6 +7782,7 @@
       if (cardQrTimer) { clearInterval(cardQrTimer); cardQrTimer = 0; }
       cardQrBusy = false;
       cardQrExpired = 0;
+      cardQrFails = 0;
       cardQrKey = '';
     }
 
@@ -7769,6 +7799,9 @@
 
     function cardQrOpen(id, cell) {
       if (cardQrId === id && cell.classList.contains('is-qr')) { cardQrClose(); return; }
+      /* 已有一个拿码请求在飞：再点别的卡直接忽略，别让新卡片画上
+         「正在获取二维码…」却没有请求在跑；等在飞的请求回来再点。 */
+      if (cardQrStarting) return;
       cardQrClose();
       cardQrId = id;
       cardQrEl = cell;
@@ -7798,10 +7831,14 @@
     }
 
     async function cardQrStart(id) {
+      if (cardQrStarting) return;   // 已有一个拿码请求在飞，再点直接忽略
+      cardQrStarting = true;
+      try {
       const seq = ++cardQrSeq;
       const cell = cardQrEl;
       const prevQrKey = cardQrKey;   // 换码前记下旧 key，qq 分支里取消它（关旧驱动）
       cardQrExpired = 0;
+      cardQrFails = 0;
       cardQrKey = '';
       cardQrSrc = '';
       cardQrBusy = false;
@@ -7853,6 +7890,9 @@
       if (seq !== cardQrSeq) return;
       cardQrPaint(cell, { src, msg: `用 ${QR_LABEL[id] || id} App 扫码` });
       cardQrTimer = setInterval(() => cardQrPoll(id, seq), 2200);
+      } finally {
+        cardQrStarting = false;
+      }
     }
 
     async function cardQrPoll(id, seq) {
@@ -7884,20 +7924,30 @@
       }
 
       if (code === 802) {
+        cardQrFails = 0;
         cardQrPaint(cell, { src: cardQrSrc, msg: '已扫码，请在手机上确认', kind: 'ok' });
         return;
       }
       if (code === 801) {
         cardQrExpired = 0;
+        cardQrFails = 0;
         cardQrPaint(cell, { src: cardQrSrc, msg: `用 ${QR_LABEL[id] || id} App 扫码` });
         return;
       }
 
-      /* 其它（500 / 风控 / 空响应）如实说，别装还在等确认 */
-      if (cardQrTimer) { clearInterval(cardQrTimer); cardQrTimer = 0; }
+      /* 其它（500 / 风控 / 空响应）如实说，但别一次就停：连续 3 次才停轮询，
+         单次抖动继续等（和登录弹窗的 QR_FAIL_LIMIT 一致）。 */
+      if (++cardQrFails >= 3) {
+        if (cardQrTimer) { clearInterval(cardQrTimer); cardQrTimer = 0; }
+        cardQrPaint(cell, {
+          src: cardQrSrc, kind: 'err',
+          msg: (d && (d.error || d.message)) || `登录接口返回 ${code || '空响应'}，点一下卡片重试`,
+        });
+        return;
+      }
       cardQrPaint(cell, {
         src: cardQrSrc, kind: 'err',
-        msg: (d && (d.error || d.message)) || `登录接口返回 ${code || '空响应'}，点一下卡片重试`,
+        msg: `登录接口返回 ${code || '空响应'}（第 ${cardQrFails}/3 次），继续等待…`,
       });
     }
 
@@ -14410,39 +14460,6 @@
     let sources = [];
     let autoSwitch = false;
     let rebindId = null; // 正在补绑 URL 的源 id（行内表单，不用 prompt）
-    const repoEl = document.getElementById('lx-source-repo');
-    let repoSources = [];
-
-    function paintRepo() {
-      if (!repoEl) return;
-      if (!repoSources.length) {
-        repoEl.innerHTML = '<p class="setpage__note">正在加载内置源仓库…</p>';
-        return;
-      }
-      repoEl.innerHTML = repoSources.map((s) => {
-        const meta = [s.version ? `v${s.version}` : '', s.author || '',
-          (s.platforms || []).join(' / ')].filter(Boolean).join(' · ');
-        const state = s.imported
-          ? '<span class="setpage__val">已添加</span>'
-          : (s.error
-            ? `<span class="lx-src__repo-error">${esc(s.error)}</span><button class="setpage__act" type="button" data-add-builtin="${esc(s.id)}">重试</button>`
-            : `<button class="setpage__act" type="button" data-add-builtin="${esc(s.id)}">添加</button>`);
-        return `<div class="setpage__row lx-src__row" data-repo="${esc(s.id)}">
-          <span class="setpage__label-group">
-            <span class="setpage__label">${esc(s.name)}</span>
-            ${meta ? `<span class="setpage__hint">${esc(meta)}</span>` : ''}
-          </span>${state}</div>`;
-      }).join('');
-    }
-
-    async function refreshRepo() {
-      if (!repoEl) return;
-      try {
-        const d = await API.lxSourcesBuiltin();
-        if (d && d.code === 0) repoSources = Array.isArray(d.sources) ? d.sources : [];
-      } catch { /* 老版本服务端没有这条路由：仓库保持空 */ }
-      paintRepo();
-    }
 
     function paint() {
       if (!sources.length) {
@@ -14452,10 +14469,8 @@
       listEl.innerHTML = sources.map((s) => {
         const meta = [s.version ? `v${s.version}` : '', s.author || '',
           (s.platforms || []).join(' / ')].filter(Boolean).join(' · ');
-        const isBuiltin = s.origin === 'builtin';
-        const badge = isBuiltin ? '<span class="lx-src__badge lx-src__badge--builtin">内置</span>'
-          : (s.sourceUrl ? '<span class="lx-src__badge">URL</span>' : '');
-        const rebind = (s.sourceUrl || isBuiltin) ? '' : `<button class="lx-src__rebind" type="button" data-rebind="${esc(s.id)}">绑定 URL</button>`;
+        const badge = s.sourceUrl ? '<span class="lx-src__badge">URL</span>' : '';
+        const rebind = s.sourceUrl ? '' : `<button class="lx-src__rebind" type="button" data-rebind="${esc(s.id)}">绑定 URL</button>`;
         const refreshBtn = s.sourceUrl ? `<button class="setpage__act" type="button" data-refresh="${esc(s.id)}">刷新</button>` : '';
         const form = rebindId === s.id ? `<div class="lx-src__rebind-form">
             <input class="lx-set__input" id="lx-source-rebind-input" type="url" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="输入该源的脚本 URL（支持 GitHub）">
@@ -14488,24 +14503,7 @@
         }
       } catch { /* 老版本服务端没有这条路由：列表保持空 */ }
       paint();
-      refreshRepo();
     }
-
-    if (repoEl) repoEl.addEventListener('click', async (e) => {
-      const t = e.target.closest('[data-add-builtin]');
-      if (!t) return;
-      const id = t.dataset.addBuiltin;
-      const s = repoSources.find((x) => x.id === id);
-      t.disabled = true;
-      try {
-        const d = await API.lxSourcesAddBuiltin(id);
-        if (d && d.code === 0) {
-          setState(`已添加 ${(d.source && d.source.name) || (s && s.name) || ''}`);
-          refreshList();
-        } else setState('添加失败：' + ((d && d.error) || '未知错误'));
-      } catch (err) { setState('添加失败：' + (err && err.message || err)); }
-      t.disabled = false;
-    });
 
     listEl.addEventListener('click', async (e) => {
       const t = e.target.closest('[data-toggle],[data-del],[data-refresh],[data-rebind],[data-rebind-ok],[data-rebind-cancel]');

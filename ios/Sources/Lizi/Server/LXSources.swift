@@ -11,14 +11,11 @@ import CryptoKit
 /// 自定义源，没有内置解析、没有自定义 LX 服务器；拿不到就抛错，
 /// 由 player.js 走平台接口备用。
 ///
-/// 内置源仓库（pdone/lx-music-source，20 个，含 suyin 溯音音源——用户
-/// 2026-11-17 21:00 明确说「都加」，推翻了之前「溯音不打包」的规矩，按最新
-/// 指令 20 个全打包）：脚本在 public/lx-sources/<目录>.js，随包发布；首次
-/// 访问时种子导入进 manifest（id 就是目录名，稳定不变），每个都能单独开关、
-/// 删除；删掉的从仓库列表一键重新添加。种子只跑一次（UserDefaults
-/// lxSourcesSeededV1），删掉的不会自己长回来；种子时个别脚本校验失败
-/// （它的服务器没响应、初始化没完成）就跳过它、记下原因，其余照常导入，
-/// 失败的在仓库里显示原因、可点重试。
+/// 预装的 20 个 pdone 源也已删（用户 2026-11-18 04:01「把内置音源都删掉，
+/// 只保留自定义音源接口」）：包里不再带 public/lx-sources 脚本，没有
+/// 种子导入、没有内置源仓库；升级后手机上已导入的那批由 list() 里的
+/// purgeBuiltinSources() 在启动时清掉。用户以后自己从 URL 或本地 .js
+/// 导入源，管理界面（开关/删除/自动切换）照常好用。
 ///
 /// 导入校验（import-url / import-file / 刷新 / 补绑 URL 共用）：
 ///   脚本必须在独立 JSContext 里跑起来、注册 request 处理、inited 上报至少一个
@@ -31,8 +28,8 @@ struct LXSourceMeta: Codable {
     var author: String
     /// inited 上报的、带 musicUrl 的平台（去掉 'local' 伪源），如 ["tx", "wy"]。
     var platforms: [String]
-    /// "url" = URL 导入（有 sourceUrl，可刷新）/ "local" = 本地文件导入 /
-    /// "builtin" = 内置源仓库（pdone/lx-music-source，随包发布，无 sourceUrl，不刷新）。
+    /// "url" = URL 导入（有 sourceUrl，可刷新）/ "local" = 本地文件导入。
+    /// 旧版预装的内置源 origin 是 "builtin"，list() 里启动时清掉（见 purgeBuiltinSources）。
     var origin: String
     /// URL 导入的源地址（已转 raw）；本地源为 nil，旧记录补绑后才有。
     var sourceUrl: String?
@@ -131,184 +128,6 @@ final class LXSourceRegistry {
 
     private init() {}
 
-    // MARK: - 内置源仓库（pdone/lx-music-source，20 个）
-
-    /// 内置源 id（= 仓库目录名 = public/lx-sources/<id>.js，也是 manifest 里的固定 id）。
-    static let builtinIds = [
-        "changqing", "feichangdao", "fish", "flower", "grass", "helloworld",
-        "huanyin", "huibq", "hyw", "ikun", "jiexiang", "juhe", "lx", "qdy",
-        "qingliang", "sixyin", "suyin", "xinghai", "xinglan", "yuningxi",
-    ]
-    /// 种子只跑一次的标记；包内脚本有变化时升版本号（V1 → V2…）再种一遍。
-    static let builtinSeedFlag = "lxSourcesSeededV1"
-
-    static func builtinRawURL(id: String) -> String {
-        "https://raw.githubusercontent.com/pdone/lx-music-source/main/\(id)/latest.js"
-    }
-
-    /// 包里自带的脚本（public/lx-sources/<id>.js，随 public/ 一起进包）。
-    static func bundledScript(id: String) -> String? {
-        Bundle.main.resourceURL.flatMap {
-            try? String(contentsOf: $0.appendingPathComponent("public/lx-sources/\(id).js"), encoding: .utf8)
-        }
-    }
-
-    /// 校验通过的内置脚本缓存（ioQueue 上访问）：addBuiltin 直接复用，不用重跑。
-    private var builtinChecked: [String: BuiltinChecked] = [:]
-    /// 校验失败的内置源（id → 原因，ioQueue 上访问）：种子跳过它，仓库里显示原因、可重试。
-    private var builtinFailures: [String: String] = [:]
-
-    private struct BuiltinChecked {
-        var name: String
-        var version: String
-        var author: String
-        var platforms: [String]
-        var script: String
-        var instance: LXScriptInstance
-    }
-
-    /// 批量校验内置脚本：先全部加载起来，再用一个共用的 5 秒期限等 inited，
-    /// 免得每个坏脚本各等 5 秒、一次校验拖半分钟。成功的缓存进 builtinChecked，
-    /// 失败的原因记进 builtinFailures。只在 ioQueue 上调。
-    private func checkBuiltin(ids: [String]) -> [String: BuiltinChecked] {
-        var loaded: [(id: String, script: String, instance: LXScriptInstance)] = []
-        for id in ids {
-            if builtinChecked[id] != nil || builtinFailures[id] != nil { continue }
-            guard let script = Self.bundledScript(id: id), !script.isEmpty else {
-                builtinFailures[id] = "包里没有这个脚本文件"; continue
-            }
-            guard script.contains("musicUrl") else {
-                builtinFailures[id] = "不是有效的落雪音源脚本"; continue
-            }
-            let inst = LXScriptInstance(script: script)
-            do { try inst.load() } catch {
-                builtinFailures[id] = "不是有效的落雪音源脚本：\(error.localizedDescription)"; continue
-            }
-            loaded.append((id, script, inst))
-        }
-        if !loaded.isEmpty {
-            let deadline = Date().addingTimeInterval(5)
-            for item in loaded { item.instance.waitForInited(deadline: deadline) }
-            for item in loaded {
-                let platforms = item.instance.platforms
-                guard !platforms.isEmpty else {
-                    builtinFailures[item.id] = "没有可用的 musicUrl 音源（初始化未完成，可能是它的服务器没响应）"
-                    continue
-                }
-                let name = LXSourceStore.headerValue(item.script, "name") ?? item.id
-                builtinChecked[item.id] = BuiltinChecked(
-                    name: name,
-                    version: LXSourceStore.headerValue(item.script, "version") ?? "",
-                    author: LXSourceStore.headerValue(item.script, "author") ?? "",
-                    platforms: platforms, script: item.script, instance: item.instance)
-            }
-        }
-        var out: [String: BuiltinChecked] = [:]
-        for id in ids { if let c = builtinChecked[id] { out[id] = c } }
-        return out
-    }
-
-    /// 种子：首次访问时把 20 个内置源导进 manifest（只跑一次；删掉的不再种回来）。
-    /// 只在 ioQueue 上调（list()/builtinList() 里调）。个别失败不拦着其余的。
-    /// 标记最后才置位：中途崩了下次还能重种（已导入的会跳过，幂等）。
-    private func seedBuiltinIfNeeded() {
-        guard !UserDefaults.standard.bool(forKey: Self.builtinSeedFlag) else { return }
-        var manifest = LXSourceStore.loadManifest()
-        let pending = Self.builtinIds.filter { id in !manifest.contains(where: { $0.id == id }) }
-        if !pending.isEmpty {
-            let checked = checkBuiltin(ids: pending)
-            try? FileManager.default.createDirectory(at: LXSourceStore.directory, withIntermediateDirectories: true)
-            for id in pending {
-                guard let c = checked[id] else { continue }
-                let meta = LXSourceMeta(
-                    id: id, name: c.name, version: c.version, author: c.author,
-                    platforms: c.platforms, origin: "builtin", sourceUrl: nil,
-                    enabled: true, importedAt: Date().timeIntervalSince1970,
-                    sha256: LXSourceStore.sha256Hex(c.script))
-                try? Data(c.script.utf8).write(to: LXSourceStore.scriptURL(id: id), options: .atomic)
-                manifest.append(meta)
-                replaceInstance(id: id, instance: c.instance)
-            }
-            LXSourceStore.saveManifest(manifest)
-        }
-        UserDefaults.standard.set(true, forKey: Self.builtinSeedFlag)
-    }
-
-    /// 仓库列表：20 个内置源各一行的元数据（名称/版本/作者/平台/raw 地址、
-    /// 是否已导入、是否启用、失败原因）。只在 ioQueue 上调。
-    func builtinList() -> [[String: Any]] {
-        ioQueue.sync {
-            seedBuiltinIfNeeded()
-            let manifest = LXSourceStore.loadManifest()
-            let unknown = Self.builtinIds.filter { id in
-                !manifest.contains(where: { $0.id == id })
-                    && builtinChecked[id] == nil && builtinFailures[id] == nil
-            }
-            if !unknown.isEmpty { _ = checkBuiltin(ids: unknown) }
-            return Self.builtinIds.map { id in
-                let m = manifest.first(where: { $0.id == id })
-                let c = builtinChecked[id]
-                let script = Self.bundledScript(id: id) ?? ""
-                var d: [String: Any] = [
-                    "id": id,
-                    "name": m?.name ?? c?.name ?? LXSourceStore.headerValue(script, "name") ?? id,
-                    "version": m?.version ?? c?.version ?? LXSourceStore.headerValue(script, "version") ?? "",
-                    "author": m?.author ?? c?.author ?? LXSourceStore.headerValue(script, "author") ?? "",
-                    "platforms": m?.platforms ?? c?.platforms ?? [],
-                    "imported": m != nil,
-                    "enabled": m?.enabled ?? false,
-                    "rawUrl": Self.builtinRawURL(id: id),
-                ]
-                if let f = builtinFailures[id] { d["error"] = f }
-                return d
-            }
-        }
-    }
-
-    /// 从仓库重新添加一个内置源（删掉后点「重新添加」走这里）：完整校验一次，
-    /// 过了才落盘 + 进 manifest；已经导入的直接返回现有记录。
-    func addBuiltin(id: String) throws -> LXSourceMeta {
-        guard Self.builtinIds.contains(id) else {
-            throw NSError(domain: "LXSources", code: 400, userInfo: [NSLocalizedDescriptionKey: "不是内置源"])
-        }
-        return try ioQueue.sync {
-            var manifest = LXSourceStore.loadManifest()
-            if let existing = manifest.first(where: { $0.id == id }) { return existing }
-            if let c = builtinChecked[id] {
-                let meta = LXSourceMeta(
-                    id: id, name: c.name, version: c.version, author: c.author,
-                    platforms: c.platforms, origin: "builtin", sourceUrl: nil,
-                    enabled: true, importedAt: Date().timeIntervalSince1970,
-                    sha256: LXSourceStore.sha256Hex(c.script))
-                try FileManager.default.createDirectory(at: LXSourceStore.directory, withIntermediateDirectories: true)
-                try Data(c.script.utf8).write(to: LXSourceStore.scriptURL(id: id), options: .atomic)
-                manifest.append(meta)
-                LXSourceStore.saveManifest(manifest)
-                replaceInstance(id: id, instance: c.instance)
-                builtinFailures.removeValue(forKey: id)
-                return meta
-            }
-            guard let script = Self.bundledScript(id: id), !script.isEmpty else {
-                throw NSError(domain: "LXSources", code: 400, userInfo: [NSLocalizedDescriptionKey: "包里没有这个脚本文件"])
-            }
-            let validated = try validate(script: script)
-            let meta = LXSourceMeta(
-                id: id,
-                name: validated.name == "自定义源" ? id : validated.name,
-                version: validated.version, author: validated.author,
-                platforms: validated.platforms, origin: "builtin", sourceUrl: nil,
-                enabled: true, importedAt: Date().timeIntervalSince1970,
-                sha256: LXSourceStore.sha256Hex(script))
-            try FileManager.default.createDirectory(at: LXSourceStore.directory, withIntermediateDirectories: true)
-            try Data(script.utf8).write(to: LXSourceStore.scriptURL(id: id), options: .atomic)
-            manifest.append(meta)
-            LXSourceStore.saveManifest(manifest)
-            replaceInstance(id: id, instance: validated.instance)
-            builtinFailures.removeValue(forKey: id)
-            return meta
-        }
-    }
-
     // MARK: - 自动切换开关（UserDefaults，默认关）
 
     var autoSwitchEnabled: Bool {
@@ -322,12 +141,30 @@ final class LXSourceRegistry {
     // MARK: - 列表
 
     /// 导入顺序（manifest 顺序），前端按这个顺序画、服务端按这个顺序试。
-    /// 首次调用时先把内置源仓库种子导入（只跑一次，见 seedBuiltinIfNeeded）。
+    /// 每次先清掉旧版预装的内置源（origin == "builtin"，用户 2026-11-18
+    /// 要求删掉全部 20 个预装源）：升级后用户手机上已经导入的那批也在
+    /// 这里清掉——manifest 记录 + 脚本文件 + 运行实例一起删；没有内置
+    /// 源时这步什么都不做。只留用户自己加的自定义源。
     func list() -> [LXSourceMeta] {
         ioQueue.sync {
-            seedBuiltinIfNeeded()
+            purgeBuiltinSources()
             return LXSourceStore.loadManifest()
         }
+    }
+
+    /// 清掉旧版预装的内置源（只在 ioQueue 上调）。幂等：没有就直接返回。
+    private func purgeBuiltinSources() {
+        var manifest = LXSourceStore.loadManifest()
+        let doomed = manifest.filter { $0.origin == "builtin" }
+        guard !doomed.isEmpty else { return }
+        for m in doomed {
+            try? FileManager.default.removeItem(at: LXSourceStore.scriptURL(id: m.id))
+            removeInstance(id: m.id)
+        }
+        manifest.removeAll(where: { $0.origin == "builtin" })
+        LXSourceStore.saveManifest(manifest)
+        // 旧种子标记也清掉，别留着占位。
+        UserDefaults.standard.removeObject(forKey: "lxSourcesSeededV1")
     }
 
     // MARK: - 导入
@@ -509,8 +346,18 @@ final class LXSourceRegistry {
         }
     }
 
-    /// 校验音频直链是否真的能打开：Range 取 1 字节，只等响应头（不下载正文）。
-    /// 跟随重定向（URLSession 默认）；2xx 即算通。
+    /// 校验音频直链是否真的能播：Range 取 1 字节，读到 1 个字节才算通。
+    /// 只验 2xx 不够：有的上游对坏地址也回 200 + HTML 错误页（长青被截断的
+    /// wy.php、过期的 vkey），探活放过后 LX 就“赢”了、平台备用走不到，
+    /// 播放器拿到错误页只能静默失败。所以同时验状态码 + Content-Type +
+    /// 至少 1 字节正文：
+    ///  - 206 + ≥1 字节：Range 生效的真音频，直接算通（Content-Type 缺失也认）；
+    ///  - 200 + ≥1 字节：要求 Content-Type 是音频（audio/*、video/*、
+    ///    application/octet-stream——酷狗 FLAC 就回这个），text/html、
+    ///    application/json 之类的错误页直接判死，换下一个候选。
+    /// 用 bytes(for:) 只读 1 字节就停：data(for:) 会把整段正文下完，遇到
+    /// 上游无视 Range 回 200 整包时会把整个文件（上百 MB 的 FLAC）拉下来探活。
+    /// 跟随重定向（URLSession 默认）。
     static func audioURLReachable(_ urlString: String, timeout: TimeInterval = 8) async -> Bool {
         guard let url = URL(string: urlString),
               url.scheme == "http" || url.scheme == "https" else { return false }
@@ -522,9 +369,21 @@ final class LXSourceRegistry {
                     var req = URLRequest(url: url, timeoutInterval: timeout)
                     req.setValue("bytes=0-1", forHTTPHeaderField: "Range")
                     req.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
-                    let (_, resp) = try await URLSession.shared.bytes(for: req)
+                    let (bytes, resp) = try await URLSession.shared.bytes(for: req)
                     guard let http = resp as? HTTPURLResponse else { return false }
-                    return (200..<300).contains(http.statusCode)
+                    guard http.statusCode == 200 || http.statusCode == 206 else { return false }
+                    let ct = (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
+                    let audioCT = ct.hasPrefix("audio/") || ct.hasPrefix("video/")
+                        || ct == "application/octet-stream" || ct == "binary/octet-stream"
+                    if http.statusCode == 200 {
+                        // 200 可能是错误页：必须有音频 Content-Type 才认。
+                        guard audioCT else { return false }
+                    } else {
+                        // 206 是真分片：Content-Type 缺失也认，有值时必须是音频。
+                        if !ct.isEmpty && !audioCT { return false }
+                    }
+                    var it = bytes.makeAsyncIterator()
+                    return try await it.next() != nil
                 } catch {
                     return false
                 }

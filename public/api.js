@@ -9,6 +9,15 @@ const API = (() => {
     try { return AbortSignal.timeout(ms); } catch { return undefined; }
   };
 
+  /* 音频代理地址：直链里的 url 参数必须编两次码。
+     原因见 2026-11-18 播放断点实测：服务端 HttpServer.readRequest 会先对
+     整条 target 做一次 removingPercentEncoding，再按 & 切 query——单次编码
+     的 %26（直链里 ?a=1&b=2 的 &）会被提前解码成真的 &，url 参数在第一个
+     & 处被截断（QQ vkey 丢 vkey → 403，长青丢 id → 522），播放器静默无声。
+     编两次后：整条解码一次还剩 %26，切 query 不会误切；服务端再对值解一次，
+     还原成原始直链。只动音频代理这四处，不动 /api/img 等其它路由。 */
+  const proxyAudioUrl = (prefix, u) => (u ? `/${prefix}?url=${encodeURIComponent(encodeURIComponent(u))}` : '');
+
   async function call(path, params, method = 'POST') {
     const url = new URL('/api/' + path, location.origin);
     let body;
@@ -130,7 +139,7 @@ const API = (() => {
     songWiki: (id) => call('song/wiki', { id }),
     /* 直链要走本机代理：网易云 CDN 不回 ACAO，而 <audio> 带着 crossOrigin='anonymous'
        （Web Audio 取频谱用），直接挂 CDN 地址会被 CORS 拦成 net::ERR_FAILED。 */
-    neteaseAudio: (u) => (u ? `/api/netease/audio?url=${encodeURIComponent(u)}` : ''),
+    neteaseAudio: (u) => proxyAudioUrl('api/netease/audio', u),
     lyric: (id) => call('lyric', { id }),
     search: (s, limit = 30) => call('search', { s, limit }),
     personalized: () => call('personalized'),
@@ -172,7 +181,7 @@ const API = (() => {
     qqRadioCategories: () => call('qq/radio/categories', {}, 'GET'),
     qqRadioTracks: (id) => call('qq/radio/tracks', { id }, 'GET'),
     /** 音频直链要走本机代理：vkey 会过期、CDN 有 referer 策略，也不该把凭证写进 DOM */
-    qqAudio: (u) => (u ? `/api/qq/audio?url=${encodeURIComponent(u)}` : ''),
+    qqAudio: (u) => proxyAudioUrl('api/qq/audio', u),
 
     /* ------------------------------------------------------------------
        其它音源（酷狗 / 汽水 / 波点 / Spotify）
@@ -257,7 +266,7 @@ const API = (() => {
     },
 
     /**
-     * 落雪（LX）优先：播放地址默认先走 /api/lx/song/url（内置解析或设置里填的自建服务器），
+     * 落雪（LX）优先：播放地址默认先走 /api/lx/song/url（用户自加的自定义源），
      * quality 不传时服务端默认从 master 向下回退，返回的 quality 是实际档位。
      * undefined 的字段不进查询串，别让服务端收到 mid=undefined。
      */
@@ -274,7 +283,7 @@ const API = (() => {
     },
 
     /** LX 解析出的音频直链走 /api/lx/audio 代理（白名单见服务端 AUDIO_HOSTS.lx） */
-    lxAudio: (u) => (u ? `/api/lx/audio?url=${encodeURIComponent(u)}` : ''),
+    lxAudio: (u) => proxyAudioUrl('api/lx/audio', u),
 
     /* ------------------------------------------------------------------
        自定义源管理（设置 → 自定义源管理；服务端见 LXSources.swift）
@@ -290,15 +299,13 @@ const API = (() => {
     lxSourcesToggle: (id, enabled) => call('lx/sources/toggle', { id, enabled }),
     lxSourcesRefresh: (id) => call('lx/sources/refresh', { id }),
     lxSourcesBindUrl: (id, url) => call('lx/sources/bind-url', { id, url }),
-    lxSourcesBuiltin: () => call('lx/sources/builtin', {}, 'GET'),
-    lxSourcesAddBuiltin: (id) => call('lx/sources/add-builtin', { id }),
     /** 不传参 = 读当前开关；传 true/false = 写开关 */
     lxSourcesAutoSwitch: (enabled) => enabled === undefined
       ? call('lx/sources/auto-switch', {}, 'GET')
       : call('lx/sources/auto-switch', { enabled }),
 
     /** 所有非网易云音源的音频都走各自代理（服务端按源做域名白名单 + 转发 Range） */
-    srcAudio: (src, u) => (u ? `/api/${src}/audio?url=${encodeURIComponent(u)}` : ''),
+    srcAudio: (src, u) => proxyAudioUrl(`api/${src}/audio`, u),
 
     /* ------------------------------------------------------------------
        本地音乐（文件 App 导入；只在 iOS 壳里有，原生桥 liziNative 负责弹选择器）

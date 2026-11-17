@@ -110,18 +110,6 @@ final class LiziRouter {
             }
             return .json(200, ["code": 0, "enabled": LXSourceRegistry.shared.autoSwitchEnabled])
         }
-        if path == "/api/lx/sources/builtin" {
-            return .json(200, ["code": 0, "sources": LXSourceRegistry.shared.builtinList()])
-        }
-        if path == "/api/lx/sources/add-builtin" && req.method == "POST" {
-            do {
-                let meta = try LXSourceRegistry.shared.addBuiltin(id: req.string("id"))
-                return .json(200, ["code": 0, "source": LXSourceMeta.json(meta)])
-            } catch {
-                return .json(200, ["code": 400, "error": error.localizedDescription])
-            }
-        }
-
         // ---- 其它边车：音频代理 + handler ----
         for name in ["kugou", "qishui", "bodian", "spotify", "kuwo"] {
             if path == "/api/\(name)/audio" { return await Proxies.proxySourceAudio(req, source: name) }

@@ -96,6 +96,24 @@ enum Proxies {
         return imageHostSuffixes.contains { h.hasSuffix($0) }
     }
 
+    /// 2xx 回包的音频校验：上游对坏地址有时回 200 + HTML 错误页（被截断的
+    /// PHP 地址、过期 vkey 的 403 页），原样透传给 <audio> 只会让播放器
+    /// 解码失败、界面静默无声。2xx 时要求 Content-Type 是音频（audio/*、
+    /// video/*、application/octet-stream——酷狗 FLAC 就回这个；206 分片
+    /// 缺 Content-Type 也认），且正文非空；否则返回错误文案，由调用方
+    /// 换 502 让播放器快速失败、走平台备用重试。非 2xx 原样透传不动。
+    private static func audioBodyError(status: Int, data: Data, contentType: String?) -> String? {
+        guard (200..<300).contains(status) else { return nil }
+        if data.isEmpty { return "上游返回空音频（HTTP \(status)）" }
+        let ct = (contentType ?? "").lowercased()
+        let audioCT = ct.hasPrefix("audio/") || ct.hasPrefix("video/")
+            || ct == "application/octet-stream" || ct == "binary/octet-stream"
+        if !audioCT && !(status == 206 && ct.isEmpty) {
+            return "上游返回的不是音频（HTTP \(status)，Content-Type: \(ct.isEmpty ? "缺失" : ct)）"
+        }
+        return nil
+    }
+
     /// /api/<source>/audio?url=：音频代理，转发 Range，返回上游状态码原样。
     static func proxySourceAudio(_ req: HttpRequest, source: String) async -> HttpResponse {
         guard let raw = req.query["url"], let url = URL(string: raw),
@@ -113,6 +131,10 @@ enum Proxies {
             if let range = req.headers["range"] { headers["Range"] = range }
             do {
                 let (data, http) = try await Upstream.fetch(url, headers: headers, timeout: 30)
+                if let err = audioBodyError(status: http.statusCode, data: data,
+                                            contentType: http.value(forHTTPHeaderField: "Content-Type")) {
+                    return .error(502, err)
+                }
                 var out: [String: String] = [
                     "Content-Type": http.value(forHTTPHeaderField: "Content-Type") ?? "audio/mpeg",
                     "Cache-Control": "no-store",
@@ -138,6 +160,10 @@ enum Proxies {
         if let range = req.headers["range"] { headers["Range"] = range }
         do {
             let (data, http) = try await Upstream.fetch(url, headers: headers, timeout: 30)
+            if let err = audioBodyError(status: http.statusCode, data: data,
+                                        contentType: http.value(forHTTPHeaderField: "Content-Type")) {
+                return .error(502, err)
+            }
             var out: [String: String] = [
                 "Content-Type": http.value(forHTTPHeaderField: "Content-Type") ?? "audio/mpeg",
                 "Cache-Control": "no-store",

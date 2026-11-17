@@ -54,6 +54,15 @@ final class NetEaseService {
                     }
                 }
                 if !setCookies.isEmpty { session.saveCookies(setCookies) }
+                // 再从 URLSession 的共享 cookie 仓补一份：多条 Set-Cookie 在
+                // allHeaderFields 里会拼成一条（甚至可能看不到），但 URLSession.shared
+                // 一定把响应 cookie 存进了共享仓（默认配置）。803 的 MUSIC_U 只走
+                // Set-Cookie——丢了它，扫码就永远收不到登录态。
+                if let stored = HTTPCookieStorage.shared.cookies(for: url) {
+                    var extra: [String: String] = [:]
+                    for c in stored { extra[c.name] = c.value }
+                    if !extra.isEmpty { session.setCookies(extra) }
+                }
                 if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                     return UpstreamResult(status: http.statusCode, json: obj, setCookies: setCookies)
                 }
@@ -813,8 +822,11 @@ extension NetEaseService {
             if !pairs.isEmpty { return ("body.data.cookie", pairs) }
         }
         if !setCookies.isEmpty {
-            let joined = setCookies.joined(separator: "; ")
-            let pairs = parseCookieInput(joined)
+            // Set-Cookie 分支必须用逗号感知的解析：URLSession 会把多条 Set-Cookie
+            // 拼成一条（", " 连接），parseCookieInput 只按 ';' 切，会把非首位 cookie
+            // 的键解析成 ", MUSIC_U" 这类带前导逗号的键，导致 pairs["MUSIC_U"] 查不到
+            // ——803 明明到了，harvest 却报 not-authorized（见 runHarvest 兜底）。
+            let pairs = SessionStore.parseSetCookieStrings(setCookies)
             if !pairs.isEmpty { return ("set-cookie", pairs) }
         }
         return (nil, [:])
@@ -882,6 +894,23 @@ extension NetEaseService {
                     field = ex.field
                 }
             } catch { /* 状态也失败就按无 MUSIC_U 处理 */ }
+        }
+
+        // 兜底：fetchUpstream 可能已把 MUSIC_U 存进 SessionStore（803 响应
+        // 的 Set-Cookie），只是上面三步都没从响应里解析出来。会话本身已登录
+        // 就别再报 not-authorized / no-music-u，直接校验它。
+        if pairs["MUSIC_U"] == nil, session.hasMusicU {
+            do {
+                if let v = try await sessionVerify(), let profile = v["profile"] {
+                    let out: [String: Any] = [
+                        "ok": true, "code": code as Any, "gotCookie": true, "field": "session",
+                        "keys": session.cookieKeys, "tried": tried + ["session"], "profile": profile,
+                    ]
+                    lastHarvest = ["at": ISO8601DateFormatter().string(from: Date()), "ok": true,
+                                   "tried": tried + ["session"], "gotCookie": true, "field": "session", "cookieKeys": session.cookieKeys]
+                    return out
+                }
+            } catch { /* 校验出错就按原路返回失败 */ }
         }
 
         let keys = Array(pairs.keys)

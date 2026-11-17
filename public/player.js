@@ -771,7 +771,7 @@ const Player = (() => {
    * 原 load() 里的取址逻辑原样搬出来：正常切歌和「预载下一首」都走这里，
    * 保证两条路径对 QQ / 边车 / 演示音轨的判断完全一致，不各写一套。
    * ------------------------------------------------------------------ */
-  async function fetchTrackUrl(track) {
+  async function fetchTrackUrl(track, opts = {}) {
     /* 非网易云的曲目（QQ / 酷狗 / 汽水 / 波点 / Spotify）：id 和直链都在各自边车上。
        这里只做分支，具体形状由 api.js 抹平（srcLyric / srcSongUrl / srcAudio）。 */
     const src = track.source || 'netease';
@@ -783,15 +783,19 @@ const Player = (() => {
     let preview = false;
     let lxQuality = '';
     let clipStartMs = 0;
+    // via：这条地址从哪来（lx / platform / local / demo）。播放器拿它决定：
+    // LX 地址进播放器才失败时，改走平台备用再试一次；平台地址失败就不再兜圈。
+    let via = '';
 
     /* 本地文件：地址就是本机 /api/local/file，不走 LX、不走平台接口。 */
     if (src === 'local') {
-      return { url: API.localFile(track.id), demo: false, reason: '', preview: false, clipStartMs: 0, lxQuality: '' };
+      return { url: API.localFile(track.id), demo: false, reason: '', preview: false, clipStartMs: 0, lxQuality: '', via: 'local' };
     }
 
-    /* 落雪优先：netease / qq / kugou / kuwo 先试 LX 解析（内置，或设置里填的自建服务器），
-       拿到真地址就直接用；LX 拿不到再走平台接口。lx.quality 是实际拿到的档位，界面按它显示。 */
-    if (src === 'netease' || src === 'qq' || src === 'kugou' || src === 'kuwo') {
+    /* 落雪优先：netease / qq / kugou / kuwo 先试 LX 解析（用户自加的自定义源），
+       拿到真地址就直接用；LX 拿不到再走平台接口。lx.quality 是实际拿到的档位，界面按它显示。
+       opts.skipLX：播放中重试时用——LX 地址已证实是死的，直接走平台备用，别再取一次。 */
+    if (!opts.skipLX && (src === 'netease' || src === 'qq' || src === 'kugou' || src === 'kuwo')) {
       try {
         const lx = await API.lxSongUrl(track);
         if (lx && lx.url) {
@@ -799,6 +803,7 @@ const Player = (() => {
           lxQuality = lx.quality || '';
           reason = '';
           preview = false;
+          via = 'lx';
         }
       } catch { /* LX 失败就走平台接口 */ }
     }
@@ -835,13 +840,61 @@ const Player = (() => {
         else if (item?.code === -110) reason = 'vip';
         else reason = 'unavailable';
       }
+      if (url) via = 'platform';
     } catch { reason = 'network'; }
 
     if (!url) {
       demo = true;
       url = makeDemoTrack(40, track.id);
     }
-    return { url, demo, reason, preview, clipStartMs, lxQuality };
+    return { url, demo, reason, preview, clipStartMs, lxQuality, via: demo ? 'demo' : via };
+  }
+
+  /* LX 地址进了播放器才发现是死的（代理 502/403、解码失败）时，改走平台备用
+     再试一次：fetchTrackUrl 只在取址前做 LX→平台降级，取址后失败原来是死路，
+     只能显示「播放失败」。每首只重试一次，且只在用户还没切歌时才换源；
+     手势拦截（NotAllowedError）不重试。 */
+  async function retryWithPlatform(track, token) {
+    if (!track || token !== state.token || state.lxRetried) return false;
+    state.lxRetried = true;
+    let data;
+    try {
+      data = await fetchTrackUrl(track, { skipLX: true });
+    } catch { return false; }
+    if (token !== state.token || !data || !data.url || data.demo) return false;
+    revokeDeckBlob(audio);
+    audio.preload = 'metadata';
+    audio.src = data.url;
+    state.lastFetch = { via: data.via, track, token };
+    emit('source', { demo: data.demo, track, reason: data.reason, preview: data.preview, clipStartMs: data.clipStartMs, lxQuality: data.lxQuality });
+    try {
+      await audio.play();
+      Beat.resume();
+      Beat.start();
+      state.playing = true;
+      emit('playstate', true);
+      return true;
+    } catch {
+      state.playing = false;
+      emit('playstate', false);
+      return false;
+    }
+  }
+
+  /** <audio> 报错时的真实原因（原来 sourceerror 只发 {}，界面除了「播放失败」
+   *  什么都说不出来，诊断日志也看不到）：MediaError 码 + 上游 host +
+   *  networkState/readyState。host 只取域名，不带 query（vkey 之类不进日志）。 */
+  function audioErrorDetail(el) {
+    let host = '';
+    try { host = new URL(el.src).host; } catch { /* blob: 地址没有 host */ }
+    const e = el.error;
+    return {
+      code: e ? e.code : 0,
+      message: e ? (e.message || '') : '',
+      host,
+      networkState: el.networkState,
+      readyState: el.readyState,
+    };
   }
 
   /** 换歌时统一的元数据入口：trackchange + 清空歌词 + 异步拉歌词 / BPM。
@@ -913,6 +966,9 @@ const Player = (() => {
 
     revokeDeckBlob(audio);
     if (data.demo) { deckBlobs.set(audio, data.url); state.objectUrl = data.url; }
+    // 记下这首的地址来源：error 事件里靠它判断要不要改走平台备用重试。
+    state.lastFetch = { via: data.via, track, token };
+    state.lxRetried = false;
 
     audio.preload = 'metadata';
     audio.src = data.url;
@@ -926,7 +982,13 @@ const Player = (() => {
         Beat.start();
         state.playing = true;
         emit('playstate', true);
-      } catch {
+      } catch (e) {
+        // 手势拦截（NotAllowedError）不是地址问题，不重试；地址问题（error 已挂上）
+        // 且是 LX 地址时，改走平台备用再试一次，成了就直接返回。
+        if (e && e.name !== 'NotAllowedError' && audio.error && data.via === 'lx' && token === state.token) {
+          const ok = await retryWithPlatform(track, token);
+          if (ok) return { demo: data.demo };
+        }
         state.playing = false;
         emit('playstate', false);
       }
@@ -1016,6 +1078,9 @@ const Player = (() => {
 
     const token = ++state.token;
     startTrackMeta(prepared.track, prepared.index, token);
+    // 过渡落点也要记地址来源，否则这首的 error 事件认不出是 LX 地址、重试走不到。
+    state.lastFetch = { via: prepared.via, track: prepared.track, token };
+    state.lxRetried = false;
 
     state.objectUrl = deckBlobs.get(incoming) || null;
     emit('source', {
@@ -1072,7 +1137,19 @@ const Player = (() => {
     });
     el.addEventListener('error', () => {
       if (el !== audio) return;
-      if (el.src) emit('sourceerror', {});
+      if (!el.src) return;
+      const detail = audioErrorDetail(el);
+      // 刚才是 LX 的地址：给平台备用一次机会；重试本身失败时再报 sourceerror。
+      // 旧行为只发 {}，界面和日志都看不到原因；现在把真实原因带出去。
+      if (state.lastFetch && state.lastFetch.via === 'lx' && state.lastFetch.token === state.token) {
+        console.warn('[player] LX 地址播放失败，改走平台备用：', detail);
+        retryWithPlatform(state.lastFetch.track, state.lastFetch.token).then((ok) => {
+          if (!ok) emit('sourceerror', detail);
+        });
+        return;
+      }
+      console.warn('[player] 播放失败：', detail);
+      emit('sourceerror', detail);
     });
   }
   bindDeck(deckA);
