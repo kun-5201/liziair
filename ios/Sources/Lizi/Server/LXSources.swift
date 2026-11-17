@@ -514,24 +514,28 @@ final class LXSourceRegistry {
     static func audioURLReachable(_ urlString: String, timeout: TimeInterval = 8) async -> Bool {
         guard let url = URL(string: urlString),
               url.scheme == "http" || url.scheme == "https" else { return false }
-        do {
-            return try await withThrowingTaskGroup(of: Bool.self) { group in
-                group.addTask {
+        // 非 throwing task group：两个子任务都不抛错（bytes 失败自己吞掉变 false，
+        // sleep 用 try?），先回来哪个算哪个，另一个取消。
+        return await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                do {
                     var req = URLRequest(url: url, timeoutInterval: timeout)
                     req.setValue("bytes=0-1", forHTTPHeaderField: "Range")
                     req.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
                     let (_, resp) = try await URLSession.shared.bytes(for: req)
                     guard let http = resp as? HTTPURLResponse else { return false }
                     return (200..<300).contains(http.statusCode)
-                }
-                group.addTask {
-                    try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                } catch {
                     return false
                 }
-                return await group.next() ?? false
             }
-        } catch {
-            return false
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
         }
     }
 
