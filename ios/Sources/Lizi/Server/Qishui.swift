@@ -1054,7 +1054,7 @@ final class QishuiService {
                 playlistCursors.removeAll()
                 return .json(200, ["code": 200, "loggedIn": false])
             case ["api", "qishui", "search"]:
-                let q = req.string("q").isEmpty ? req.string("keyword") : req.string("q")
+                let q = [req.string("s"), req.string("q"), req.string("keyword")].first(where: { !$0.isEmpty }) ?? ""
                 if q.isEmpty { return .json(200, ["code": 200, "source": "qishui", "tracks": [], "songCount": 0]) }
                 let limit = scClamp(req.int("limit", 20), 1, 50)
                 let offset = max(0, req.int("offset", 0))
@@ -1153,7 +1153,7 @@ final class QishuiService {
                                                       "playlist": NSNull(), "error": e.message])
                 }
             case ["api", "qishui", "search", "playlists"]:
-                let q = req.string("q").isEmpty ? req.string("keyword") : req.string("q")
+                let q = [req.string("s"), req.string("q"), req.string("keyword")].first(where: { !$0.isEmpty }) ?? ""
                 if q.isEmpty { return .json(200, ["code": 200, "source": "qishui", "playlists": []]) }
                 let limit = scClamp(req.int("limit", 20), 1, 50)
                 let offset = max(0, req.int("offset", 0))

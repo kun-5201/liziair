@@ -308,6 +308,8 @@
       if (next === 'now') {
         /* 播放页没有"拉起歌词"按钮了，直接常开 */
         setLyricsOpen(true);
+        /* 窄屏封面流：进页就按当前队列画一张（不只等切歌事件） */
+        paintCoverFlow();
         /* 布局落定后把封面列下移到"封面中心 = 歌词列中线"。
            再补一次 700ms 后的复算：进播放页时 grid/歌词列还在做 560ms 过渡，
            第一次量到的中线是过渡途中的，会差十几像素。 */
@@ -460,6 +462,45 @@
     });
     el.tracks.appendChild(frag);
     el.tracks.scrollTop = 0;
+    /* 搜索先返回曲目、封面后补（服务端不再阻塞等详情，见 NetEase.swift）：
+       只对没封面的前 30 行调一次 /api/song/detail，回来把占位图换成真封面。
+       补不到就留着占位，不影响听歌。 */
+    const missing = tracks
+      .map((t, i) => ({ t, i }))
+      .filter(({ t }) => !t.cover)
+      .slice(0, 30);
+    if (missing.length) {
+      API.songDetail(missing.map(({ t }) => t.id)).then((d) => {
+        const byId = new Map((d.tracks || []).map((t) => [String(t.id), t]));
+        for (const { t, i } of missing) {
+          const det = byId.get(String(t.id));
+          if (!det || !det.cover) continue;
+          t.cover = det.cover;
+          const li = el.tracks.querySelector(`.track[data-index="${i}"]`);
+          const ph = li && li.querySelector('.track__cover--ph');
+          if (!ph) continue;
+          const img = document.createElement('img');
+          img.className = 'track__cover';
+          img.src = API.img(det.cover, 400);
+          img.alt = '';
+          img.loading = 'lazy';
+          img.decoding = 'async';
+          img.addEventListener('load', () => paintWash(li, img), { once: true });
+          ph.replaceWith(img);
+          /* 正在播的这首封面刚补回来：播放页大图 + 封面流也一起换上，
+             不用等下次切歌（用户可能已经点进播放页了） */
+          const cur = Player.state.queue && Player.state.queue[Player.state.index];
+          if (cur === t) {
+            const art = API.img(det.cover, 500);
+            if (el.nowArt) el.nowArt.src = art;
+            if (el.nowBg) el.nowBg.style.backgroundImage = 'url("' + art + '")';
+          }
+        }
+        /* 这一批封面都回来了：封面流按最新队列重画一次（±2 首里刚补上的
+           封面也一并出现，不用等下次切歌） */
+        paintCoverFlow();
+      }).catch(() => { /* 封面补不到就留着占位 */ });
+    }
   }
 
   /* --------------------------------------------------------------------------
@@ -12960,7 +13001,9 @@
       d = await API.qrCheck(key);
     } catch (e) {
       qrBusy = false;
-      if (seq === qrSeq) qrTrouble('请求失败：' + ((e && e.message) || e));
+      /* 传输层失败（本机服务抖动 / 断网）是暂时的：不计入 qrFails、不停轮询。
+         对照 Folia 把 502 当 transient 处理；key 过期由 800 分支自动换码。 */
+      if (seq === qrSeq) setQrStatus('网络波动，继续等待扫码…');
       return;
     }
     qrBusy = false;
@@ -13688,6 +13731,100 @@
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); Player.toggle(); }
     });
   }
+  bindCoverFlow();
+
+  /* --------------------------------------------------------------------------
+     播放页 3D 封面流（Cover Flow）：窄屏播放页上半部分。
+     中间是当前播的歌（正对、最大），前后两首在两侧绕 Y 轴倾斜带透视，
+     下面有倒影；左右滑切歌，点中间播/停、点两侧跳到那首。
+     只渲染当前 ±2 首（性能）；封面没有时用 ♪ 占位，不留空白。
+     -------------------------------------------------------------------------- */
+  function paintCoverFlow(track, index) {
+    const trackEl = document.getElementById('cf-track');
+    if (!trackEl) return;
+    const q = Player.state.queue || [];
+    const cur = typeof index === 'number' ? index : Player.state.index;
+    if (!q.length || cur < 0 || cur >= q.length) { trackEl.replaceChildren(); return; }
+    const frag = document.createDocumentFragment();
+    for (let off = -2; off <= 2; off++) {
+      const idx = cur + off;
+      if (idx < 0 || idx >= q.length) continue;
+      const t = q[idx];
+      const item = document.createElement('div');
+      item.className = 'cf__item';
+      item.dataset.off = String(off);
+      item.dataset.idx = String(idx);
+      item.setAttribute('role', 'button');
+      item.setAttribute('aria-label', off === 0 ? '当前播放，点按播放/暂停' : '切换到这首');
+      if (t.cover) {
+        const img = document.createElement('img');
+        img.src = API.img(t.cover, 400);
+        img.alt = '';
+        img.draggable = false;
+        item.appendChild(img);
+      } else {
+        item.classList.add('is-ph');
+        const ph = document.createElement('span');
+        ph.className = 'cf__ph';
+        ph.textContent = '♪';
+        item.appendChild(ph);
+      }
+      frag.appendChild(item);
+    }
+    trackEl.replaceChildren(frag);
+  }
+
+  function bindCoverFlow() {
+    const cf = document.getElementById('coverflow');
+    const trackEl = document.getElementById('cf-track');
+    if (!cf || !trackEl || cf.__bound) return;
+    cf.__bound = true;
+    let startX = 0, startY = 0, dx = 0, dragging = false, startT = 0, pid = null;
+    const reset = () => {
+      trackEl.style.transition = '';
+      trackEl.style.transform = '';
+      dragging = false; pid = null; dx = 0;
+    };
+    cf.addEventListener('pointerdown', (e) => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      pid = e.pointerId;
+      startX = e.clientX; startY = e.clientY; dx = 0; startT = Date.now();
+      dragging = true;
+      try { cf.setPointerCapture(pid); } catch { /* ignore */ }
+    });
+    cf.addEventListener('pointermove', (e) => {
+      if (!dragging || e.pointerId !== pid) return;
+      dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
+      /* 横滑才跟手；竖滑留给页面（CSS 里 touch-action: pan-y 也拦了一道） */
+      if (Math.abs(dx) > Math.abs(dy)) {
+        trackEl.style.transition = 'none';
+        trackEl.style.transform = `translateX(${(dx * 0.45).toFixed(1)}px)`;
+      }
+    });
+    const finish = (e) => {
+      if (!dragging || (e && e.pointerId !== pid)) return;
+      const adx = Math.abs(dx);
+      const dt = Date.now() - startT;
+      const target = e.target && e.target.closest ? e.target.closest('.cf__item') : null;
+      reset();
+      if (adx > 56) {
+        if (dx < 0) Player.next(); else Player.prev();
+        return;
+      }
+      if (adx < 12 && dt < 400 && target) {
+        const idx = Number(target.dataset.idx);
+        if (Number.isFinite(idx) && idx !== Player.state.index) {
+          Player.playQueue(Player.state.queue, idx);
+        } else {
+          Player.toggle();
+        }
+      }
+    };
+    cf.addEventListener('pointerup', finish);
+    cf.addEventListener('pointercancel', reset);
+  }
 
   /* ================================================================== *
    * 播放器事件
@@ -13722,6 +13859,8 @@
     updateQueueCount();                     // 队列长度 / 当前曲目变了，抽屉里的计数要跟上
     if (queueBox && !queueBox.hidden) renderQueue();
     applyArtwork(track);
+    /* 窄屏封面流跟着切歌换中间那张 */
+    paintCoverFlow(track, index);
     /* 铺色态开着时，底色跟着新封面渐变过去（自定义色 / 平台色模式下内部会 no-op） */
     Hall.recolor(track);
     beatUI.reset();          // 换歌后节拍要重新估

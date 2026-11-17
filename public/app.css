@@ -8681,3 +8681,167 @@ body.is-stage .updtoast { bottom: 18px; }
 .lx-src__repo { padding: var(--sp-2) 0; }
 .lx-src__repo summary { cursor: pointer; }
 .lx-src__repo-error { font-size: 13px; color: #c0392b; }
+
+/* ==========================================================================
+   窄屏播放页（≤900px，含 iPhone 390×844）—— 2026-11-18 重排
+   --------------------------------------------------------------------------
+   根因（实测定位）：触屏那套 @media (max-width:1280px) and (pointer:coarse)
+   规则把舞台写成两栏 calc(328px×1.09) + calc(320px×0.8×1.09) + 44px 间距
+   ≈ 680px，在 390px 视口上必然溢出、标题左侧被截断；≤900px 的单列规则
+   只在歌词拉起时生效、权重还更低，从来没赢过。
+   这里用 #view-now 的高权重选择器在文件末尾一次性兜底：单列，封面流在上、
+   歌词在中、歌名/歌手/控制沉底，全部在视口内；底部留 Home Indicator 安全区。
+   无头 Chromium 里 env(safe-area-inset-*) = 0，取 px 保底；真机刘海高度
+   以真机为准（待真机确认）。
+   ========================================================================== */
+
+/* 封面流：宽屏不用（仍是大封面 .disc），窄屏才显示 */
+.cf { display: none; }
+
+@media (max-width: 900px) {
+  /* 顶栏：留出刘海 / 灵动岛安全区 */
+  body.is-now .now__bar {
+    padding-top: max(20px, env(safe-area-inset-top));
+    padding-bottom: 8px;
+  }
+
+  /* 舞台改单列 flex：封面流 / 歌词 / 底部信息三段 */
+  body.is-now #view-now .now__stage,
+  body.touch-ui.is-now #view-now .now__stage {
+    display: flex; flex-direction: column;
+    grid-template-columns: none;
+    gap: 0; align-items: stretch; justify-content: flex-start;
+    padding-top: 64px;
+    padding-bottom: max(28px, calc(env(safe-area-inset-bottom) + 12px));
+  }
+  /* 触屏：底部 dock 是 44px 的触摸热区（bottom:30px），传输键下沿必须
+     整个让出它的上沿，不然按钮底部会被进度条抢去点按（实测重叠 26px） */
+  body.touch-ui.is-now #view-now .now__stage {
+    padding-bottom: max(62px, calc(env(safe-area-inset-bottom) + 28px));
+  }
+
+  /* .now__art 只做分组容器：子元素直接排进舞台的 flex 列 */
+  body.is-now #view-now .now__art,
+  body.touch-ui.is-now #view-now .now__art {
+    display: contents;
+  }
+
+  /* 宽屏大封面在窄屏下隐藏（终点矩形为 0 时飞入动画自带 guard 会跳过） */
+  body.is-now #view-now .disc { display: none; }
+
+  /* ---- 3D 封面流 ---- */
+  body.is-now #view-now .cf {
+    display: block; order: 0; flex: none;
+    perspective: 1100px;
+    touch-action: pan-y;
+    user-select: none; -webkit-user-select: none;
+    margin-top: 6px;
+  }
+  .cf__track {
+    position: relative;
+    height: 254px;
+    transform-style: preserve-3d;
+    will-change: transform;
+  }
+  .cf__item {
+    position: absolute; left: 50%; top: 0;
+    width: 188px; aspect-ratio: 1;
+    border-radius: 14px;
+    /* overflow 必须 visible：倒影（-webkit-box-reflect）画在元素框外面，
+       overflow:hidden 会直接裁掉它；圆角改由里面的 img 自己负责 */
+    background: oklch(22% 0.01 270);
+    box-shadow: 0 18px 44px rgba(0, 0, 0, 0.5);
+    cursor: pointer;
+    transition: transform 0.38s cubic-bezier(0.32, 0.72, 0, 1), opacity 0.38s ease;
+  }
+  .cf__item img {
+    width: 100%; height: 100%; object-fit: cover; display: block;
+    border-radius: 14px;
+    -webkit-box-reflect: below 8px linear-gradient(transparent 62%, rgba(255, 255, 255, 0.25));
+  }
+  .cf__item.is-ph { display: grid; place-items: center; }
+  .cf__item.is-ph .cf__ph {
+    font-size: 64px; line-height: 1; color: rgba(255, 255, 255, 0.75);
+    -webkit-box-reflect: below 8px linear-gradient(transparent 62%, rgba(255, 255, 255, 0.2));
+  }
+  .cf__item[data-off="0"]  { transform: translateX(-50%) scale(1.04); z-index: 5; }
+  .cf__item[data-off="-1"] { transform: translateX(calc(-50% - 128px)) translateZ(-110px) rotateY(40deg); opacity: 0.88; z-index: 4; }
+  .cf__item[data-off="1"]  { transform: translateX(calc(-50% + 128px)) translateZ(-110px) rotateY(-40deg); opacity: 0.88; z-index: 4; }
+  .cf__item[data-off="-2"] { transform: translateX(calc(-50% - 224px)) translateZ(-200px) rotateY(50deg); opacity: 0.5; z-index: 3; }
+  .cf__item[data-off="2"]  { transform: translateX(calc(-50% + 224px)) translateZ(-200px) rotateY(-50deg); opacity: 0.5; z-index: 3; }
+
+  /* 歌词拉起时（进播放页默认就是拉起）封面流收小，给歌词留地方 */
+  body.is-now #view-now.is-lyrics-open .cf__track { height: 198px; }
+  body.is-now #view-now.is-lyrics-open .cf__item { width: 148px; }
+  body.is-now #view-now.is-lyrics-open .cf__item[data-off="-1"] { transform: translateX(calc(-50% - 104px)) translateZ(-90px) rotateY(40deg); }
+  body.is-now #view-now.is-lyrics-open .cf__item[data-off="1"]  { transform: translateX(calc(-50% + 104px)) translateZ(-90px) rotateY(-40deg); }
+  body.is-now #view-now.is-lyrics-open .cf__item[data-off="-2"] { transform: translateX(calc(-50% - 182px)) translateZ(-160px) rotateY(50deg); }
+  body.is-now #view-now.is-lyrics-open .cf__item[data-off="2"]  { transform: translateX(calc(-50% + 182px)) translateZ(-160px) rotateY(-50deg); }
+
+  /* ---- 歌词面板：中间一段，可滚动；收起时彻底不占位 ---- */
+  body.is-now #view-now .now__lyrics {
+    order: 2; flex: 1 1 auto; min-height: 0; height: auto;
+    margin: 12px 0 0; padding: 0;
+    opacity: 1; transform: none; visibility: visible; pointer-events: auto;
+  }
+  body.is-now #view-now:not(.is-lyrics-open) .now__lyrics { display: none; }
+  /* 歌词窗口不再锁死 3 行 / 5.2 行：跟着中间这段自由长 */
+  body.is-now #view-now .lyrics {
+    height: auto; flex: 1 1 auto;
+    margin-block: 0;
+    padding-top: calc(var(--ly-row) * 1);
+    padding-bottom: calc(var(--ly-row) * 1);
+  }
+  body.touch-ui.is-now:not([class*="now-layout-"]) #view-now .lyrics {
+    height: auto !important; flex: 1 1 auto !important;
+    margin-block: 0 !important;
+    padding-top: calc(var(--ly-row) * 1) !important;
+    padding-bottom: calc(var(--ly-row) * 1) !important;
+  }
+
+  /* ---- 底部：歌名 / 歌手 / 控制，一行排开、全部在视口内 ---- */
+  body.is-now #view-now .now__meta {
+    order: 3; flex: none; width: 100%; max-width: 100%; min-width: 0;
+    margin-top: auto; padding-top: 12px;
+    text-align: center;
+  }
+  body.is-now #view-now .now__title {
+    font-size: 20px; line-height: 1.25;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  body.is-now #view-now .now__sub {
+    font-size: 14px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  body.is-now #view-now .now__transport {
+    order: 4; flex: none; width: 100%;
+    display: flex; align-items: center; justify-content: center;
+    gap: 16px; margin-top: 10px; margin-bottom: 0;
+  }
+  body.is-now #view-now .ntr-side { gap: 16px; }
+  /* 触屏那套 71px 传输键在 390px 上 4 个就占 309px + 间距，必溢出；收小 */
+  body.is-now #view-now .ntr,
+  body.touch-ui.is-now #view-now .ntr {
+    width: 52px; height: 52px;
+  }
+  body.is-now #view-now .ntr .ico,
+  body.touch-ui.is-now #view-now .ntr .ico {
+    width: 22px; height: 22px;
+  }
+  body.is-now #view-now .ntr--play,
+  body.touch-ui.is-now #view-now .ntr--play {
+    width: 64px; height: 64px;
+  }
+  body.is-now #view-now .ntr--play .ico,
+  body.touch-ui.is-now #view-now .ntr--play .ico {
+    width: 30px; height: 30px;
+  }
+  body.is-now #view-now #ntr-mode,
+  body.touch-ui.is-now #view-now #ntr-mode {
+    width: 52px; height: 52px;
+  }
+  body.is-now #view-now #ntr-mode .ico,
+  body.touch-ui.is-now #view-now #ntr-mode .ico {
+    width: 20px; height: 20px;
+  }
+}

@@ -14,6 +14,10 @@ final class LiziRouter {
         // ---- 静态图片代理 ----
         if path == "/api/img" { return await Proxies.proxyImage(req) }
 
+        // ---- 服务健康 + 诊断（不经过上游；搜不到歌时先看这里）----
+        if path == "/api/health" { return .json(200, ["ok": true]) }
+        if path == "/api/diag/search" { return .json(200, DiagLog.shared.json()) }
+
         // ---- Wallpaper Engine 壁纸（wallpaper-api.mjs）----
         // 主播放器界面不依赖它（只给 658 形态 iframe 用）；v1 先返回 404，见规格文档。
         if path == "/api/wallpaper" || path.hasPrefix("/api/wallpaper/") {

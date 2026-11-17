@@ -17,14 +17,30 @@ const API = (() => {
     } else {
       for (const [k, v] of Object.entries(params || {})) url.searchParams.set(k, v);
     }
-    const res = await fetch(url, {
-      method,
-      headers: method === 'POST' ? { 'Content-Type': 'application/json' } : undefined,
-      body,
-      signal: timeout(60000),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return res.json();
+    const headers = method === 'POST' ? { 'Content-Type': 'application/json' } : undefined;
+    const opts = { method, headers, body, signal: timeout(60000) };
+    try {
+      const res = await fetch(url, opts);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    } catch (e) {
+      /* 只有网络层失败（本机服务掉了个连接，如 WKWebView 的 "Load failed"）
+         才重试一次：换一条新连接往往就通了。HTTP 错误和 60 秒超时 abort
+         不重试——前者重试也没用，后者重试只会再等 60 秒。 */
+      const msg = String((e && e.message) || e);
+      const isNet = e && e.name === 'TypeError'
+        && /Load failed|Failed to fetch|NetworkError|Network request failed/i.test(msg);
+      if (!isNet) throw e;
+      await new Promise((r) => setTimeout(r, 300));
+      try {
+        const res2 = await fetch(url, { method, headers, body, signal: timeout(60000) });
+        if (!res2.ok) throw new Error(`HTTP ${res2.status}`);
+        return res2.json();
+      } catch (e2) {
+        if (e2 && e2.name === 'AbortError') throw e2;
+        throw new Error(`本地服务连接失败（${String((e2 && e2.message) || e2)}），请重启 App 后重试`);
+      }
+    }
   }
 
   /**
@@ -109,6 +125,8 @@ const API = (() => {
       ids: Array.isArray(ids) ? ids.join(',') : ids,
       level: level || (typeof window !== 'undefined' && window.LIZI_QUALITY) || 'exhigh',
     }),
+    /** 批量取曲目详情（含封面）：搜索先返回曲目、封面后补就走这条（见 app.js renderTracks） */
+    songDetail: (ids) => call('song/detail', { ids: Array.isArray(ids) ? ids.join(',') : ids }),
     songWiki: (id) => call('song/wiki', { id }),
     /* 直链要走本机代理：网易云 CDN 不回 ACAO，而 <audio> 带着 crossOrigin='anonymous'
        （Web Audio 取频谱用），直接挂 CDN 地址会被 CORS 拦成 net::ERR_FAILED。 */

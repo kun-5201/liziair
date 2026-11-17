@@ -84,25 +84,40 @@ final class WebHost: NSObject, ObservableObject, WKUIDelegate {
     func start() {
         // 幂等：onAppear 可能多次触发；重复启动会建一个新端口的服务、丢掉
         // 旧服务，页面还指着旧端口，后续 /api 请求全变 Load failed。
+        // 但上次启动失败过（failed）时要允许重试：先停掉旧服务再建新的。
+        if failed { server?.stop(); server = nil }
         guard server == nil else { return }
         failed = false
         do {
             let server = try LocalHttpServer(router: router)
             self.server = server
             server.start()
-            // 等 listener 就绪拿到端口再加载页面。
-            DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                guard let self, let server = self.server, server.port > 0 else {
-                    DispatchQueue.main.async { self?.fail("本地服务没有拿到端口") }
-                    return
-                }
-                DispatchQueue.main.async { self.load(port: server.port) }
-            }
+            // 等 listener 就绪拿到端口再加载页面：冷启动时 0.5 秒未必够，
+            // 每 250ms 查一次、最多 3 秒，拿不到才报失败。
+            waitForPort(deadline: Date().addingTimeInterval(3))
             configureAudioSession()
             setupRemoteCommands()
             startNowPlayingPolling()
         } catch {
             fail("启动本地服务失败：\(error.localizedDescription)")
+        }
+    }
+
+    /// 轮询等端口（listener 就绪才有 port），拿到就加载页面。
+    private func waitForPort(deadline: Date) {
+        if let server, server.port > 0 {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.load(port: server.port)
+            }
+            return
+        }
+        guard Date() < deadline else {
+            fail("本地服务没有拿到端口")
+            return
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            self?.waitForPort(deadline: deadline)
         }
     }
 

@@ -75,45 +75,102 @@ struct HttpResponse {
 }
 
 final class LocalHttpServer {
-    private let listener: NWListener
+    private var listener: NWListener?
     private let router: LiziRouter
     private(set) var port: Int = 0
 
+    /// 优先固定端口：监听死掉重建时仍是同一个端口，页面 URL 不会失效。
+    /// 固定端口被占时退回动态端口（首次就绪前失败才退，见 restartListener）。
+    private static let preferredPort: UInt16 = 18791
+    private var boundPort: NWEndpoint.Port?
+    private var readyOnce = false
+    private var restarts = 0
+    private var stopped = false
+
     init(router: LiziRouter) throws {
         self.router = router
+        self.listener = try makeListener(port: NWEndpoint.Port(rawValue: Self.preferredPort) ?? .any)
+    }
+
+    private func makeListener(port: NWEndpoint.Port) throws -> NWListener {
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
         // 只绑本机回环：和 server.mjs 的 127.0.0.1 一致，不对外暴露。
-        params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: .any)
-        self.listener = try NWListener(using: params)
-    }
-
-    func start() {
-        listener.stateUpdateHandler = { [weak self] state in
-            if case .ready = state {
-                self?.port = Int(self?.listener.port?.rawValue ?? 0)
+        params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: port)
+        let l = try NWListener(using: params)
+        boundPort = port
+        l.stateUpdateHandler = { [weak self, weak l] state in
+            guard let self else { return }
+            switch state {
+            case .ready:
+                self.port = Int(l?.port?.rawValue ?? 0)
+                self.readyOnce = true
+                self.restarts = 0
+            case .failed(let err):
+                // 监听死掉（端口被占 / 运行中异常）：页面还指着旧端口，
+                // 所有 /api 请求会立刻变 Load failed，必须自己重建。
+                DiagLog.shared.recordEvent("listener failed: \(err.localizedDescription)")
+                self.restartListener()
+            default:
+                break
             }
         }
-        listener.newConnectionHandler = { [weak self] conn in
+        l.newConnectionHandler = { [weak self] conn in
             guard let self else { return }
             self.handleConnection(conn)
         }
-        listener.start(queue: .global(qos: .userInitiated))
+        return l
     }
 
-    func stop() { listener.cancel() }
+    func start() {
+        listener?.start(queue: .global(qos: .userInitiated))
+    }
+
+    func stop() {
+        stopped = true
+        listener?.cancel()
+        listener = nil
+    }
+
+    /// 监听失败后重建：已就绪过就用原来那个端口（页面 URL 不变）；
+    /// 从没就绪过说明固定端口被占，改走动态端口。最多重试 3 次。
+    private func restartListener() {
+        guard !stopped, restarts < 3 else { return }
+        restarts += 1
+        listener?.cancel()
+        listener = nil
+        let port: NWEndpoint.Port = readyOnce ? (boundPort ?? .any) : .any
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            guard let self, !self.stopped else { return }
+            do {
+                let l = try self.makeListener(port: port)
+                self.listener = l
+                l.start(queue: .global(qos: .userInitiated))
+            } catch {
+                DiagLog.shared.recordEvent("listener restart failed: \(error.localizedDescription)")
+            }
+        }
+    }
 
     // MARK: - 连接处理（HTTP/1.1，每次响应后关闭连接；WKWebView 能正常工作）
 
     private func handleConnection(_ conn: NWConnection) {
         conn.start(queue: .global(qos: .userInitiated))
         Task {
+            let t0 = Date()
             do {
                 let req = try await readRequest(conn)
                 let resp = await router.handle(req)
                 try await writeResponse(conn, resp)
+                DiagLog.shared.recordRequest(method: req.method, path: req.path,
+                                             ms: Int(Date().timeIntervalSince(t0) * 1000), status: resp.status)
             } catch {
-                // 读失败就直接关连接，不回包。
+                // 读失败也尽量回一个 400：静默关连接会让前端 fetch 直接报
+                // "Load failed"，除了一行文案什么信息都没有。
+                let resp = HttpResponse.error(400, "bad request: \(error.localizedDescription)")
+                try? await writeResponse(conn, resp)
+                DiagLog.shared.recordRequest(method: "?", path: "(read-error)",
+                                             ms: Int(Date().timeIntervalSince(t0) * 1000), status: 400)
             }
             conn.cancel()
         }
@@ -148,6 +205,11 @@ final class LocalHttpServer {
                 let contentLength = Int(headers["content-length"] ?? "0") ?? 0
                 while rest.count < contentLength {
                     let chunk = try await receive(conn, min(65536, max(1, contentLength - rest.count)))
+                    // 对端提前关连接时 receive 会回空 Data：不抛错就会在这里
+                    // 无限空转，这个连接永远不回包，前端一直等到 60 秒超时。
+                    guard !chunk.isEmpty else {
+                        throw NSError(domain: "LiziServer", code: 5, userInfo: [NSLocalizedDescriptionKey: "eof in body"])
+                    }
                     rest.append(chunk)
                 }
                 let body = rest.prefix(contentLength)

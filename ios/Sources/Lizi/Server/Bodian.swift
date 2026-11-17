@@ -770,7 +770,7 @@ final class BodianService {
                 qrSessions.removeAll()
                 return .json(200, ["code": 200, "loggedIn": false])
             case "search":
-                let q = req.string("q").isEmpty ? req.string("keyword") : req.string("q")
+                let q = [req.string("s"), req.string("q"), req.string("keyword")].first(where: { !$0.isEmpty }) ?? ""
                 if q.trimmingCharacters(in: .whitespaces).isEmpty {
                     return .json(200, ["code": 200, "source": "bodian", "tracks": [], "songCount": 0])
                 }

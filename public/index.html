@@ -1143,6 +1143,12 @@ python -c "from pedalboard import load_plugin; p=load_plugin(r'C:\Program Files\
 
     <div class="now__stage">
       <div class="now__art">
+        <!-- 3D 封面流（窄屏播放页上半部分）：中间当前曲正对放大，两侧倾斜带透视，
+             下面有倒影；左右滑切歌。内容由 app.js paintCoverFlow() 从队列里画，
+             宽屏下隐藏、仍用下面的 .disc 大封面。 -->
+        <div class="cf" id="coverflow" aria-label="封面流">
+          <div class="cf__track" id="cf-track"></div>
+        </div>
         <div class="disc">
           <img id="now-art" class="disc__img" alt="">
           <div class="disc__glow" aria-hidden="true"></div>

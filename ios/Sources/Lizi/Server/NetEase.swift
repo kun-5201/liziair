@@ -347,6 +347,7 @@ extension NetEaseService {
         // 参数整形。
         payload = shapePayload(routeKey: hit.key, payload: payload)
 
+        let t0 = Date()
         do {
             let result: UpstreamResult
             // 搜索要快：上游慢网时别重试、别拖到前端 60 秒超时才掐掉——
@@ -361,8 +362,26 @@ extension NetEaseService {
                 result = try await weapiRequest(apiPath, payload, timeout: reqTimeout, attempts: reqAttempts)
             }
             let normalized = await normalize(routeKey: hit.key, data: result.json, payload: payload)
+            if isSearch {
+                DiagLog.shared.recordSearch([
+                    "endpoint": "/search/get",
+                    "ms": Int(Date().timeIntervalSince(t0) * 1000),
+                    "http": result.status,
+                    "code": normalized["code"] as Any,
+                    "count": (normalized["tracks"] as? [[String: Any]])?.count ?? 0,
+                    "at": Int(Date().timeIntervalSince1970),
+                ])
+            }
             return .json(200, normalized)
         } catch {
+            if hit.key == "search" {
+                DiagLog.shared.recordSearch([
+                    "endpoint": "/search/get",
+                    "ms": Int(Date().timeIntervalSince(t0) * 1000),
+                    "error": error.localizedDescription,
+                    "at": Int(Date().timeIntervalSince1970),
+                ])
+            }
             return .json(502, ["code": 502, "error": error.localizedDescription])
         }
     }
@@ -417,35 +436,12 @@ extension NetEaseService {
         switch routeKey {
         case "search":
             let result = dict(data, "result")
-            var tracks = arr(result, "songs").compactMap { toTrack($0) }
-            // 任一缺封面就批量查详情补封面（失败不影响搜索本身）。
-            // 补封面是锦上添花：6 秒拿不到就直接返回搜索结果，别让它把
-            // 搜索拖到前端 60 秒超时（慢网下这一步曾让整条搜索超时）。
-            if tracks.contains(where: { str($0, "cover").isEmpty }) {
-                let ids = tracks.compactMap { $0["id"] as? Int }
-                let details = await withTaskGroup(of: [[String: Any]].self) { group in
-                    group.addTask { await self.fetchTrackDetails(ids) }
-                    group.addTask {
-                        try? await Task.sleep(nanoseconds: 6_000_000_000)
-                        return []
-                    }
-                    let first = await group.next() ?? []
-                    group.cancelAll()
-                    return first
-                }
-                var byId: [Int: [String: Any]] = [:]
-                for d in details {
-                    if let id = d["id"] as? Int, byId[id] == nil { byId[id] = d }
-                }
-                tracks = tracks.map { t in
-                    guard let id = t["id"] as? Int, let f = byId[id], let ft = toTrack(f) else { return t }
-                    var nt = t
-                    if str(nt, "cover").isEmpty { nt["cover"] = ft["cover"] as Any }
-                    if (nt["fee"] as? Int) == nil { nt["fee"] = ft["fee"] as Any }
-                    if (nt["duration"] as? Int ?? 0) == 0 { nt["duration"] = ft["duration"] as Any }
-                    return nt
-                }
-            }
+            let tracks = arr(result, "songs").compactMap { toTrack($0) }
+            // Folia 的做法：一次请求直接返回，不阻塞在补封面那步。
+            // /search/get 回的歌没有 al.picUrl（只有 picId，拼不出封面地址），
+            // 以前这里每搜一次都要再调 /v3/song/detail 全量补封面（最长 6 秒），
+            // 慢网下搜索全程被拖到 10 秒以上。改成先返回曲目，封面由前端
+            // 对可见行调 /api/song/detail 懒补（见 app.js renderTracks）。
             let songCount = (result["songCount"] as? Int) ?? tracks.count
             return ["code": code, "tracks": tracks, "songCount": songCount]
         case "song/url":
