@@ -275,7 +275,7 @@ enum LXScriptRuntime {
           var cp = ((c & 0x07) << 18) | ((bytes[i + 1] & 0x3f) << 12) | ((bytes[i + 2] & 0x3f) << 6) | (bytes[i + 3] & 0x3f);
           cp -= 0x10000;
           out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff)); i += 4;
-        } else { out += '\ufffd'; i++; }
+        } else { out += '\\ufffd'; i++; }
       }
       return out;
     };
