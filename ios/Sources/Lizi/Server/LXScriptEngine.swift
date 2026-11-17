@@ -136,7 +136,9 @@ final class LXScriptEngine {
 
     private func ensureLoaded() throws {
         if loaded { return }
-        let ctx = JSContext()
+        guard let ctx = JSContext() else {
+            throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "JSContext 创建失败"])
+        }
         ctx.exceptionHandler = { _, exc in
             if let exc { print("[lx] JS exception: \(exc)") }
         }
