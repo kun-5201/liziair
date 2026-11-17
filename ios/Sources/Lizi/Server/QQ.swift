@@ -708,6 +708,12 @@ extension QQService {
             } catch {
                 return .closed
             }
+            // 未成包缓冲上限 1MB：异常服务端一直发碎片会把 buffer 撑爆（内存紧张
+            // 时这就是压垮的稻草）；超了按会话失败处理，驱动随之结束，不等 180 秒超时。
+            if buffer.count > 1_048_576 {
+                await failSession(key: key, reason: "MQTT 数据异常（未成包超过 1MB）")
+                return .closed
+            }
             for (type, payload) in qqMqttSplitPackets(&buffer) {
                 if let outcome = await handleMqttPacket(key: key, ws: ws, type: type, payload: payload) {
                     return outcome
@@ -980,7 +986,25 @@ extension QQService {
         if qrSessions.values.contains(where: { $0.state == "exchanging" }) {
             throw QQAuthError(409, "Another QR login is already active")
         }
+        // 先取消被丢弃的过期会话的驱动/连接：只过滤字典不取消，驱动会空跑到
+        // 180 秒（qqQrTTL）才退，点一次登录就漏一个驱动。
+        for s in qrSessions.values where s.expiresAt <= now {
+            s.wsTask?.cancel()
+            s.driverTask?.cancel()
+        }
         qrSessions = qrSessions.filter { $0.value.expiresAt > now }
+        // 单飞：一次只允许一个活着的二维码会话。前端「登录」按钮在拿码期间
+        // 没禁用，用户连点（或码半天不出再点）会起第二个会话；旧会话前端
+        // 拿不到 key、cancel 不到它，旧驱动就一直跑到 180 秒过期。新会话
+        // 建起来之前先把旧的活会话顶掉（只取消任务 + 删字典，不走 failSession：
+        // failSession 会设 15 秒冷却，刚好把正在进行的这次登录也挡住）。
+        // exchanging 的会话上面已经 409 拦住了，不会走到这里。
+        let superseded = qrSessions.filter { ["created", "waiting", "scanned"].contains($0.value.state) }
+        for (k, s) in superseded {
+            s.wsTask?.cancel()
+            s.driverTask?.cancel()
+            qrSessions.removeValue(forKey: k)
+        }
         creatingSession = true
         defer { creatingSession = false }
         do {
@@ -1030,6 +1054,8 @@ extension QQService {
         qrSessions[key] = s
         guard await waitListenerReady(key: key) else {
             let reason = qrSessions[key]?.listenerFailed ?? "MQTT 监听器启动超时"
+            // 超时也走 failSession：它会取消 ws + driver，不让驱动空跑到 180 秒。
+            await failSession(key: key, reason: reason)
             throw QQAuthError(502, reason)
         }
         return img
@@ -1154,7 +1180,12 @@ extension QQService {
         guard let s = qrSessions[key] else { return }
         if s.state == "confirmed" { return }
         if s.state == "exchanging" {
-            // 换凭证已经在路上：记下取消，换完不发会话（本移植直接丢弃该会话）。
+            // 换凭证已经在路上：选「先取消再删」，不保留等换完。
+            // 保留会让 createSession 的 exchanging 409 一直拦着下一次登录；
+            // 取消后换完的 finalizeCredential / failSession 都以 qrSessions[key]
+            // 为准，会话没了就直接 no-op，不会写回已删的会话。
+            s.wsTask?.cancel()
+            s.driverTask?.cancel()
             qrSessions.removeValue(forKey: key)
             return
         }

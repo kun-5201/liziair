@@ -258,6 +258,27 @@ const API = (() => {
     /** LX 解析出的音频直链走 /api/lx/audio 代理（白名单见服务端 AUDIO_HOSTS.lx） */
     lxAudio: (u) => (u ? `/api/lx/audio?url=${encodeURIComponent(u)}` : ''),
 
+    /* ------------------------------------------------------------------
+       自定义源管理（设置 → 自定义源管理；服务端见 LXSources.swift）
+       列表 / URL 导入（GitHub 链接服务端自动转 raw）/ 本地文件导入 /
+       删除 / 启用开关 / 刷新（仅 URL 源）/ 旧源补绑 URL / 自动切换开关。
+       导入失败服务端回 200 + { code:400, error }（如「不是有效的落雪音源脚本」），
+       调用方读 error 显示，不要只看 HTTP 状态。
+       ------------------------------------------------------------------ */
+    lxSourcesList: () => call('lx/sources', {}, 'GET'),
+    lxSourcesImportUrl: (url) => call('lx/sources/import-url', { url }),
+    lxSourcesImportFile: (name, content) => call('lx/sources/import-file', { name, content }),
+    lxSourcesDelete: (id) => call('lx/sources/delete', { id }),
+    lxSourcesToggle: (id, enabled) => call('lx/sources/toggle', { id, enabled }),
+    lxSourcesRefresh: (id) => call('lx/sources/refresh', { id }),
+    lxSourcesBindUrl: (id, url) => call('lx/sources/bind-url', { id, url }),
+    lxSourcesBuiltin: () => call('lx/sources/builtin', {}, 'GET'),
+    lxSourcesAddBuiltin: (id) => call('lx/sources/add-builtin', { id }),
+    /** 不传参 = 读当前开关；传 true/false = 写开关 */
+    lxSourcesAutoSwitch: (enabled) => enabled === undefined
+      ? call('lx/sources/auto-switch', {}, 'GET')
+      : call('lx/sources/auto-switch', { enabled }),
+
     /** 所有非网易云音源的音频都走各自代理（服务端按源做域名白名单 + 转发 Range） */
     srcAudio: (src, u) => (u ? `/api/${src}/audio?url=${encodeURIComponent(u)}` : ''),
 

@@ -37,6 +37,12 @@ struct HttpRequest {
         if let v = params[key] as? NSNumber { return v.intValue }
         return def
     }
+    func bool(_ key: String, _ def: Bool = false) -> Bool {
+        if let v = params[key] as? Bool { return v }
+        if let v = params[key] as? String { return v == "true" || v == "1" }
+        if let v = params[key] as? NSNumber { return v.boolValue }
+        return def
+    }
 }
 
 struct HttpResponse {

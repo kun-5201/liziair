@@ -3127,6 +3127,7 @@
     let key = '';
     let timer = 0;
     let checking = false;      // 上一轮还没回来就跳过这一轮，避免并发轮询
+    let starting = false;      // 拿码请求在飞时再点「登录/换一张」直接忽略，别起第二个会话
     let refreshing = 0;        // 连续过期次数：连换 3 次就停手，别把上游惹毛
     let autoTries = 0;         // 过期自动换码时撞上 15s 冷却，最多再等 3 轮
     let channel = 'qqmusic';
@@ -3192,6 +3193,8 @@
     }
 
     async function startQr(auto = false) {
+      if (starting) return;               // 已有一个拿码请求在飞，再点直接忽略
+      starting = true;
       stop();
       // 换一张之前先取消旧会话（关掉它的 MQTT 驱动），不然旧驱动一直跑到 180 秒过期。
       // 不等它回来（fire-and-forget），别拖慢新码。
@@ -3210,8 +3213,10 @@
         box.innerHTML = '<span>边车没起来</span>';
         status.textContent = '启动失败：' + e.message;
         status.className = 'qq-qr__status is-error';
+        starting = false;
         return;
       }
+      starting = false;
       if (!d || !d.key || !d.qrimg) {
         box.innerHTML = '<span>拿不到二维码</span>';
         /* 二维码不是随时能刷：上游对同一设备有 15s 冷却（服务端会把 retryAfterMs 带回来）。
@@ -14259,6 +14264,239 @@
       } catch (e) { if (state) state.textContent = '保存失败：' + (e && e.message || e); }
       saveBtn.disabled = false;
     });
+  })();
+
+  /* 设置 → 自定义源管理：导入落雪源脚本（GET/POST /api/lx/sources/*，
+     脚本存 App 沙盒、元数据存 manifest.json，重启仍在；见 LXSources.swift）。
+     列表按导入顺序画；URL 导入的源有 URL 标记 + 刷新按钮，本地导入的没有；
+     没有 sourceUrl 的旧记录，点右侧蓝色链接可重新绑定一次 URL。
+     不用 window.prompt：WKWebView 没接 textInput 面板，prompt 弹不出来。 */
+  (function initLxSourceSettings() {
+    const listEl = document.getElementById('lx-source-list');
+    const stateEl = document.getElementById('lx-source-state');
+    const urlInput = document.getElementById('lx-source-url');
+    const importUrlBtn = document.getElementById('lx-source-import-url');
+    const importFileBtn = document.getElementById('lx-source-import-file');
+    const fileInput = document.getElementById('lx-source-file-input');
+    const autoBtn = document.getElementById('lx-source-autoswitch');
+    if (!listEl) return;
+    const esc = (v) => String(v == null ? '' : v).replace(/[&<>\"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[c]));
+    const setState = (msg) => { if (stateEl) stateEl.textContent = msg || ''; };
+    const setAutoUI = (on) => {
+      if (autoBtn) autoBtn.setAttribute('aria-checked', on ? 'true' : 'false');
+    };
+    let sources = [];
+    let autoSwitch = false;
+    let rebindId = null; // 正在补绑 URL 的源 id（行内表单，不用 prompt）
+    const repoEl = document.getElementById('lx-source-repo');
+    let repoSources = [];
+
+    function paintRepo() {
+      if (!repoEl) return;
+      if (!repoSources.length) {
+        repoEl.innerHTML = '<p class="setpage__note">正在加载内置源仓库…</p>';
+        return;
+      }
+      repoEl.innerHTML = repoSources.map((s) => {
+        const meta = [s.version ? `v${s.version}` : '', s.author || '',
+          (s.platforms || []).join(' / ')].filter(Boolean).join(' · ');
+        const state = s.imported
+          ? '<span class="setpage__val">已添加</span>'
+          : (s.error
+            ? `<span class="lx-src__repo-error">${esc(s.error)}</span><button class="setpage__act" type="button" data-add-builtin="${esc(s.id)}">重试</button>`
+            : `<button class="setpage__act" type="button" data-add-builtin="${esc(s.id)}">添加</button>`);
+        return `<div class="setpage__row lx-src__row" data-repo="${esc(s.id)}">
+          <span class="setpage__label-group">
+            <span class="setpage__label">${esc(s.name)}</span>
+            ${meta ? `<span class="setpage__hint">${esc(meta)}</span>` : ''}
+          </span>${state}</div>`;
+      }).join('');
+    }
+
+    async function refreshRepo() {
+      if (!repoEl) return;
+      try {
+        const d = await API.lxSourcesBuiltin();
+        if (d && d.code === 0) repoSources = Array.isArray(d.sources) ? d.sources : [];
+      } catch { /* 老版本服务端没有这条路由：仓库保持空 */ }
+      paintRepo();
+    }
+
+    function paint() {
+      if (!sources.length) {
+        listEl.innerHTML = '<p class="setpage__note">暂无自定义源</p>';
+        return;
+      }
+      listEl.innerHTML = sources.map((s) => {
+        const meta = [s.version ? `v${s.version}` : '', s.author || '',
+          (s.platforms || []).join(' / ')].filter(Boolean).join(' · ');
+        const isBuiltin = s.origin === 'builtin';
+        const badge = isBuiltin ? '<span class="lx-src__badge lx-src__badge--builtin">内置</span>'
+          : (s.sourceUrl ? '<span class="lx-src__badge">URL</span>' : '');
+        const rebind = (s.sourceUrl || isBuiltin) ? '' : `<button class="lx-src__rebind" type="button" data-rebind="${esc(s.id)}">绑定 URL</button>`;
+        const refreshBtn = s.sourceUrl ? `<button class="setpage__act" type="button" data-refresh="${esc(s.id)}">刷新</button>` : '';
+        const form = rebindId === s.id ? `<div class="lx-src__rebind-form">
+            <input class="lx-set__input" id="lx-source-rebind-input" type="url" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="输入该源的脚本 URL（支持 GitHub）">
+            <button class="setpage__act" type="button" data-rebind-ok="${esc(s.id)}">绑定</button>
+            <button class="setpage__act" type="button" data-rebind-cancel="1">取消</button>
+          </div>` : '';
+        return `<div class="setpage__row lx-src__row" data-row="${esc(s.id)}">
+          <span class="setpage__label-group">
+            <span class="setpage__label">${esc(s.name)}${badge}</span>
+            ${meta ? `<span class="setpage__hint">${esc(meta)}</span>` : ''}
+          </span>
+          ${rebind}${refreshBtn}
+          <button class="setpage__switch" type="button" role="switch"
+                  aria-checked="${s.enabled ? 'true' : 'false'}" aria-label="启用 ${esc(s.name)}"
+                  data-toggle="${esc(s.id)}">
+            <span class="setpage__switch-knob" aria-hidden="true"></span>
+          </button>
+          <button class="setpage__act" type="button" data-del="${esc(s.id)}">删除</button>
+        </div>${form}`;
+      }).join('');
+    }
+
+    async function refreshList() {
+      try {
+        const d = await API.lxSourcesList();
+        if (d && d.code === 0) {
+          sources = Array.isArray(d.sources) ? d.sources : [];
+          autoSwitch = !!d.autoSwitch;
+          setAutoUI(autoSwitch);
+        }
+      } catch { /* 老版本服务端没有这条路由：列表保持空 */ }
+      paint();
+      refreshRepo();
+    }
+
+    if (repoEl) repoEl.addEventListener('click', async (e) => {
+      const t = e.target.closest('[data-add-builtin]');
+      if (!t) return;
+      const id = t.dataset.addBuiltin;
+      const s = repoSources.find((x) => x.id === id);
+      t.disabled = true;
+      try {
+        const d = await API.lxSourcesAddBuiltin(id);
+        if (d && d.code === 0) {
+          setState(`已添加 ${(d.source && d.source.name) || (s && s.name) || ''}`);
+          refreshList();
+        } else setState('添加失败：' + ((d && d.error) || '未知错误'));
+      } catch (err) { setState('添加失败：' + (err && err.message || err)); }
+      t.disabled = false;
+    });
+
+    listEl.addEventListener('click', async (e) => {
+      const t = e.target.closest('[data-toggle],[data-del],[data-refresh],[data-rebind],[data-rebind-ok],[data-rebind-cancel]');
+      if (!t) return;
+      if (t.dataset.toggle) {
+        const s = sources.find((x) => x.id === t.dataset.toggle);
+        if (!s) return;
+        const next = !s.enabled;
+        t.setAttribute('aria-checked', next ? 'true' : 'false');
+        try {
+          const d = await API.lxSourcesToggle(s.id, next);
+          if (d && d.code === 0) { s.enabled = next; setState(next ? `已启用 ${s.name}` : `已停用 ${s.name}`); }
+          else { t.setAttribute('aria-checked', s.enabled ? 'true' : 'false'); setState('切换失败：' + ((d && d.error) || '未知错误')); }
+        } catch (err) { t.setAttribute('aria-checked', s.enabled ? 'true' : 'false'); setState('切换失败：' + (err && err.message || err)); }
+        return;
+      }
+      if (t.dataset.del) {
+        const s = sources.find((x) => x.id === t.dataset.del);
+        if (!s) return;
+        try {
+          const d = await API.lxSourcesDelete(s.id);
+          if (d && d.code === 0) { setState(`已删除 ${s.name}`); if (rebindId === s.id) rebindId = null; refreshList(); }
+          else setState('删除失败：' + ((d && d.error) || '未知错误'));
+        } catch (err) { setState('删除失败：' + (err && err.message || err)); }
+        return;
+      }
+      if (t.dataset.refresh) {
+        const s = sources.find((x) => x.id === t.dataset.refresh);
+        if (!s) return;
+        t.disabled = true;
+        try {
+          const d = await API.lxSourcesRefresh(s.id);
+          if (d && d.code === 0) {
+            setState(d.changed ? `已刷新到 v${(d.source && d.source.version) || ''}` : `${s.name} 已是最新版本`);
+            refreshList();
+          } else setState('刷新失败：' + ((d && d.error) || '未知错误'));
+        } catch (err) { setState('刷新失败：' + (err && err.message || err)); }
+        t.disabled = false;
+        return;
+      }
+      if (t.dataset.rebind) {
+        rebindId = t.dataset.rebind;
+        paint();
+        const input = document.getElementById('lx-source-rebind-input');
+        if (input) input.focus();
+        return;
+      }
+      if (t.dataset.rebindCancel) { rebindId = null; paint(); return; }
+      if (t.dataset.rebindOk) {
+        const input = document.getElementById('lx-source-rebind-input');
+        const url = input ? input.value.trim() : '';
+        if (!url) { setState('请先输入脚本 URL'); return; }
+        t.disabled = true;
+        try {
+          const d = await API.lxSourcesBindUrl(t.dataset.rebindOk, url);
+          if (d && d.code === 0) { rebindId = null; setState(`已绑定 URL：${(d.source && d.source.name) || ''}`); refreshList(); }
+          else setState('绑定失败：' + ((d && d.error) || '未知错误'));
+        } catch (err) { setState('绑定失败：' + (err && err.message || err)); }
+        t.disabled = false;
+      }
+    });
+
+    if (importUrlBtn) importUrlBtn.addEventListener('click', async () => {
+      const url = urlInput ? urlInput.value.trim() : '';
+      if (!url) { setState('请先输入脚本 URL'); return; }
+      importUrlBtn.disabled = true;
+      try {
+        const d = await API.lxSourcesImportUrl(url);
+        if (d && d.code === 0) {
+          if (urlInput) urlInput.value = '';
+          setState(`已导入 ${(d.source && d.source.name) || ''}`);
+          refreshList();
+        } else setState('导入失败：' + ((d && d.error) || '未知错误'));
+      } catch (err) { setState('导入失败：' + (err && err.message || err)); }
+      importUrlBtn.disabled = false;
+    });
+
+    if (importFileBtn && fileInput) {
+      importFileBtn.addEventListener('click', () => fileInput.click());
+      fileInput.addEventListener('change', async () => {
+        const files = Array.prototype.slice.call(fileInput.files || []);
+        if (!files.length) return;
+        fileInput.value = '';
+        importFileBtn.disabled = true;
+        let ok = 0;
+        const fails = [];
+        for (const f of files) {
+          try {
+            const text = await f.text();
+            const d = await API.lxSourcesImportFile(f.name, text);
+            if (d && d.code === 0) ok++;
+            else fails.push(`${f.name}：${(d && d.error) || '未知错误'}`);
+          } catch (err) { fails.push(`${f.name}：${err && err.message || err}`); }
+        }
+        setState(`已导入 ${ok} 个` + (fails.length ? `；失败 ${fails.length} 个：${fails.join('；')}` : ''));
+        importFileBtn.disabled = false;
+        refreshList();
+      });
+    }
+
+    if (autoBtn) autoBtn.addEventListener('click', async () => {
+      const next = !autoSwitch;
+      setAutoUI(next);
+      try {
+        const d = await API.lxSourcesAutoSwitch(next);
+        if (d && d.code === 0) { autoSwitch = !!d.enabled; setAutoUI(autoSwitch); setState(autoSwitch ? '自动切换音源已开启' : '自动切换音源已关闭'); }
+        else { setAutoUI(autoSwitch); setState('保存失败：' + ((d && d.error) || '未知错误')); }
+      } catch (err) { setAutoUI(autoSwitch); setState('保存失败：' + (err && err.message || err)); }
+    });
+
+    refreshList();
   })();
 
   /* 设置 → 本地音乐：导入按钮（走 Hall.importLocal，弹原生文件选择器）。

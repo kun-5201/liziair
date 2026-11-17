@@ -1,148 +1,50 @@
 import Foundation
 import JavaScriptCore
+import CryptoKit
 
-/// 落雪音源脚本引擎：用 JavaScriptCore 跑 KMusic 的 落雪音源.js v1.0.3，
-/// 取歌走脚本的 musicUrl，替代 LX.swift 的内置 tx/wy 解析。
-/// 脚本文件在 Bundle 里 public/落雪音源.js（原样，未改动），以后换源就是换文件。
+/// 落雪音源脚本引擎：用 JavaScriptCore 跑落雪 LX Music 源脚本（KMusic 的 落雪音源.js v1.0.3，
+/// 或用户在「自定义源管理」里导入的任意源脚本），取歌走脚本的 musicUrl。
 ///
-/// lx 运行时（request / on / send / utils / EVENT_NAMES）照 KMusic 二进制里的桥来：
+/// 一个脚本 = 一个独立 JSContext（LXScriptInstance），互不串台；所有 JSContext
+/// 只在同一条串行队列 jsQueue 上碰。lx 运行时（request / on / send / utils /
+/// EVENT_NAMES / console）的装配只有一份（LXScriptRuntime.install），内置源和
+/// 自定义源共用，不复制粘贴两份。
+///
+/// lx 运行时照 KMusic 二进制里的桥来：
 ///   exp.musicUrl(source, musicInfo, quality)、exp.sources、actions；
 ///   env = "mobile"，version = "2.12.0"（和 KMusic 的 lx-music-mobile/2.12.0 UA 一致）。
-/// 自定义服务器（LX_API_URL）仍走 LXResolver.resolveViaExternalServer，不经过这里。
-/// kg/kw/mg 脚本里没有，仍走 LXResolver 内置解析；脚本全部档位失败时也回退到内置解析，
-/// 别让一次上游故障直接断播。
+/// 另外补了真实落雪宿主会给、但 KMusic 桥没有的几样（pdone 仓库的源脚本要用，
+/// 没有就加载即崩）：lx.currentScriptInfo（脚本头注释）、atob/btoa、
+/// window/self（= globalThis）、lx.utils.crypto（md5/sha1/sha256）。
+/// 自定义服务器（LX_API_URL）不经过这里，见 LXSourceRegistry 的取歌链。
+/// kg/kw/mg 内置脚本里没有，仍走 LXResolver 内置解析；脚本全部档位失败时也回退
+/// 到内置解析，别让一次上游故障直接断播。
 ///
 /// 线程：JSContext 只在 jsQueue 这条串行队列上碰；网络请求走 URLSession，
 /// 回调跳回 jsQueue 再调 JS。JSC 里未处理的 Promise rejection 不会崩 App
 /// （脚本加载时的 checkUpdate 失败就是这么走的）。
 
-final class LXScriptEngine {
-    static let shared = LXScriptEngine()
+// MARK: - lx 运行时装配（内置源 / 自定义源共用，只有一份）
 
-    /// 脚本支持的档位（按从高到低回退；脚本没有 flac，flac 按 flac24bit 算）。
-    static let scriptTiers = ["master", "atmos", "hires", "flac24bit", "320k", "128k"]
-    static let scriptSources = ["wy", "tx"]
+/// lx.send('inited') 带回来的 sources、lx.on('request') 注册的处理函数。
+/// 引用类型：装配时挂进 JS 的 block 直接写它，实例从它读。
+final class LXScriptSink {
+    var requestHandler: JSValue?
+    /// source -> actions（inited 事件上报的 musicSources）。
+    var initedSources: [String: [String]] = [:]
+}
 
-    private let jsQueue = DispatchQueue(label: "com.lty5201.lizi.lxscript")
-    private var context: JSContext?
-    private var requestHandler: JSValue?
-    private var loaded = false
-
-    private init() {}
-
-    // MARK: - 对外入口
-
-    /// 按档位从高到低回退，返回 (url, 实际档位)。
-    func resolveMusicUrl(source: String, songId: String, quality: String) async throws -> (String, String) {
-        guard !songId.isEmpty else {
-            throw NSError(domain: "LXScript", code: 6, userInfo: [NSLocalizedDescriptionKey: "缺少歌曲 ID"])
-        }
-        // 脚本只支持 tx/wy；kg/kw/mg 直接走内置解析。
-        guard Self.scriptSources.contains(source) else {
-            return try await LXResolver.resolveMusicUrl(source: source, songId: songId, quality: quality)
-        }
-        let tiers = Self.tiersFrom(quality)
-        var lastError: Error?
-        for tier in tiers {
-            do {
-                let url = try await callScriptMusicUrl(source: source, songId: songId, quality: tier)
-                return (url, tier)
-            } catch {
-                lastError = error
-            }
-        }
-        // 脚本全部档位失败，回退内置解析（oiapi 备用）。
-        do {
-            return try await LXResolver.resolveMusicUrl(source: source, songId: songId, quality: quality)
-        } catch {
-            throw lastError ?? error
-        }
-    }
-
-    private static func tiersFrom(_ quality: String) -> [String] {
-        var q = LXResolver.normalizeQuality(quality)
-        if q == "flac" { q = "flac24bit" }
-        let idx = scriptTiers.firstIndex(of: q) ?? 0
-        return Array(scriptTiers[idx...])
-    }
-
-    // MARK: - 调脚本（带单档位 20 秒上限）
-
-    private func callScriptMusicUrl(source: String, songId: String, quality: String) async throws -> String {
-        try await withThrowingTaskGroup(of: String.self) { group in
-            group.addTask { try await self.callScriptMusicUrlOnce(source: source, songId: songId, quality: quality) }
-            group.addTask {
-                try await Task.sleep(nanoseconds: 20_000_000_000)
-                throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "落雪脚本超时（\(source)/\(quality)）"])
-            }
-            guard let url = try await group.next() else {
-                throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "落雪脚本无返回"])
-            }
-            group.cancelAll()
-            return url
-        }
-    }
-
-    private func callScriptMusicUrlOnce(source: String, songId: String, quality: String) async throws -> String {
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
-            jsQueue.async { [weak self] in
-                guard let self else {
-                    cont.resume(throwing: NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "引擎已释放"]))
-                    return
-                }
-                do {
-                    try self.ensureLoaded()
-                    guard let ctx = self.context, let handler = self.requestHandler else {
-                        throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "落雪脚本未就绪"])
-                    }
-                    let payload: [String: Any] = [
-                        "action": "musicUrl",
-                        "source": source,
-                        "info": ["musicInfo": ["songmid": songId], "type": quality],
-                    ]
-                    guard let payloadValue = JSValue(object: payload, in: ctx) else {
-                        throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "请求构造失败"])
-                    }
-                    guard let promise = handler.call(withArguments: [payloadValue]), !promise.isUndefined else {
-                        throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "落雪脚本异常：\(ctx.exception?.toString() ?? "未知")"])
-                    }
-                    guard promise.hasProperty("then") else {
-                        throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "落雪脚本未返回 Promise"])
-                    }
-                    let fulfilled: @convention(block) (JSValue?) -> Void = { value in
-                        let url = value?.toString() ?? ""
-                        if url.hasPrefix("http://") || url.hasPrefix("https://") {
-                            cont.resume(returning: url)
-                        } else {
-                            cont.resume(throwing: NSError(domain: "LXScript", code: 2, userInfo: [NSLocalizedDescriptionKey: "落雪脚本未返回音频链接"]))
-                        }
-                    }
-                    let rejected: @convention(block) (JSValue?) -> Void = { value in
-                        cont.resume(throwing: NSError(domain: "LXScript", code: 2, userInfo: [NSLocalizedDescriptionKey: value?.toString() ?? "落雪脚本取歌失败"]))
-                    }
-                    guard let f = JSValue(object: fulfilled, in: ctx),
-                          let r = JSValue(object: rejected, in: ctx) else {
-                        throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "回调构造失败"])
-                    }
-                    _ = promise.invokeMethod("then", withArguments: [f, r])
-                } catch {
-                    cont.resume(throwing: error)
-                }
-            }
-        }
-    }
-
-    // MARK: - 加载脚本（只在 jsQueue 上跑）
-
-    private func ensureLoaded() throws {
-        if loaded { return }
-        guard let ctx = JSContext() else {
-            throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "JSContext 创建失败"])
-        }
+enum LXScriptRuntime {
+    /// 往一个全新的 JSContext 里装 console + globalThis.lx（request/on/send/
+    /// utils/EVENT_NAMES/env/version）。装完调用方再 evaluateScript(脚本)。
+    /// sink 由调用方持有：request 处理函数和 inited sources 都写进它。
+    /// scriptInfo：脚本头注释解析出的 name/version/author/description，
+    /// 装成 lx.currentScriptInfo（真实落雪宿主会给；野花/野草拿它拼请求头，
+    /// 没有就读 undefined.version 直接崩）。缺字段就传 ""，不缺整个对象。
+    static func install(into ctx: JSContext, sink: LXScriptSink, scriptInfo: [String: String] = [:]) {
         ctx.exceptionHandler = { _, exc in
             if let exc { print("[lx] JS exception: \(exc)") }
         }
-        self.context = ctx
 
         // console：JSC 自带没有；日志截断，免得脚本每次请求都把整个响应打出来。
         let logBlock: @convention(block) (String, String) -> Void = { level, message in
@@ -168,8 +70,10 @@ final class LXScriptEngine {
         lx.setValue("2.12.0", forProperty: "version")
 
         // lx.request(url, options, cb)：cb(err, resp)，resp.body 已按 JSON 解析过。
-        let requestBlock: @convention(block) (JSValue?, JSValue?, JSValue?) -> Void = { [weak self] urlValue, optionsValue, callbackValue in
-            guard let self,
+        // ctx 只弱引用：实例被删（源被删除/刷新）后，未完成的网络回调不再往已死的
+        // JSContext 里调，不留悬空引用。
+        let requestBlock: @convention(block) (JSValue?, JSValue?, JSValue?) -> Void = { [weak ctx] urlValue, optionsValue, callbackValue in
+            guard let ctx,
                   let urlString = urlValue?.toString(),
                   let url = URL(string: urlString),
                   let callback = callbackValue, !callback.isUndefined else { return }
@@ -186,8 +90,8 @@ final class LXScriptEngine {
             Task {
                 do {
                     let (data, resp) = try await Upstream.fetch(url, headers: headers, timeout: 15, method: method)
-                    self.jsQueue.async {
-                        guard let ctx = self.context else { return }
+                    LXScriptInstance.jsQueue.async { [weak ctx] in
+                        guard let ctx else { return }
                         let respObj = JSValue(newObjectIn: ctx)!
                         respObj.setValue(resp.statusCode, forProperty: "statusCode")
                         if let obj = try? JSONSerialization.jsonObject(with: data),
@@ -200,8 +104,8 @@ final class LXScriptEngine {
                     }
                 } catch {
                     let message = error.localizedDescription
-                    self.jsQueue.async {
-                        guard let ctx = self.context else { return }
+                    LXScriptInstance.jsQueue.async { [weak ctx] in
+                        guard let ctx else { return }
                         _ = callback.call(withArguments: [message, JSValue(undefinedIn: ctx)!])
                     }
                 }
@@ -210,46 +114,72 @@ final class LXScriptEngine {
         lx.setValue(JSValue(object: requestBlock, in: ctx)!, forProperty: "request")
 
         // lx.on(event, handler)：只接 request 事件。
-        let onBlock: @convention(block) (JSValue?, JSValue?) -> Void = { [weak self] eventValue, handlerValue in
-            guard let self, eventValue?.toString() == "request",
+        let onBlock: @convention(block) (JSValue?, JSValue?) -> Void = { eventValue, handlerValue in
+            guard eventValue?.toString() == "request",
                   let handler = handlerValue, !handler.isUndefined else { return }
-            self.requestHandler = handler
+            sink.requestHandler = handler
         }
         lx.setValue(JSValue(object: onBlock, in: ctx)!, forProperty: "on")
 
-        // lx.send(event, data)：inited 带 sources；updateAlert 只记日志。
-        let sendBlock: @convention(block) (JSValue?, JSValue?) -> Void = { eventValue, _ in
-            if eventValue?.toString() == "updateAlert" {
+        // lx.send(event, data)：inited 带 sources（记下来当覆盖平台）；
+        // updateAlert 只记日志。
+        let sendBlock: @convention(block) (JSValue?, JSValue?) -> Void = { eventValue, dataValue in
+            switch eventValue?.toString() {
+            case "inited":
+                if let sources = dataValue?.forProperty("sources")?.toDictionary() {
+                    var parsed: [String: [String]] = [:]
+                    for (key, value) in sources {
+                        guard let name = key as? String,
+                              let entry = value as? [String: Any] else { continue }
+                        if let actions = entry["actions"] as? [String] {
+                            parsed[name] = actions
+                        } else if let actions = entry["actions"] as? [Any] {
+                            parsed[name] = actions.map { "\($0)" }
+                        }
+                    }
+                    sink.initedSources = parsed
+                }
+            case "updateAlert":
                 print("[lx] updateAlert（脚本有更新，不自动处理）")
+            default:
+                break
             }
         }
         lx.setValue(JSValue(object: sendBlock, in: ctx)!, forProperty: "send")
 
+        // lx.currentScriptInfo：脚本自己的头注释（见 install 注释）。
+        let info = JSValue(newObjectIn: ctx)!
+        for (k, v) in scriptInfo { info.setValue(v, forProperty: k) }
+        lx.setValue(info, forProperty: "currentScriptInfo")
+
         ctx.setObject(lx, forKeyedSubscript: "lx" as NSString)
 
         // utils.buffer（纯 JS，和 Node 验证用的同一份代码；只给 local 源的 base64 用）。
-        ctx.evaluateScript(LXScriptEngine.utilsJS)
+        ctx.evaluateScript(LXScriptRuntime.utilsJS)
         ctx.evaluateScript("lx.utils = { buffer: __lxBuffer };")
-        if let exc = ctx.exception {
-            throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "运行时安装失败：\(exc)"])
-        }
 
-        guard let scriptURL = Bundle.main.resourceURL?.appendingPathComponent("public/落雪音源.js"),
-              let script = try? String(contentsOf: scriptURL, encoding: .utf8) else {
-            throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "找不到 public/落雪音源.js"])
+        // lx.utils.crypto：md5/sha1/sha256（独家音源这类脚本签名请求要用）。
+        // 复用现成的 Native 实现，不在 JS 里重写一遍。
+        let md5Block: @convention(block) (String) -> String = { NetEaseCrypto.md5Hex($0) }
+        let sha1Block: @convention(block) (String) -> String = { s in
+            Insecure.SHA1.hash(data: Data(s.utf8)).map { String(format: "%02x", $0) }.joined()
         }
-        ctx.evaluateScript(script)
-        if let exc = ctx.exception {
-            throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "落雪脚本加载失败：\(exc)"])
+        let sha256Block: @convention(block) (String) -> String = { s in
+            SHA256.hash(data: Data(s.utf8)).map { String(format: "%02x", $0) }.joined()
         }
-        guard requestHandler != nil else {
-            throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "落雪脚本没有注册 request 处理"])
-        }
-        loaded = true
+        let cryptoObj = JSValue(newObjectIn: ctx)!
+        cryptoObj.setValue(JSValue(object: md5Block, in: ctx)!, forProperty: "md5")
+        cryptoObj.setValue(JSValue(object: sha1Block, in: ctx)!, forProperty: "sha1")
+        cryptoObj.setValue(JSValue(object: sha256Block, in: ctx)!, forProperty: "sha256")
+        if let utils = lx.forProperty("utils") { utils.setValue(cryptoObj, forProperty: "crypto") }
+
+        // atob/btoa（JSC 自带没有；独家音源加载时就要用）与 window/self
+        //（六音读 window.console；都指向 globalThis）。
+        ctx.evaluateScript("var atob = __lxAtob; var btoa = __lxBtoa; var window = globalThis; var self = globalThis;")
     }
 
     /// utils.buffer 的 JS 实现（和 /tmp/lx-test/lx-utils.js 同一份逻辑）。
-    private static let utilsJS = """
+    static let utilsJS = """
     var __lxB64 = (function () {
       var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
       function utf8Bytes(str) {
@@ -291,5 +221,270 @@ final class LXScriptEngine {
         return s;
       }
     };
+    // atob/btoa：JSC 自带没有，这里用纯 JS 补（Latin-1 语义，和浏览器一致）。
+    var __lxB64Chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    var __lxAtob = function (s) {
+      var str = String(s).replace(/[^A-Za-z0-9+/=]/g, '');
+      var out = '';
+      for (var i = 0; i < str.length; i += 4) {
+        var n = (__lxB64Chars.indexOf(str[i]) << 18) | (__lxB64Chars.indexOf(str[i + 1]) << 12) |
+                ((str[i + 2] === '=' ? 0 : __lxB64Chars.indexOf(str[i + 2])) << 6) |
+                (str[i + 3] === '=' ? 0 : __lxB64Chars.indexOf(str[i + 3]));
+        out += String.fromCharCode((n >> 16) & 255);
+        if (str[i + 2] !== '=') out += String.fromCharCode((n >> 8) & 255);
+        if (str[i + 3] !== '=') out += String.fromCharCode(n & 255);
+      }
+      return out;
+    };
+    var __lxBtoa = function (s) {
+      var str = String(s);
+      var bytes = [];
+      for (var i = 0; i < str.length; i++) {
+        var c = str.charCodeAt(i);
+        if (c > 0xff) throw new Error('btoa: The string to be encoded contains characters outside of the Latin1 range.');
+        bytes.push(c);
+      }
+      var out = '';
+      for (var i = 0; i < bytes.length; i += 3) {
+        var b0 = bytes[i], b1 = bytes[i + 1], b2 = bytes[i + 2];
+        var n = (b0 << 16) | ((b1 || 0) << 8) | (b2 || 0);
+        out += __lxB64Chars[(n >> 18) & 63] + __lxB64Chars[(n >> 12) & 63];
+        out += (b1 === undefined) ? '=' : __lxB64Chars[(n >> 6) & 63];
+        out += (b2 === undefined) ? '=' : __lxB64Chars[n & 63];
+      }
+      return out;
+    };
     """
+}
+
+// MARK: - 单脚本实例（一个源脚本 = 一个独立 JSContext）
+
+/// 一个落雪源脚本的运行实例：独立 JSContext + 独立 request 处理。
+/// load() 必须在 jsQueue 之外的线程调（内部 jsQueue.sync；Router 的 Task 里调没问题）。
+/// load() 成功后才能调 resolveMusicUrl；load() 失败抛错，调用方按「无效脚本」处理。
+final class LXScriptInstance {
+    /// 所有实例共用一条串行队列：JSContext 不是线程安全的，跨实例也串行。
+    static let jsQueue = DispatchQueue(label: "com.lty5201.lizi.lxscript")
+
+    /// 脚本支持的档位（按从高到低回退；脚本没有 flac，flac 按 flac24bit 算）。
+    static let scriptTiers = ["master", "atmos", "hires", "flac24bit", "320k", "128k"]
+
+    let scriptText: String
+
+    private var context: JSContext?
+    private var sink = LXScriptSink()
+    /// 只在 jsQueue 上读/写（load() 的检查在 jsQueue.sync 里做，
+    /// loadAssumingOnQueue 本来就在 jsQueue 上），不需要额外的锁。
+    private var loaded = false
+
+    init(script: String) {
+        self.scriptText = script
+    }
+
+    /// 脚本 inited 上报的、带 musicUrl 动作的平台（去掉 'local' 伪源）。
+    /// 只能在 load() 成功后读。
+    var platforms: [String] {
+        sink.initedSources
+            .filter { $0.key != "local" && $0.value.contains("musicUrl") }
+            .map(\.key).sorted()
+    }
+
+    /// 加载脚本：装运行时 + evaluateScript + 校验注册了 request 处理。
+    /// 成功后 loaded = true；失败不记 loaded，下次 resolve 会重试加载。
+    /// 只能在 jsQueue 之外的线程调（内部 jsQueue.sync）。
+    func load() throws {
+        var loadError: Error?
+        Self.jsQueue.sync {
+            if loaded { return }
+            do {
+                try loadOnQueue()
+                loaded = true
+            } catch { loadError = error }
+        }
+        if let loadError { throw loadError }
+    }
+
+    /// 已在 jsQueue 上时用：直接加载，不再 sync（load() 从 jsQueue 里调会死锁）。
+    func loadAssumingOnQueue() throws {
+        if loaded { return }
+        try loadOnQueue()
+        loaded = true
+    }
+
+    /// 等 inited：有的脚本（如 juhe）先拉远程配置再发 inited，load() 返回时
+    /// platforms 还是空的。导入校验在读 platforms 前调这个等一等（最多 5 秒；
+    /// 同步发 inited 的脚本当场就到，不等）。只能在 jsQueue 之外调
+    /// （内部用 jsQueue.sync 读，sleep 的间隙 jsQueue 是空的，不会死锁）。
+    /// deadline 版：批量校验多个脚本时共用一个期限，免得每个坏脚本各等 5 秒。
+    func waitForInited(timeout: TimeInterval = 5) {
+        waitForInited(deadline: Date().addingTimeInterval(timeout))
+    }
+
+    func waitForInited(deadline: Date) {
+        while Date() < deadline {
+            let has = Self.jsQueue.sync { !self.platforms.isEmpty }
+            if has { return }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+    }
+
+    /// 按档位从高到低回退，返回 (url, 实际档位)。只跑脚本，不回退内置解析。
+    func resolveMusicUrl(source: String, songId: String, quality: String) async throws -> (String, String) {
+        guard !songId.isEmpty else {
+            throw NSError(domain: "LXScript", code: 6, userInfo: [NSLocalizedDescriptionKey: "缺少歌曲 ID"])
+        }
+        var lastError: Error?
+        for tier in Self.tiersFrom(quality) {
+            do {
+                let url = try await callScriptMusicUrl(source: source, songId: songId, quality: tier)
+                return (url, tier)
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError ?? NSError(domain: "LXScript", code: 2, userInfo: [NSLocalizedDescriptionKey: "落雪脚本未返回音频链接"])
+    }
+
+    static func tiersFrom(_ quality: String) -> [String] {
+        var q = LXResolver.normalizeQuality(quality)
+        if q == "flac" { q = "flac24bit" }
+        let idx = scriptTiers.firstIndex(of: q) ?? 0
+        return Array(scriptTiers[idx...])
+    }
+
+    // MARK: - 调脚本（带单档位 20 秒上限）
+
+    private func callScriptMusicUrl(source: String, songId: String, quality: String) async throws -> String {
+        try await withThrowingTaskGroup(of: String.self) { group in
+            group.addTask { try await self.callScriptMusicUrlOnce(source: source, songId: songId, quality: quality) }
+            group.addTask {
+                try await Task.sleep(nanoseconds: 20_000_000_000)
+                throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "落雪脚本超时（\(source)/\(quality)）"])
+            }
+            guard let url = try await group.next() else {
+                throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "落雪脚本无返回"])
+            }
+            group.cancelAll()
+            return url
+        }
+    }
+
+    private func callScriptMusicUrlOnce(source: String, songId: String, quality: String) async throws -> String {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
+            Self.jsQueue.async { [weak self] in
+                guard let self else {
+                    cont.resume(throwing: NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "引擎已释放"]))
+                    return
+                }
+                do {
+                    try self.loadAssumingOnQueue()
+                    guard let ctx = self.context, let handler = self.sink.requestHandler else {
+                        throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "落雪脚本未就绪"])
+                    }
+                    let payload: [String: Any] = [
+                        "action": "musicUrl",
+                        "source": source,
+                        "info": ["musicInfo": ["songmid": songId], "type": quality],
+                    ]
+                    guard let payloadValue = JSValue(object: payload, in: ctx) else {
+                        throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "请求构造失败"])
+                    }
+                    guard let promise = handler.call(withArguments: [payloadValue]), !promise.isUndefined else {
+                        throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "落雪脚本异常：\(ctx.exception?.toString() ?? "未知")"])
+                    }
+                    guard promise.hasProperty("then") else {
+                        throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "落雪脚本未返回 Promise"])
+                    }
+                    let fulfilled: @convention(block) (JSValue?) -> Void = { value in
+                        let url = value?.toString() ?? ""
+                        if url.hasPrefix("http://") || url.hasPrefix("https://") {
+                            cont.resume(returning: url)
+                        } else {
+                            cont.resume(throwing: NSError(domain: "LXScript", code: 2, userInfo: [NSLocalizedDescriptionKey: "落雪脚本未返回音频链接"]))
+                        }
+                    }
+                    let rejected: @convention(block) (JSValue?) -> Void = { value in
+                        cont.resume(throwing: NSError(domain: "LXScript", code: 2, userInfo: [NSLocalizedDescriptionKey: value?.toString() ?? "落雪脚本取歌失败"]))
+                    }
+                    guard let f = JSValue(object: fulfilled, in: ctx),
+                          let r = JSValue(object: rejected, in: ctx) else {
+                        throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "回调构造失败"])
+                    }
+                    _ = promise.invokeMethod("then", withArguments: [f, r])
+                } catch {
+                    cont.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    // MARK: - 加载脚本（只在 jsQueue 上跑）
+
+    private func loadOnQueue() throws {
+        guard let ctx = JSContext() else {
+            throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "JSContext 创建失败"])
+        }
+        // 换一个全新的 sink + context：刷新/重载后旧的 request 处理不再生效。
+        let freshSink = LXScriptSink()
+        self.context = ctx
+        self.sink = freshSink
+        let scriptInfo: [String: String] = [
+            "name": LXSourceStore.headerValue(scriptText, "name") ?? "",
+            "version": LXSourceStore.headerValue(scriptText, "version") ?? "",
+            "author": LXSourceStore.headerValue(scriptText, "author") ?? "",
+            "description": LXSourceStore.headerValue(scriptText, "description") ?? "",
+        ]
+        LXScriptRuntime.install(into: ctx, sink: freshSink, scriptInfo: scriptInfo)
+        if let exc = ctx.exception {
+            throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "运行时安装失败：\(exc)"])
+        }
+        ctx.evaluateScript(scriptText)
+        if let exc = ctx.exception {
+            throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "落雪脚本加载失败：\(exc)"])
+        }
+        guard freshSink.requestHandler != nil else {
+            throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "不是有效的落雪音源脚本：没有注册 request 处理"])
+        }
+    }
+}
+
+// MARK: - 内置源（Bundle 里的 public/落雪音源.js v1.0.3）
+
+/// 内置落雪音源：注册表里的 "builtin" 项。tx/wy 走脚本；kg/kw/mg 脚本没有，
+/// 引擎内部走内置解析；脚本全挂时也回退内置解析。
+final class LXScriptEngine {
+    static let shared = LXScriptEngine()
+
+    static let scriptTiers = LXScriptInstance.scriptTiers
+    static let scriptSources = ["wy", "tx"]
+
+    private let builtin: LXScriptInstance
+
+    private init() {
+        let script = Bundle.main.resourceURL
+            .flatMap { try? String(contentsOf: $0.appendingPathComponent("public/落雪音源.js"), encoding: .utf8) } ?? ""
+        builtin = LXScriptInstance(script: script)
+    }
+
+    /// 按档位从高到低回退，返回 (url, 实际档位)。
+    func resolveMusicUrl(source: String, songId: String, quality: String) async throws -> (String, String) {
+        guard !songId.isEmpty else {
+            throw NSError(domain: "LXScript", code: 6, userInfo: [NSLocalizedDescriptionKey: "缺少歌曲 ID"])
+        }
+        // 脚本只支持 tx/wy；kg/kw/mg 直接走内置解析。
+        guard Self.scriptSources.contains(source) else {
+            return try await LXResolver.resolveMusicUrl(source: source, songId: songId, quality: quality)
+        }
+        do {
+            try builtin.load()
+            return try await builtin.resolveMusicUrl(source: source, songId: songId, quality: quality)
+        } catch let scriptError {
+            // 脚本全部档位失败，回退内置解析（oiapi 备用）。
+            do {
+                return try await LXResolver.resolveMusicUrl(source: source, songId: songId, quality: quality)
+            } catch {
+                throw scriptError
+            }
+        }
+    }
 }

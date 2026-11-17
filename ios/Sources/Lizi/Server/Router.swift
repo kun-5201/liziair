@@ -54,6 +54,89 @@ final class LiziRouter {
                                 "via": LXResolver.externalApiURL.isEmpty ? "builtin" : "external"])
         }
 
+        // ---- 自定义源管理（设置 → 自定义源管理；见 LXSources.swift）----
+        // 失败一律回 200 + { code:400, error }（不回 HTTP 400），前端 api.js 的
+        // call() 只在 HTTP 非 2xx 时抛错，这样错误文案能原样显示在设置页。
+        if path == "/api/lx/sources" {
+            return .json(200, ["code": 0,
+                                "sources": LXSourceRegistry.shared.list().map { LXSourceMeta.json($0) },
+                                "autoSwitch": LXSourceRegistry.shared.autoSwitchEnabled])
+        }
+        if path == "/api/lx/sources/import-url" && req.method == "POST" {
+            let url = req.string("url").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !url.isEmpty else {
+                return .json(200, ["code": 400, "error": "请填写脚本 URL"])
+            }
+            do {
+                let meta = try await LXSourceRegistry.shared.importFromURL(url)
+                return .json(200, ["code": 0, "source": LXSourceMeta.json(meta)])
+            } catch {
+                return .json(200, ["code": 400, "error": error.localizedDescription])
+            }
+        }
+        if path == "/api/lx/sources/import-file" && req.method == "POST" {
+            let content = req.string("content")
+            guard !content.isEmpty else {
+                return .json(200, ["code": 400, "error": "文件内容为空"])
+            }
+            do {
+                let meta = try LXSourceRegistry.shared.importFile(name: req.string("name"), content: content)
+                return .json(200, ["code": 0, "source": LXSourceMeta.json(meta)])
+            } catch {
+                return .json(200, ["code": 400, "error": error.localizedDescription])
+            }
+        }
+        if path == "/api/lx/sources/delete" && req.method == "POST" {
+            guard LXSourceRegistry.shared.delete(id: req.string("id")) else {
+                return .json(200, ["code": 404, "error": "源不存在"])
+            }
+            return .json(200, ["code": 0])
+        }
+        if path == "/api/lx/sources/toggle" && req.method == "POST" {
+            let enabled = req.bool("enabled")
+            guard let meta = LXSourceRegistry.shared.setEnabled(id: req.string("id"), enabled: enabled) else {
+                return .json(200, ["code": 404, "error": "源不存在"])
+            }
+            return .json(200, ["code": 0, "source": LXSourceMeta.json(meta)])
+        }
+        if path == "/api/lx/sources/refresh" && req.method == "POST" {
+            do {
+                let r = try await LXSourceRegistry.shared.refresh(id: req.string("id"))
+                return .json(200, ["code": 0, "changed": r.changed, "source": LXSourceMeta.json(r.meta)])
+            } catch {
+                return .json(200, ["code": 400, "error": error.localizedDescription])
+            }
+        }
+        if path == "/api/lx/sources/bind-url" && req.method == "POST" {
+            let url = req.string("url").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !url.isEmpty else {
+                return .json(200, ["code": 400, "error": "请填写脚本 URL"])
+            }
+            do {
+                let meta = try await LXSourceRegistry.shared.bindURL(id: req.string("id"), urlString: url)
+                return .json(200, ["code": 0, "source": LXSourceMeta.json(meta)])
+            } catch {
+                return .json(200, ["code": 400, "error": error.localizedDescription])
+            }
+        }
+        if path == "/api/lx/sources/auto-switch" {
+            if req.method == "POST" {
+                LXSourceRegistry.shared.setAutoSwitch(req.bool("enabled"))
+            }
+            return .json(200, ["code": 0, "enabled": LXSourceRegistry.shared.autoSwitchEnabled])
+        }
+        if path == "/api/lx/sources/builtin" {
+            return .json(200, ["code": 0, "sources": LXSourceRegistry.shared.builtinList()])
+        }
+        if path == "/api/lx/sources/add-builtin" && req.method == "POST" {
+            do {
+                let meta = try LXSourceRegistry.shared.addBuiltin(id: req.string("id"))
+                return .json(200, ["code": 0, "source": LXSourceMeta.json(meta)])
+            } catch {
+                return .json(200, ["code": 400, "error": error.localizedDescription])
+            }
+        }
+
         // ---- 其它边车：音频代理 + handler ----
         for name in ["kugou", "qishui", "bodian", "spotify", "kuwo"] {
             if path == "/api/\(name)/audio" { return await Proxies.proxySourceAudio(req, source: name) }
@@ -143,16 +226,14 @@ final class LiziRouter {
         guard !songId.isEmpty else { return .json(400, ["code": 6, "error": "缺少歌曲 id"]) }
         let quality = req.string("quality", "master")
         do {
-            let r: (String, String)
-            if !LXResolver.externalApiURL.isEmpty {
-                r = try await LXResolver.resolveViaExternalServer(source: lxSource, songId: songId, quality: quality)
-            } else {
-                // 脚本引擎（KMusic 落雪音源.js，tx/wy 走脚本；kg/kw/mg 脚本没有，
-                // 引擎内部走内置解析；脚本全挂时也回退内置解析）。
-                r = try await LXScriptEngine.shared.resolveMusicUrl(source: lxSource, songId: songId, quality: quality)
-            }
+            // 取歌链（LXSourceRegistry）：启用的自定义源（列表顺序，只试它声明覆盖
+            // 的平台）→ 内置落雪音源.js → 自定义 LX 服务器 → 失败抛错，
+            // 由 player.js 走平台接口备用。自动切换开关控制是否多源重试。
+            let r = try await LXSourceRegistry.shared.resolveMusicUrl(
+                source: lxSource, songId: songId, quality: quality,
+                autoSwitch: LXSourceRegistry.shared.autoSwitchEnabled)
             return .json(200, ["code": 0, "url": r.0, "quality": r.1, "lxSource": lxSource,
-                                "via": LXResolver.externalApiURL.isEmpty ? "lx-script" : "external"])
+                                "via": r.2])
         } catch {
             return .json(200, ["code": 2, "error": error.localizedDescription])
         }

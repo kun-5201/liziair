@@ -798,6 +798,10 @@ python -c "from pedalboard import load_plugin; p=load_plugin(r'C:\Program Files\
           <svg class="setnav__ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V6l10-2v11"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="16.5" cy="15" r="2.5"/></svg>
           <span class="setnav__label">落雪音源</span>
         </button>
+        <button class="setnav__item" type="button" data-sec="set-sec-source">
+          <svg class="setnav__ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l9 5-9 5-9-5 9-5z"/><path d="M3.5 13.5L12 18l8.5-4.5"/><path d="M3.5 17.5L12 22l8.5-4.5"/></svg>
+          <span class="setnav__label">自定义源管理</span>
+        </button>
         <button class="setnav__item" type="button" data-sec="set-sec-local">
           <svg class="setnav__ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v10m0 0l-3.5-3.5M12 13l3.5-3.5M4 17v2.5A1.5 1.5 0 0 0 5.5 21h13a1.5 1.5 0 0 0 1.5-1.5V17"/></svg>
           <span class="setnav__label">本地音乐</span>
@@ -925,6 +929,42 @@ python -c "from pedalboard import load_plugin; p=load_plugin(r'C:\Program Files\
         <button class="setpage__act" id="lx-server-save" type="button">保存</button>
       </div>
       <p class="setpage__note" id="lx-server-state" role="status">当前：内置解析</p>
+      </section>
+
+    <!-- ---------- 自定义源管理 ---------- -->
+      <section class="setpage__sec setcard setcard--wide" id="set-sec-source" aria-labelledby="setpage-h-source">
+        <h2 class="setpage__h" id="setpage-h-source">自定义源管理</h2>
+      <p class="setpage__note">导入落雪音源脚本（LX Music 源），播放时按列表顺序依次尝试；内置落雪音源仍可用，搜索与歌词仍走平台接口。</p>
+      <div class="setpage__row setpage__row--switch">
+        <span class="setpage__label-group">
+          <span class="setpage__label">自动切换音源</span>
+          <span class="setpage__hint" id="lx-source-autoswitch-hint">开启后，当前音源播放失败时自动搜索并切换到其他可用音源播放</span>
+        </span>
+        <button class="setpage__switch" id="lx-source-autoswitch" type="button"
+                role="switch" aria-checked="false" aria-label="自动切换音源"
+                aria-describedby="lx-source-autoswitch-hint">
+          <span class="setpage__switch-knob" aria-hidden="true"></span>
+        </button>
+      </div>
+      <div id="lx-source-list"></div>
+      <div class="setpage__row lx-set__row">
+        <input class="lx-set__input" id="lx-source-url" type="url" inputmode="url" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="输入脚本 URL（支持 GitHub）">
+      </div>
+      <div class="setpage__row">
+        <button class="setpage__act" id="lx-source-import-url" type="button">从 URL 导入</button>
+        <button class="setpage__act" id="lx-source-import-file" type="button">本地文件</button>
+        <input type="file" id="lx-source-file-input" accept=".js,text/javascript,application/javascript" multiple hidden>
+      </div>
+      <p class="setpage__note" id="lx-source-state" role="status"></p>
+      <details class="lx-src__repo">
+        <summary class="setpage__label">内置源仓库（20 个）</summary>
+        <p class="setpage__note">App 自带的落雪源（pdone/lx-music-source），删掉的可以在这里一键重新添加；已导入的显示“已添加”。</p>
+        <div id="lx-source-repo"></div>
+      </details>
+      <p class="setpage__note">自动切换开启后，当前音源播放失败时自动搜索并切换到其他可用音源播放；关闭时只试列表里第一个可用的音源，失败即走平台接口。</p>
+      <p class="setpage__note">GitHub 链接会自动转为 raw 格式再拉取（github.com/用户/仓库/blob/分支/路径 → raw.githubusercontent.com/用户/仓库/分支/路径）。</p>
+      <p class="setpage__note">URL 导入的源带有 URL 标记，右侧有刷新按钮，点一下重新拉取更新到新版本；本地导入的源没有刷新按钮。</p>
+      <p class="setpage__note">旧版导入的源如果没有 URL 标记，点右侧蓝色链接可重新绑定一次 URL，绑定后出现 URL 标记和刷新按钮。</p>
       </section>
 
     <!-- ---------- 本地音乐 ---------- -->

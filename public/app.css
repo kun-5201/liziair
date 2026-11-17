@@ -8646,3 +8646,15 @@ body.is-stage .updtoast { bottom: 18px; }
 .lx-set__row { gap: 10px; }
 .lx-set__input { flex: 1 1 auto; min-width: 0; border: 0; outline: 0; background: transparent; }
 .lx-set__input::placeholder { opacity: .45; }
+
+/* 自定义源管理（设置 → 自定义源管理）：列表行 / URL 标记 / 蓝色重绑链接 / 行内补绑表单 */
+.lx-src__row { flex-wrap: wrap; gap: 10px; }
+.lx-src__badge { display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 999px; background: oklch(21% 0.022 270 / .08); font-size: 11px; font-weight: var(--fw-med); color: var(--ink-2); vertical-align: 1px; }
+.lx-src__badge--builtin { background: oklch(70% 0.12 150 / .18); color: oklch(45% 0.12 150); }
+.lx-src__rebind { padding: 0; border: 0; background: transparent; cursor: pointer; font: inherit; font-size: 13px; color: #2563eb; }
+.lx-src__rebind:hover { text-decoration: underline; }
+.lx-src__rebind-form { display: flex; gap: 10px; padding: 0 0 var(--sp-3); }
+/* 内置源仓库：折叠区块 + 导入失败原因（红字，点重试可再加一次） */
+.lx-src__repo { padding: var(--sp-2) 0; }
+.lx-src__repo summary { cursor: pointer; }
+.lx-src__repo-error { font-size: 13px; color: #c0392b; }
