@@ -18,6 +18,40 @@ const API = (() => {
      还原成原始直链。只动音频代理这四处，不动 /api/img 等其它路由。 */
   const proxyAudioUrl = (prefix, u) => (u ? `/${prefix}?url=${encodeURIComponent(encodeURIComponent(u))}` : '');
 
+  /* ------------------------------------------------------------------
+     音频直链 https 升级（第 12 轮 ATS 修法）
+     根因：build 22 的 plist 里 NSAllowsArbitraryLoads 与
+     NSAllowsLocalNetworking 同在，前者被系统静默忽略，实际 ATS 只许 https；
+     代理用 URLSession 拉 http 上游直接 -1022。修法是直链 + 升级，不再
+     指望代理那一跳：播放器直接用升级后的直链播（见 neteaseAudio /
+     qqAudio / lxAudio / srcAudio），代理只留作直链失败后的兜底。
+     只升实测支持 https 的域（2026-11-19 VM curl 实测，根路径 403 也算
+     支持——TLS 通 + 有 HTTP 回包；真文件另在 Playwright 里验过 206）：
+     m701/m702.music.126.net、aqqmusic.tc.qq.com、ws/sjy6/dl.stream.qqmusic.qq.com、
+     fsandroid/webfs.tx.kugou.com、kw-er.kuwo.cn、kglink.com。
+     不支持/没验过的域一律不动（仍走 http，设备上 ATS 照旧会拦，兜底也救不了——
+     诚实边界，见第 12 轮汇报的 https 支持表）。与 Swift 侧
+     Upstream.audioHTTPSSuffixes 是同一张表，改一边要同步另一边。
+     ------------------------------------------------------------------ */
+  const AUDIO_HTTPS_SUFFIXES = ['.music.126.net', '.qq.com', '.kugou.com', '.kuwo.cn', '.kglink.com'];
+  const upgradeAudioUrl = (u) => {
+    if (!u || typeof u !== 'string') return u;
+    try {
+      const x = new URL(u);
+      if (x.protocol !== 'http:') return u;
+      const host = x.hostname.toLowerCase();
+      if (AUDIO_HTTPS_SUFFIXES.some((s) => host === s.slice(1) || host.endsWith(s))) {
+        x.protocol = 'https:';
+        return x.toString();
+      }
+    } catch { /* 拼不出的地址原样返回，交给播放器/代理按原逻辑处理 */ }
+    return u;
+  };
+  /** 直接播：升级后的直链本身就是 audio.src，不再拼代理地址。 */
+  const directAudioUrl = (u) => upgradeAudioUrl(u || '');
+  /** 直链失败后的兜底：同一条升级后的地址走本机代理（代理侧也会再升一次）。 */
+  const proxyAudioFor = (src, u) => proxyAudioUrl(`api/${src}/audio`, upgradeAudioUrl(u || ''));
+
   async function call(path, params, method = 'POST', extraSignal) {
     const url = new URL('/api/' + path, location.origin);
     let body;
@@ -147,9 +181,11 @@ const API = (() => {
     /** 批量取曲目详情（含封面）：搜索先返回曲目、封面后补就走这条（见 app.js renderTracks） */
     songDetail: (ids) => call('song/detail', { ids: Array.isArray(ids) ? ids.join(',') : ids }),
     songWiki: (id) => call('song/wiki', { id }),
-    /* 直链要走本机代理：网易云 CDN 不回 ACAO，而 <audio> 带着 crossOrigin='anonymous'
-       （Web Audio 取频谱用），直接挂 CDN 地址会被 CORS 拦成 net::ERR_FAILED。 */
-    neteaseAudio: (u) => proxyAudioUrl('api/netease/audio', u),
+    /* 第 12 轮：直接播。网易云 CDN 真文件回 Access-Control-Allow-Origin: *
+       （2026-11-19 curl 实测 206 + ACAO:*），<audio> crossOrigin='anonymous'
+       + Beat 的 Web Audio 图走得通，不再需要同源代理；代理只留作直链失败兜底
+       （见 proxyAudioFor）。api.js 里旧注释说的“CDN 不回 ACAO”已是过期结论。 */
+    neteaseAudio: (u) => directAudioUrl(u),
     lyric: (id) => call('lyric', { id }),
     /** 网易每日签到（第 11 轮 kun 对齐：后端 /api/daily/signin，weapi /point/dailyTask type 0+1；未登录回 {code:301, loggedIn:false}）。暂无界面入口，先把调用接好。 */
     dailySignin: () => call('daily/signin', {}),
@@ -192,8 +228,11 @@ const API = (() => {
     /** 电台频道目录（匿名）；点开频道听歌要登录，见 qqRadioTracks */
     qqRadioCategories: () => call('qq/radio/categories', {}, 'GET'),
     qqRadioTracks: (id) => call('qq/radio/tracks', { id }, 'GET'),
-    /** 音频直链要走本机代理：vkey 会过期、CDN 有 referer 策略，也不该把凭证写进 DOM */
-    qqAudio: (u) => proxyAudioUrl('api/qq/audio', u),
+    /** 第 12 轮：直接播（见 neteaseAudio）。aqqmusic / ws.stream 真文件都回
+       ACAO:*（2026-11-19 curl 实测 206），crossOrigin 直链走得通；vkey 在
+       audio.src 里和原来在代理 URL 里一样可见，不新增暴露面。直链失败时
+       player.js 用 proxyAudioFor 走代理兜底。 */
+    qqAudio: (u) => directAudioUrl(u),
 
     /* ------------------------------------------------------------------
        其它音源（酷狗 / 汽水 / 波点 / Spotify）
@@ -317,8 +356,11 @@ const API = (() => {
       return call('lx/song/url', params, 'GET');
     },
 
-    /** LX 解析出的音频直链走 /api/lx/audio 代理（白名单见服务端 AUDIO_HOSTS.lx） */
-    lxAudio: (u) => proxyAudioUrl('api/lx/audio', u),
+    /** 第 12 轮：直接播。LX 解析出的音频直链不再走 /api/lx/audio 代理——
+       代理用 URLSession 拉 http 上游正是被 ATS -1022 拦住的那一步；直链
+       （已按升级表升成 https）由播放器直接播。/api/lx/audio 端点保留，
+       只作直链失败后的兜底（见 proxyAudioFor）。 */
+    lxAudio: (u) => directAudioUrl(u),
 
     /* ------------------------------------------------------------------
        自定义源管理（设置 → 自定义源管理；服务端见 LXSources.swift）
@@ -339,8 +381,11 @@ const API = (() => {
       ? call('lx/sources/auto-switch', {}, 'GET')
       : call('lx/sources/auto-switch', { enabled }),
 
-    /** 所有非网易云音源的音频都走各自代理（服务端按源做域名白名单 + 转发 Range） */
-    srcAudio: (src, u) => proxyAudioUrl(`api/${src}/audio`, u),
+    /** 第 12 轮：直接播（见 neteaseAudio）。所有非网易云音源的音频都直接用
+       升级后的直链播；各自代理端点保留，只作直链失败后的兜底。 */
+    srcAudio: (src, u) => directAudioUrl(u),
+    /** 直链失败后的兜底：同一条升级后的地址走本机代理（player.js 用）。 */
+    proxyAudio: (src, u) => proxyAudioFor(src, u),
 
     /* ------------------------------------------------------------------
        本地音乐（文件 App 导入；只在 iOS 壳里有，原生桥 liziNative 负责弹选择器）

@@ -483,7 +483,10 @@ final class KuwoService {
     }
 
     private func lyricH5(_ id: String) async throws -> String {
-        let url = URL(string: "http://m.kuwo.cn/newh5/singles/songinfoandlrc?musicId=" + scURLEncode(id))!
+        // 第 12 轮：http → https（m.kuwo.cn 实测 https 200，与 http 等价）。
+        // plist 里被忽略的 NSAllowsArbitraryLoads 删掉后，URLSession 拉 http
+        // 会被 ATS -1022 拦掉；这条是歌词接口，顺手一起升了。
+        let url = URL(string: "https://m.kuwo.cn/newh5/singles/songinfoandlrc?musicId=" + scURLEncode(id))!
         let (data, _) = try await Upstream.fetch(url, headers: ["User-Agent": Self.uaMobile, "Referer": "https://m.kuwo.cn/"], timeout: 15)
         let text = String(data: data, encoding: .utf8) ?? ""
         guard let j = scParseJSON(text) as? [String: Any],

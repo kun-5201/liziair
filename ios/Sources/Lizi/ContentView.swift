@@ -97,6 +97,7 @@ final class WebHost: NSObject, ObservableObject, WKUIDelegate {
             waitForPort(deadline: Date().addingTimeInterval(3))
             configureAudioSession()
             setupRemoteCommands()
+            setupAudioInterruptions()
             startNowPlayingPolling()
         } catch {
             fail("启动本地服务失败：\(error.localizedDescription)")
@@ -139,6 +140,38 @@ final class WebHost: NSObject, ObservableObject, WKUIDelegate {
         } catch {
             // 音频会话配不上也不拦着进页面；后台播放会受影响。
         }
+    }
+
+    /// 第 12 轮第三件（切后台就暂停）：只配一次 session 不够——
+    /// 电话/Siri/系统打断会让 session 失效，且没有任何回调把它激活回来；
+    /// 回前台时 session 也可能还是非激活态，Web Audio 上下文就一直挂着。
+    /// 中断结束、回到前台都重新激活一次，并让页面把 AudioContext resume
+    /// 回来（window.__liziResumeWebAudio，见 player.js）；不改播放进度、
+    /// 不重播。灵动岛那路不动。
+    private func setupAudioInterruptions() {
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self else { return }
+            guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  let type = AVAudioSession.InterruptionType(rawValue: raw),
+                  type == .ended else { return }
+            self.reactivateAudioSession()
+        }
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.reactivateAudioSession()
+        }
+    }
+
+    private func reactivateAudioSession() {
+        do {
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch {
+            // 激活失败也不拦着；页面侧的 resume 仍会尝试。
+        }
+        webView.evaluateJavaScript("window.__liziResumeWebAudio && window.__liziResumeWebAudio()")
     }
 
     // MARK: - 锁屏 / 控制中心

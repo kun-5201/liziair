@@ -421,8 +421,12 @@ final class LXSourceRegistry {
     ///    200 + 非音频 Content-Type、空正文），判死时把主机 + 状态/CT
     ///    记进诊断（不记完整直链），不再只剩一句「打不开」。
     static func audioURLReachable(_ urlString: String, source: String, timeout: TimeInterval = 10) async -> Bool {
-        guard let url = Upstream.url(from: urlString),
-              url.scheme == "http" || url.scheme == "https" else { return false }
+        guard let rawURL = Upstream.url(from: urlString),
+              rawURL.scheme == "http" || rawURL.scheme == "https" else { return false }
+        // 第 12 轮：探升级后的地址——播放器播的就是升级后的地址，探 http 原址
+        // 只会探到 ATS -1022，给不出真结论；升级表见 Upstream.audioHTTPSSuffixes。
+        // 超时算结论不明、放行给播放器试的逻辑不动（见函数末尾 catch）。
+        let url = Upstream.upgradedAudioURL(rawURL)
         let host = url.host ?? ""
         // 非 throwing task group：两个子任务都不抛错（bytes 失败自己吞掉变
         // 结论不明，sleep 用 try?），先回来哪个算哪个，另一个取消。

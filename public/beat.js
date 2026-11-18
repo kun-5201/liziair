@@ -181,10 +181,13 @@ const Beat = (() => {
     if (el) audio = el;
   }
 
-  /** 浏览器要求音频上下文在用户手势后才能跑起来 */
+  /** 浏览器要求音频上下文在用户手势后才能跑起来。
+   *  第 12 轮：切后台时 iOS 会把上下文置 suspended 或 interrupted，
+   *  光认 suspended 会漏掉 interrupted 那一半；running 之外都试着 resume，
+   *  interrupted 时 resume 会等中断结束再生效。 */
   async function resume() {
     if (!ctx) return;
-    if (ctx.state === 'suspended') { try { await ctx.resume(); } catch { /* 忽略 */ } }
+    if (ctx.state !== 'running') { try { await ctx.resume(); } catch { /* 忽略 */ } }
   }
 
   /* ------------------------------------------------------------------ *

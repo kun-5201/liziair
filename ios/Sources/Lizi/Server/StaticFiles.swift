@@ -110,6 +110,23 @@ enum StaticFiles {
 
 /// 上游请求小工具（URLSession，带超时；对标 server.mjs 的 fetch 行为）。
 enum Upstream {
+    /// 音频直链 https 升级（第 12 轮 ATS 修法，与 public/api.js 的
+    /// AUDIO_HTTPS_SUFFIXES 是同一张表，改一边要同步另一边）。
+    /// 根因见 project.yml 注释：plist 里 NSAllowsArbitraryLoads 已被系统
+    /// 静默忽略，URLSession 拉 http 上游直接 -1022。凡实测支持 https 的
+    /// 音频域，在探活、代理取上游之前一律先升成 https；没验过的域不动。
+    static let audioHTTPSSuffixes = [".music.126.net", ".qq.com", ".kugou.com", ".kuwo.cn", ".kglink.com"]
+
+    /// http → https（仅升级表里的域；host 不变，只换 scheme）。
+    static func upgradedAudioURL(_ url: URL) -> URL {
+        guard url.scheme == "http", let host = url.host else { return url }
+        let h = host.lowercased()
+        guard audioHTTPSSuffixes.contains(where: { h == $0.dropFirst() || h.hasSuffix($0) }) else { return url }
+        var comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        comps?.scheme = "https"
+        return comps?.url ?? url
+    }
+
     /// 直链转 URL：先原样试；含空格 / {} / | 等非法字符时 URL(string:) 会回 nil，
     /// 这时只把非法字符做 % 编码（保留 :/?#[]@!$&'()*+,;= 结构字符和已有的 %
     /// 转义），再试一次。两次都 nil 才返回 nil（调用方按原有 400 / false 处理）。

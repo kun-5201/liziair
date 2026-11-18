@@ -845,6 +845,8 @@ const Player = (() => {
     const isQQ = src === 'qq';
     const isOther = !isQQ && src !== 'netease';
     let url = null;
+    let proxyUrl = null;   // 第 12 轮：直链失败后的兜底地址（同一条升级后的地址走本机代理）
+    let directUrl = null;  // 第 12 轮：实际交给 audio.src 的直链（已升 https）
     let demo = false;
     let reason = '';
     let preview = false;
@@ -867,22 +869,25 @@ const Player = (() => {
        那一档直接跳过，从下一档开始试。 */
     if (!opts.skipPlatform) try {
       if (isQQ) {
-        /* QQ 给的是 http 的 vkey 直链（会过期、CDN 挑 referer），统一走本机代理；
-           没登录/没会员时上游只给试听片段，如实标 preview，不假装能放全曲。 */
+        /* 第 12 轮：直接播。QQ 直链（aqqmusic / ws.stream）真文件回 ACAO:*，
+           crossOrigin 直链走得通；代理只留作直链失败后的兜底。 */
         const d = await API.qqSongUrl(track.mid || track.id);
         if (d.url) {
-          url = API.qqAudio(d.url);
+          directUrl = API.qqAudio(d.url);
+          url = directUrl;
+          proxyUrl = API.proxyAudio('qq', d.url);
           preview = !!d.preview;
         } else {
           reason = d.reason === 'login' ? 'vip' : 'qq-unavailable';
         }
       } else if (isOther) {
-        /* 酷狗 / 汽水 / 波点 / Spotify：一样走各自代理。
-           reason 原样从服务端来（login / region / drm / unavailable），
-           界面据此说清楚「为什么没声音」，绝不用假音轨冒充。 */
+        /* 第 12 轮：直接播（见上）。reason 原样从服务端来（login / region /
+           drm / unavailable），界面据此说清楚「为什么没声音」，绝不用假音轨冒充。 */
         const d = await API.srcSongUrl(track);
         if (d && d.url) {
-          url = API.srcAudio(src, d.url);
+          directUrl = API.srcAudio(src, d.url);
+          url = directUrl;
+          proxyUrl = API.proxyAudio(src, d.url);
           preview = !!d.preview;
           clipStartMs = d.clipStartMs || 0;
         } else {
@@ -891,7 +896,11 @@ const Player = (() => {
       } else {
         const d = await API.songUrl(track.id);
         const item = (d.data || [])[0];
-        if (item?.url) url = API.neteaseAudio(item.url);
+        if (item?.url) {
+          directUrl = API.neteaseAudio(item.url);
+          url = directUrl;
+          proxyUrl = API.proxyAudio('netease', item.url);
+        }
         // code -110 = 未授权。绝大多数是 VIP 专属（fee=1），登录后就能播。
         // 把这个原因带出去，界面才能告诉用户"为什么放不了"，而不是默默放演示音。
         else if (item?.code === -110) reason = 'vip';
@@ -908,6 +917,8 @@ const Player = (() => {
       const cloud = await fetchCloudUrl(track);
       if (cloud && cloud.url) {
         url = cloud.url;
+        directUrl = cloud.url;
+        proxyUrl = cloud.proxyUrl || null;
         via = 'cloud';
         reason = '';
       }
@@ -923,7 +934,9 @@ const Player = (() => {
       try {
         const lx = await API.lxSongUrl(track);
         if (lx && lx.url) {
-          url = API.lxAudio(lx.url);
+          directUrl = API.lxAudio(lx.url);
+          url = directUrl;
+          proxyUrl = API.proxyAudio('lx', lx.url);
           lxQuality = lx.quality || '';
           preview = false;
           via = 'lx';
@@ -942,7 +955,7 @@ const Player = (() => {
       url = await makeDemoTrack(40, track.id);
       postDiagAudio(`取链均失败，走演示音：source=${src} id=${track.id ?? track.mid ?? track.hash ?? ''} reason=${reason || 'unavailable'} via=演示音`);
     }
-    return { url, demo, reason, preview, clipStartMs, lxQuality, via: demo ? 'demo' : via };
+    return { url, demo, reason, preview, clipStartMs, lxQuality, via: demo ? 'demo' : via, directUrl, proxyUrl };
   }
 
   /* ------------------------------------------------------------------ *
@@ -1024,7 +1037,7 @@ const Player = (() => {
       const item = (d.data || [])[0];
       if (item && item.url) {
         postDiagAudio(`云盘取链成功：source=netease id=${track.id ?? ''} cloudSongId=${hit.songId} via=云盘`);
-        return { url: API.neteaseAudio(item.url), cloudSongId: hit.songId };
+        return { url: API.neteaseAudio(item.url), proxyUrl: API.proxyAudio('netease', item.url), cloudSongId: hit.songId };
       }
       postDiagAudio(`云盘取链失败：source=netease id=${track.id ?? ''} cloudSongId=${hit.songId} code=${item ? item.code : ''} via=云盘`);
     } catch (e) {
@@ -1057,8 +1070,39 @@ const Player = (() => {
     revokeDeckBlob(audio);
     audio.preload = 'metadata';
     audio.src = data.url;
-    state.lastFetch = { via: data.via, track, token, reason: data.reason };
+    state.lastFetch = { via: data.via, track, token, reason: data.reason, directUrl: data.directUrl, proxyUrl: data.proxyUrl };
+    state.proxyTried = false;
     emit('source', { demo: data.demo, track, reason: data.reason, preview: data.preview, clipStartMs: data.clipStartMs, lxQuality: data.lxQuality });
+    try {
+      await audio.play();
+      Beat.resume();
+      Beat.start();
+      state.playing = true;
+      emit('playstate', true);
+      return true;
+    } catch {
+      state.playing = false;
+      emit('playstate', false);
+      return false;
+    }
+  }
+
+  /* 直链进了播放器才死时，先走同一条地址的代理兜底一次（第 12 轮）：
+     直链失败可能是 CDN 临时抽风 / CORS 抖动，代理同源、无 CORS 问题，
+     常能救回来；代理也死了再按原逻辑往下一档 / 演示音。每首只试一次
+     （state.proxyTried，load / retry / commit 落点时清零），且只在用户
+     还没切歌时才换源。via 不改：代理再失败时 error 事件按原 via 走
+     下一档 / 演示音，不丢重试链。 */
+  async function tryProxyFallback(track, token) {
+    const lf = state.lastFetch;
+    if (!track || token !== state.token || !lf || lf.token !== token) return false;
+    if (!lf.proxyUrl || state.proxyTried) return false;
+    if (lf.via !== 'platform' && lf.via !== 'cloud' && lf.via !== 'lx') return false;
+    state.proxyTried = true;
+    postDiagAudio(`直链播放失败，走代理兜底：source=${track.source || 'netease'} id=${track.id ?? track.mid ?? track.hash ?? ''} via=${lf.via}`);
+    revokeDeckBlob(audio);
+    audio.preload = 'metadata';
+    audio.src = lf.proxyUrl;
     try {
       await audio.play();
       Beat.resume();
@@ -1209,8 +1253,10 @@ const Player = (() => {
     if (data.demo) { deckBlobs.set(audio, data.url); state.objectUrl = data.url; }
     // 记下这首的地址来源：error 事件里靠它判断要不要往下一档重试。
     // reason 一起记：LX 地址播放失败改放演示音时，角标要说清真正原因。
-    state.lastFetch = { via: data.via, track, token, reason: data.reason };
+    // directUrl/proxyUrl 一起记：直链失败时 error 事件先试代理兜底（第 12 轮）。
+    state.lastFetch = { via: data.via, track, token, reason: data.reason, directUrl: data.directUrl, proxyUrl: data.proxyUrl };
     state.fallbackRetried = false;
+    state.proxyTried = false;
 
     audio.preload = 'metadata';
     audio.src = data.url;
@@ -1229,7 +1275,12 @@ const Player = (() => {
         emit('playstate', true);
       } catch (e) {
         // 手势拦截（NotAllowedError）不是地址问题，不重试；地址问题（error 已挂上）
-        // 且是平台/云盘地址时，往下一档重试一次，成了就直接返回。
+        // 且是平台/云盘/LX 地址时，先走同一条地址的代理兜底一次（第 12 轮），
+        // 代理也死了再按原逻辑往下一档 / 演示音。
+        if (e && e.name !== 'NotAllowedError' && audio.error && (data.via === 'platform' || data.via === 'cloud' || data.via === 'lx') && token === state.token) {
+          const okProxy = await tryProxyFallback(track, token);
+          if (okProxy) return { demo: data.demo };
+        }
         if (e && e.name !== 'NotAllowedError' && audio.error && (data.via === 'platform' || data.via === 'cloud') && token === state.token) {
           const ok = await retryWithFallback(track, token);
           if (ok) return { demo: data.demo };
@@ -1330,8 +1381,9 @@ const Player = (() => {
     const token = ++state.token;
     startTrackMeta(prepared.track, prepared.index, token);
     // 过渡落点也要记地址来源，否则这首的 error 事件认不出是哪一档的地址、重试走不到。
-    state.lastFetch = { via: prepared.via, track: prepared.track, token, reason: prepared.reason };
+    state.lastFetch = { via: prepared.via, track: prepared.track, token, reason: prepared.reason, directUrl: prepared.directUrl, proxyUrl: prepared.proxyUrl };
     state.fallbackRetried = false;
+    state.proxyTried = false;
 
     state.objectUrl = deckBlobs.get(incoming) || null;
     emit('source', {
@@ -1386,10 +1438,22 @@ const Player = (() => {
       if (state.mode === 'single') { el.currentTime = 0; el.play(); }
       else next(true);
     });
-    el.addEventListener('error', () => {
+    el.addEventListener('error', async () => {
       if (el !== audio) return;
       if (!el.src) return;
       const detail = audioErrorDetail(el);
+      // 直链播放失败：先走同一条地址的代理兜底一次（第 12 轮）；代理也死了
+      // 再往下走原逻辑（LX → 演示音，平台/云盘 → 下一档）。proxyTried 置位后
+      // 不会再进这条分支，不循环。
+      if (state.lastFetch && (state.lastFetch.via === 'platform' || state.lastFetch.via === 'cloud' || state.lastFetch.via === 'lx') && state.lastFetch.token === state.token && !state.proxyTried && state.lastFetch.proxyUrl) {
+        const failedTrack = state.lastFetch.track;
+        console.warn('[player] 直链播放失败，走代理兜底：', detail);
+        postDiagAudio(`直链播放失败，走代理兜底：code=${detail.code} host=${detail.host} ns=${detail.networkState} rs=${detail.readyState} via=${state.lastFetch.via}`);
+        const okProxy = await tryProxyFallback(failedTrack, state.lastFetch.token);
+        if (okProxy) return;
+        // 代理也死了：往下走原逻辑；error 事件不会为这次代理失败再触发
+        // （tryProxyFallback 里 play() 的 catch 已接住），直接用本次 detail 走。
+      }
       // LX 地址播放失败：第 11 轮第 8 件起改放演示音，不再直接报 sourceerror
       // 卡住（取链失败走演示音、播放失败也走演示音，兜底才算走通）。
       if (state.lastFetch && state.lastFetch.via === 'lx' && state.lastFetch.token === state.token) {
@@ -1423,6 +1487,38 @@ const Player = (() => {
   }
   bindDeck(deckA);
   bindDeck(deckB);
+
+  /* ------------------------------------------------------------------ *
+   * 切后台就暂停的修法（第 12 轮第三件）
+   *
+   * 机理：<audio> 的声音经 Beat 的 Web Audio 图出来（createMediaElementSource）。
+   * iOS 切后台时会把页面的 AudioContext 挂起（suspended / interrupted，
+   * WebKit bug 237878 同款表现），上下文不恢复就一直静音；个别情况下元素
+   * 本身也会被系统暂停。原生侧（ContentView）已有 UIBackgroundModes audio +
+   * .playback session，所以修法在这一层：回前台时把上下文 resume 回来，
+   * 元素停了就就地续播（不断进度、不重播、不丢队列）。
+   * 注意：不能用 state.playing 做判断——系统暂停元素时会触发 pause 事件，
+   * state.playing 已经被置 false；所以隐藏瞬间先把“切后台前在播”记下来。
+   * ------------------------------------------------------------------ */
+  let wasPlayingBeforeHide = false;
+  function resumeWebAudio() {
+    try { Beat.resume(); } catch { /* Beat 不可用也不影响续播 */ }
+    try {
+      if (wasPlayingBeforeHide && audio.src && audio.paused) {
+        audio.play().catch(() => {});
+      }
+    } catch { /* ignore */ }
+    wasPlayingBeforeHide = false;
+  }
+  // 原生侧 didBecomeActive 时调这个钩子；页面自己回前台也走同一条路。
+  window.__liziResumeWebAudio = resumeWebAudio;
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      wasPlayingBeforeHide = !audio.paused && !!audio.src;
+      return;
+    }
+    resumeWebAudio();
+  });
 
   /* ------------------------------------------------------------------ *
    * 对外 API

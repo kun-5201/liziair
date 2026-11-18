@@ -53,9 +53,16 @@ targets:
         ITSAppUsesNonExemptEncryption: false
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
-          # 落雪脚本的取歌接口是明文 http 裸 IP（220.167.101.253:6001），
-          # 不放开 ATS 的话 URLSession 会直接拦掉；酷狗内置解析也有 http 接口。
-          NSAllowsArbitraryLoads: true
+          # 注意：这里不能再加 NSAllowsArbitraryLoads——Apple 规则（iOS 10+）：
+          # NSAllowsLocalNetworking / NSAllowsArbitraryLoadsForMedia /
+          # NSAllowsArbitraryLoadsInWebContent 任一在场，NSAllowsArbitraryLoads
+          # 都会被系统静默忽略、按 NO 处理。build 22 就是这么死的：plist 看着
+          # 放行，实际生效的 ATS 只有默认（仅 https）+ 本地联网例外，http 上游
+          # 全被 -1022 拦掉。删掉这个被忽略的键，免得后人再被它骗。
+          # 音频直链的放行不靠 plist 靠 https 升级：public/api.js 的
+          # upgradeAudioUrl 与 Swift Upstream.upgradedAudioURL 共用同一张
+          # 实测支持 https 的域名后缀表；实测过的音频域全部支持 https，
+          # 所以不需要 NSExceptionDomains。127.0.0.1 本地服务靠上面这行。
         CFBundleURLTypes:
           - CFBundleURLName: com.lty5201.lizi
             CFBundleURLSchemes:

@@ -258,12 +258,16 @@ enum Proxies {
     }
 
     /// /api/<source>/audio?url=：音频代理，转发 Range，返回上游状态码原样。
+    /// 第 12 轮：拉上游之前先把 http 升成 https（Upstream.upgradedAudioURL，
+    /// 与前端同一张表）——代理是直链失败后的兜底，兜底自己不能再死在 ATS -1022
+    /// 上。白名单校验仍用原始 host（升级只换 scheme，不换 host）。
     static func proxySourceAudio(_ req: HttpRequest, source: String) async -> HttpResponse {
         guard let raw = req.query["url"], let url = Upstream.url(from: raw),
               let host = url.host,
               (url.scheme == "http" || url.scheme == "https") else {
             return .error(400, "bad url")
         }
+        let fetchURL = Upstream.upgradedAudioURL(url)
         let allow: [String]
         if source == "qq" {
             // QQ 走独立实现（proxyQQAudio）：仅腾讯域名，Referer https://y.qq.com/。
@@ -273,7 +277,7 @@ enum Proxies {
             var headers: [String: String] = ["User-Agent": "Mozilla/5.0", "Referer": "https://y.qq.com/"]
             headers["Range"] = cappedRangeHeader(req.headers["range"])
             do {
-                let (data, http) = try await Upstream.fetch(url, headers: headers, timeout: 30)
+                let (data, http) = try await Upstream.fetch(fetchURL, headers: headers, timeout: 30)
                 if !(200..<300).contains(http.statusCode) {
                     recordAudioProxyFailure(source: source, host: host, reason: "upstream HTTP \(http.statusCode)")
                 }
@@ -308,7 +312,7 @@ enum Proxies {
         if let ref = audioReferer[source], !ref.isEmpty { headers["Referer"] = ref }
         headers["Range"] = cappedRangeHeader(req.headers["range"])
         do {
-            let (data, http) = try await Upstream.fetch(url, headers: headers, timeout: 30)
+            let (data, http) = try await Upstream.fetch(fetchURL, headers: headers, timeout: 30)
             if !(200..<300).contains(http.statusCode) {
                 recordAudioProxyFailure(source: source, host: host, reason: "upstream HTTP \(http.statusCode)")
             }
