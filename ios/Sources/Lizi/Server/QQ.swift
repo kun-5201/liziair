@@ -1284,7 +1284,10 @@ extension QQService {
         // ptlogin 优先（Moumusic 形状）：取码 + 轮询都是轻量 HTTPS，
         // 取码那一刻不启动任何 WebSocket/驱动——二维码「一准备转出来」
         // 正是旧链路同时起 MQTT 驱动的时刻。ptlogin 失败才走 MQTT 兜底。
-        if s.channel == "qqmusic" || s.channel == "ptlogin" {
+        // qq（手机 QQ）也走 ptlogin：ptlogin 的码就是 QQ 网页登录码，本来就是给手机 QQ 扫的；
+        // 第 7 轮只把 qqmusic 切过来，qq 还留在 MQTT 老路上，用户 14:44 报的正是这条路
+        // 取码时（码还没刷新出来）就崩。ptlogin 失败时下面照样回落到 MQTT，不丢兜底。
+        if s.channel == "qqmusic" || s.channel == "ptlogin" || s.channel == "qq" {
             do {
                 let img = try await ptQrCodeWithRetry(key: key)
                 guard qrSessions[key] != nil else {
@@ -1369,7 +1372,8 @@ extension QQService {
         s.driverTask = Task { await self.runMqttDriver(key: key) }
         qrSessions[key] = s
         DiagLog.shared.recordLog(category: "qq", message: "二维码已生成",
-                                 fields: ["code": 200, "reason": "png=\(png.count)B 耗时=\(Int(Date().timeIntervalSince(t0) * 1000))ms"])
+                                 fields: ["code": 200, "channel": s.channel,
+                                          "reason": "png=\(png.count)B 耗时=\(Int(Date().timeIntervalSince(t0) * 1000))ms"])
         // 监听器只等 3 秒就回码：SUBACK 正常 <1 秒；3 秒还没到就先把码给
         // 用户、驱动后台继续连——check 轮询会在监听器失败时立刻报 800 +
         // 原因，前端自动换码。以前等满 20 秒才回，慢网下整个拿码请求能拖

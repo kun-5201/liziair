@@ -129,7 +129,10 @@ enum Upstream {
         var req = URLRequest(url: url, timeoutInterval: timeout)
         req.httpMethod = method
         for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
-        req.httpBody = body
+        // iOS 13+ 的 URLSession 拒绝 GET 带 body（NSURLError -1103 "resource exceeds maximum size"，
+        // 2026-11-18 真机波点登录就是这么死的）。这里统一丢掉 GET 的 body：
+        // 各边车不要依赖 GET+body（波点 users/login 改走 POST，checkRight/audioUrl 的参数 query 里本来就有）。
+        req.httpBody = (method.uppercased() == "GET") ? nil : body
         let (data, resp) = try await URLSession.shared.data(for: req)
         guard let http = resp as? HTTPURLResponse else {
             throw NSError(domain: "LiziUpstream", code: -1, userInfo: [NSLocalizedDescriptionKey: "no http response"])

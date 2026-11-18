@@ -254,6 +254,9 @@
   let profile = null;
   let currentList = [];
   let view = 'hall';        // 大厅是入口视图（browse 现在只放搜索结果/歌单曲目）
+  /* 舞台会话是否正经 classic 绕道在播放页里（见 applyStage）：从舞台切 classic
+     落到 now，再从播放页菜单切回形态时，仍是同一次舞台会话，来源不能重算。 */
+  let stageDetour = false;
   /* Lab 模块把「停自动过渡演示音源」注册到这里：离开实验室 / 切走分页时要立刻掐掉。
      那几个是一次性 BufferSource，挂在共享 master 上，不主动停会自己响完（≤8s）。 */
   let labStopXfade = null;
@@ -354,6 +357,8 @@
 
   function show(next) {
     view = next;
+    /* 回到大厅 = 舞台会话结束：classic 绕道标记清掉，下次从播放页进舞台是全新进入。 */
+    if (next === 'hall') stageDetour = false;
     if (next !== 'now') {
       document.body.classList.remove('from-track', 'is-cover-flying', 'is-hero-flying');
       el.viewNow.classList.remove('from-hero');
@@ -3059,7 +3064,9 @@
   // 舞台操作条：返回
   $('stage-back').addEventListener('click', () => {
     if (stageFromHall) { stageFromHall = false; show('hall'); return; }
-    show('now');
+    /* 显式点返回离场 = 舞台会话结束：classic 绕道标记清掉，下次从播放页
+       菜单再进舞台是全新进入，回播放页（不是把上一次的大厅来源留下来）。 */
+    stageDetour = false; show('now');
   });
 
   /* ---- 形态下拉（「形态」按钮）----
@@ -3485,7 +3492,15 @@
       channel = b.dataset.ch;
       try { localStorage.setItem('lizi.qq.channel', channel); } catch { /* ignore */ }
       paint();
-      if (!wrap.hidden) startQr();      // 二维码开着就直接换成新通道的
+      // 二维码开着就直接换成新通道的。取码请求在飞时 startQr() 会因 starting 直接 return，
+      // 但 channel 已经换了——旧码继续轮询、标签却是新通道，二维码「没有重新」。
+      // 先 abort 在飞的取码（AbortError 会把 starting 清掉），150ms 后再取新通道的码。
+      if (!wrap.hidden) {
+        if (starting) {
+          if (keyCtl) keyCtl.abort();
+          setTimeout(() => { if (!wrap.hidden && !logged) startQr(); }, 150);
+        } else startQr();
+      }
     });
 
     return { refresh, pause, startQr, logout, get logged() { return logged; } };
@@ -3732,6 +3747,7 @@
       active = id;
       expired = 0;
       key = '';
+      Object.keys(rows).forEach(paint);   // 切家时旧行也要重画，不然旧行一直停在「等待扫码」「换一张」
       qr.wrap.hidden = false;
       qr.box.innerHTML = '<span>正在获取二维码…</span>';
       qr.status.className = 'qq-qr__status';
@@ -3772,6 +3788,7 @@
       checking = true;
       try {
         const d = await API.srcQrCheck(id, key);
+        if (active !== id) return;   // 切到别家后才回来的旧轮询，别把旧家的报错写进新家的状态栏
         const code = Number(d && d.code);
         if (code === 803) {
           stop();
@@ -5913,17 +5930,23 @@
   }
 
   function applyStage(id, fromHall) {
-    /* 记来源：形态长廊面传 true，舞台操作条的返回键据此决定回大厅还是回播放器；
-       其余入口（播放器里的形态菜单 / 整页画廊）不传，保持原路回播放器。
-       但切形态（已在舞台里）不传 fromHall 时要保留来源——否则从大厅进来
-       切一次形态，stageFromHall 就被清掉，返回键回播放页不回大厅
-       （第 7 轮第 1 件复现 D 路径实测）。 */
-    if (fromHall !== undefined || view !== 'stage') stageFromHall = !!fromHall;
+    /* 记来源：只在「真正进入舞台」时写，舞台会话一旦开始就 sticky——
+       从大厅进来后，无论中间切多少次形态、是否经过 classic、是否从播放页
+       菜单再切回来，返回键都要一次回大厅；从播放页进来则一次回播放页。
+       - 大厅 tile 传 true → stageFromHall = true；
+       - 播放页 / 抽屉 / 深链不传、且不在 classic 绕道里 → 全新进入，false；
+       - 已在舞台里切形态，或 classic 切出后从播放页菜单再切回来
+         （stageDetour）→ 保留最初来源，不写。
+       第 8 轮：第 7 轮的 `view !== 'stage'` 条件在 classic 绕道后误判——
+       从舞台切 classic 落到 now，再从播放页菜单进形态时 view='now'，
+       `stageFromHall = !!undefined` 把大厅来源清掉，返回落到播放页（P2）。 */
+    if (fromHall !== undefined) stageFromHall = !!fromHall;
+    else if (view !== 'stage' && !stageDetour) stageFromHall = false;
     const s = StageHost.load(id);
     if (menuVal) menuVal.textContent = s.name;
     markCurrent(s.id);
-    if (s.id !== 'classic') show('stage');
-    else if (view === 'stage') show('now');
+    if (s.id !== 'classic') { stageDetour = false; show('stage'); }
+    else if (view === 'stage') { stageDetour = true; show('now'); }
   }
 
   /* 搜索 / 标签栏 */

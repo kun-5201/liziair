@@ -86,9 +86,14 @@ final class BodianService {
     }
 
     /// call：path 须以 / 开头且不含 ..；query 注入恒带 uid（会话 uid 或 -1）与 token（无会话为空）；
-    /// signed 时先加 timestamp（毫秒）再算 sign；GET 也可带 JSON body；
+    /// signed 时先加 timestamp（毫秒）再算 sign；GET 一律不带 body（见下）；
     /// 响应 code 须为 200，否则 407 地域限制、11012 需登录、20018 不可播、其他 invalid-response；
     /// HTTP 401 → auth-required，其余非 2xx → network。
+    /// 注意：iOS 的 URLSession 拒绝 GET 带 body（NSURLError -1103 "resource exceeds maximum size"，
+    /// 2026-11-18 真机波点登录就是这么死的：扫码后 status=3 换 token 那步是 GET+body，
+    /// 前端红字原样显示了这句系统文案）。桌面端协议里 checkRight/audioUrl 是 GET 带 JSON body，
+    /// 但 query 里已有同样参数，实测去掉 body 上游照样回 200；users/login 上游 Node 版走 POST，
+    /// 这里也改 POST。所以 GET 的 body 在这里直接丢掉（签名也按无 body 算），不再往下传。
     private func call(path: String, params: [(String, String)] = [], body: [String: Any]? = nil,
                      signed: Bool = false, base: String = bdBase, method: String = "GET") async throws -> [String: Any] {
         guard path.hasPrefix("/"), !path.contains("..") else {
@@ -100,9 +105,11 @@ final class BodianService {
             ("token", sess == nil ? "" : scStr(sess!, "token")),
         ]
         pairs.append(contentsOf: params)
+        // GET 不带 body（见上）：effectiveBodyText 为空时签名也不含 body 的 md5。
+        let effectiveBody: [String: Any]? = (method.uppercased() == "GET") ? nil : body
         let bodyText: String
-        if let body = body {
-            guard let data = try? JSONSerialization.data(withJSONObject: body) else {
+        if let effectiveBody = effectiveBody {
+            guard let data = try? JSONSerialization.data(withJSONObject: effectiveBody) else {
                 throw BodianError(code: "invalid-response", message: "波点请求体构造失败", upstreamCode: nil)
             }
             bodyText = String(data: data, encoding: .utf8) ?? ""
@@ -117,10 +124,10 @@ final class BodianService {
             throw BodianError(code: "network", message: "波点请求构造失败", upstreamCode: nil)
         }
         var headers = desktopHeaders(loggedIn: sess != nil)
-        if body != nil { headers["Content-Type"] = "application/json" }
+        if effectiveBody != nil { headers["Content-Type"] = "application/json" }
         let (rawData, resp) = try await Upstream.fetch(url, headers: headers, timeout: 15,
                                                        method: method,
-                                                       body: body == nil ? nil : Data(bodyText.utf8))
+                                                       body: effectiveBody == nil ? nil : Data(bodyText.utf8))
         if resp.statusCode == 401 {
             throw BodianError(code: "auth-required", message: "Bodian HTTP 401", upstreamCode: nil)
         }
@@ -147,8 +154,11 @@ final class BodianService {
             case 20018:
                 throw BodianError(code: "not-playable", message: msg.isEmpty ? "波点歌曲不可播" : msg, upstreamCode: "20018")
             default:
+                // 上游 msg 能说明问题时原样显示（如 11052 "二维码已过期失效"），别只剩一句 code；
+                // upstreamCode 保持原样，loginQrCheck 里 11027→scanned 的判断不受影响。
                 throw BodianError(code: "invalid-response",
-                                  message: "Bodian rejected the request (code \(code))", upstreamCode: String(code))
+                                  message: msg.isEmpty ? "Bodian rejected the request (code \(code))" : msg,
+                                  upstreamCode: String(code))
             }
         }
         return obj
@@ -179,19 +189,24 @@ final class BodianService {
         return bdZlibInflate(deflate)
     }
 
-    /// zlib 解压（COMPRESSION_ZLIB，缓冲翻倍重试），与 Kuwo 的同款实现思路一致。
+    /// zlib 解压（COMPRESSION_ZLIB，缓冲翻倍重试），与 Kuwo/Kugou 的守卫写法一致：
+    /// 空 Data 时 withUnsafeBytes 的 baseAddress 是 nil，旧写法 baseAddress! 会直接
+    /// 杀死进程（bdGunzip 的守卫允许 pos == count-8 即空 deflate 体时就会走到这里）。
     private static func bdZlibInflate(_ data: Data) -> Data? {
+        guard !data.isEmpty else { return nil }
         var capacity = max(data.count * 4, 65536)
         for _ in 0..<6 {
             var out = Data(count: capacity)
-            let decoded = out.withUnsafeMutableBytes { dst in
-                data.withUnsafeBytes { src in
-                    compression_decode_buffer(dst.baseAddress!.assumingMemoryBound(to: UInt8.self), capacity,
-                                              src.baseAddress!.assumingMemoryBound(to: UInt8.self), data.count,
-                                              nil, COMPRESSION_ZLIB)
+            var decoded = 0
+            let ok: Bool = data.withUnsafeBytes { src in
+                out.withUnsafeMutableBytes { dst in
+                    guard let s = src.baseAddress?.assumingMemoryBound(to: UInt8.self),
+                          let d = dst.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return false }
+                    decoded = compression_decode_buffer(d, capacity, s, data.count, nil, COMPRESSION_ZLIB)
+                    return decoded > 0
                 }
             }
-            if decoded > 0 { out.count = decoded; return out }
+            if ok { out.count = decoded; return out }
             capacity *= 2
         }
         return nil
@@ -257,8 +272,10 @@ final class BodianService {
             return ["status": "expired", "code": 800, "message": "二维码已过期"]
         case 3:
             do {
+                // Node 版 users/login 走 POST；Swift 之前没传 method，默认 GET 带 JSON body，
+                // iOS URLSession 直接抛 -1103 "resource exceeds maximum size"，登录永远换不到 token。
                 let loginObj = try await call(path: "/api/ucenter/users/login",
-                                              body: ["authType": 10, "qrCode": key], signed: true)
+                                              body: ["authType": 10, "qrCode": key], signed: true, method: "POST")
                 guard let login = loginObj["data"] as? [String: Any] else {
                     throw BodianError(code: "invalid-response", message: "波点登录返回缺 data", upstreamCode: nil)
                 }
@@ -414,9 +431,11 @@ final class BodianService {
         return true
     }
 
-    /// audio：① checkRight（signed GET 带 JSON body，query 与 body 均为 {musicId, freeSign}）；
-    /// ② audioUrl（signed GET 带 JSON body，body {devId, musicId, format, br, freeSign}，
-    /// query 为 body 展开后再以字符串 musicId 覆盖）。
+    /// audio：① checkRight（signed GET，query {musicId, freeSign}）；② audioUrl（signed GET，
+    /// query {devId, musicId, format, br, freeSign}）。桌面端协议是 GET 带 JSON body，
+    /// 但 iOS URLSession 拒绝 GET+body（-1103）；query 里已有全部参数，实测去掉 body
+    /// 上游照样回 200（checkRight 回正常 data；audioUrl 回业务码 20018，与带 body 时一致），
+    /// POST 则被上游拒（500 Service error），所以这里只发 query、不发 body。
     /// 档位：standard=mp3/128kmp3、high=mp3/320kmp3、lossless=flac/2000kflac，hires 归一为 lossless，
     /// 未传默认 high，其他值抛 'Unsupported Bodian audio quality'。
     private func audioOp(id: String, quality req: String, freeSign: String) async throws -> [String: Any] {
@@ -429,10 +448,8 @@ final class BodianService {
         else if req.isEmpty { q = "high" }
         else { throw BodianError(code: "invalid-response", message: "Unsupported Bodian audio quality", upstreamCode: nil) }
         let (format, br) = map[q]!
-        let numericId = Int(id) ?? 0
         let checkData = try await dataOf(path: "/api/play/music/v2/checkRight",
-                                         params: [("musicId", id), ("freeSign", freeSign)],
-                                         body: ["musicId": numericId, "freeSign": freeSign], signed: true)
+                                         params: [("musicId", id), ("freeSign", freeSign)], signed: true)
         if checkData["status"] == nil {
             let loggedIn = loadSession() != nil
             throw BodianError(code: loggedIn ? "not-playable" : "auth-required",
@@ -457,9 +474,7 @@ final class BodianService {
         }
         let audioData = try await dataOf(path: "/api/play/music/v2/audioUrl",
                                          params: [("devId", deviceId()), ("musicId", id), ("format", format),
-                                                  ("br", br), ("freeSign", freeSign)],
-                                         body: ["devId": deviceId(), "musicId": numericId,
-                                                "format": format, "br": br, "freeSign": freeSign], signed: true)
+                                                  ("br", br), ("freeSign", freeSign)], signed: true)
         guard let url = (audioData["audioHttpsUrl"] as? String) ?? (audioData["audioUrl"] as? String),
               !url.isEmpty, Self.bdValidateAudioURL(url) else {
             throw BodianError(code: "not-playable", message: "波点音频地址无效", upstreamCode: nil)

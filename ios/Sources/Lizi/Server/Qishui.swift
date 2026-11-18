@@ -485,29 +485,56 @@ final class QishuiService {
         case "refused":
             throw QishuiError(code: "auth-required", message: "用户拒绝了登录", upstreamCode: nil)
         case "confirmed":
-            let code = scStr(d, "code").isEmpty ? scStr(d, "auth_code") : scStr(d, "code")
+            // 授权码一次性：confirmed 之后这张码就死了，之后任何一步失败都回 800 让前端自动换一张，
+            // 别抛错让轮询一直打同一张死码（之前就卡在这里：每轮都报「取 access_code 返回缺字段」）。
+            let code = scStrOrNum(d, "code").isEmpty ? scStrOrNum(d, "auth_code") : scStrOrNum(d, "code")
+            guard !code.isEmpty else {
+                pending.removeValue(forKey: key)
+                return ["status": "expired", "code": 800, "message": "扫码已确认，但上游没给授权码，已换新码请重新扫码"]
+            }
             let qStr = "\(Self.qsPublicBase)/access/code/get/?\(qishuiParams(deviceId: deviceId()))&auth_code=\(qsFormEncode(code))"
             guard let qURL = URL(string: qStr) else {
                 throw QishuiError(code: "network", message: "取 access_code 请求构造失败", upstreamCode: nil)
             }
-            let (codeData, _) = try await qsFetch(url: qURL, headers: ["user-agent": Self.qsUA])
-            guard let codeObj = Upstream.jsonObject(codeData),
-                  let cd = codeObj["data"] as? [String: Any],
-                  let accessCode = cd["access_code"] as? String, !accessCode.isEmpty,
-                  let openId = cd["open_id"] as? String else {
-                throw QishuiError(code: "invalid-response", message: "取 access_code 返回缺字段", upstreamCode: nil)
-            }
-            var cred: [String: Any] = ["deviceId": deviceId(), "accessCode": accessCode, "openId": openId]
-            cred = try await exchangeTicket(credential: cred)
-            // Node 是取落盘 current.user；check 时 user 可能为空，这里多调一次 getUser 补画像。
-            saveSession(cred)
-            if let user = try? await getUser(credential: cred) {
-                cred["userId"] = user["id"]
-                cred["user"] = user
+            do {
+                // 这里不用 qsFetch：access/code/get 出错时上游回非 2xx + err_no/err_msg
+                //（如 auth_code 过期：HTTP 500 + 28035007），qsFetch 会直接抛 "HTTP 500"，
+                // body 里的真原因就读不到了。直接调 Upstream.fetch 拿原始响应再跑 checked()。
+                let (codeData, _) = try await Upstream.fetch(qURL, headers: ["user-agent": Self.qsUA], timeout: 25)
+                guard let codeObj = Upstream.jsonObject(codeData) else {
+                    throw QishuiError(code: "invalid-response", message: "取 access_code 返回无法解析", upstreamCode: nil)
+                }
+                let checked = try Self.checkQishuiResponse(codeObj)
+                guard let cd = checked["data"] as? [String: Any] else {
+                    throw QishuiError(code: "invalid-response", message: "取 access_code 返回缺 data", upstreamCode: nil)
+                }
+                // Node 版取法：open_id 不行就用 open_uid，且数字也认（String(...) 兜底）；
+                // Swift 之前只认 String 的 open_id，数字或 open_uid 一来就报「返回缺字段」。
+                let accessCode = scStrOrNum(cd, "access_code")
+                let openId = scStrOrNum(cd, "open_id").isEmpty ? scStrOrNum(cd, "open_uid") : scStrOrNum(cd, "open_id")
+                guard !accessCode.isEmpty, !openId.isEmpty else {
+                    throw QishuiError(code: "invalid-response", message: "取 access_code 返回缺字段（access_code/open_id）", upstreamCode: nil)
+                }
+                var cred: [String: Any] = ["deviceId": deviceId(), "accessCode": accessCode, "openId": openId]
+                cred = try await exchangeTicket(credential: cred)
+                // Node 是取落盘 current.user；check 时 user 可能为空，这里多调一次 getUser 补画像。
                 saveSession(cred)
+                if let user = try? await getUser(credential: cred) {
+                    cred["userId"] = user["id"]
+                    cred["user"] = user
+                    saveSession(cred)
+                }
+                pending.removeValue(forKey: key)
+                return ["status": "confirmed", "code": 803, "message": "登录成功"]
+            } catch let e as QishuiError {
+                // 换码失败意味着这张码已死（auth_code 一次性），照样换一张；
+                // message 里现在是上游真原因（如 "auth code 已经过期"），不再是 "HTTP 500"。
+                pending.removeValue(forKey: key)
+                return ["status": "expired", "code": 800, "message": "换凭证失败（\(e.message)），已换新码请重新扫码"]
+            } catch {
+                pending.removeValue(forKey: key)
+                return ["status": "expired", "code": 800, "message": "换凭证失败（\(error.localizedDescription)），已换新码请重新扫码"]
             }
-            pending.removeValue(forKey: key)
-            return ["status": "confirmed", "code": 803, "message": "登录成功"]
         default:
             throw QishuiError(code: "invalid-response", message: "未知扫码状态：\(status)", upstreamCode: nil)
         }
@@ -536,10 +563,10 @@ final class QishuiService {
                 let (data, _) = try await qsFetch(url: qURL, headers: ["user-agent": Self.qsUA])
                 guard let obj = Upstream.jsonObject(data),
                       let cd = obj["data"] as? [String: Any],
-                      let accessCode = cd["access_code"] as? String else {
+                      !scStrOrNum(cd, "access_code").isEmpty else {
                     throw QishuiError(code: "invalid-response", message: "续期返回缺 access_code", upstreamCode: nil)
                 }
-                cred["accessCode"] = accessCode
+                cred["accessCode"] = scStrOrNum(cd, "access_code")
                 cred = try await exchangeTicket(credential: cred)
                 saveSession(cred)
             } catch let e as QishuiError {
@@ -971,6 +998,7 @@ final class QishuiService {
         let cover = qsPickCover((display["cover"] as? [String: Any]) ?? [:])
         var out: [String: Any] = [
             "id": scStr(base, "id").isEmpty ? scStr(track, "id") : scStr(base, "id"),
+            "source": "qishui",
             "name": scStr(base, "name"), "artists": artists,
             "album": scStr(album, "name"), "albumId": scStr(album, "id"),
             "cover": cover, "duration": scInt(base, "duration_ms"), "fee": 0,
