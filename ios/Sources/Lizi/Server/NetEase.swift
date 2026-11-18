@@ -9,6 +9,11 @@ import UIKit
 /// 扫码 key/check 走 eapi（包里 APP_CONF.encrypt=true 时默认 eapi，type 硬编码为 3），
 /// dj/专辑/每日推荐走 weapi；X-antiCheatToken 按包里的 register_checktoken_v3 从
 /// ac.dun.163yun.com 实时取（取不到就按包的做法：不带头继续请求）。
+/// 第 11 轮（kun 对齐）：搜索、取链、每日签到三条线按 kun（lty5201/kun，
+/// dynamic-island-lyrics 分支，MusicAPI.swift / MusicClient.swift）对齐——
+/// 搜索走 eapi /cloudsearch/pc，取链走 eapi /song/enhance/player/url/v1
+///（encodeType 恒为 flac，sky 档加 immerseType c51），签到走 weapi
+/// /point/dailyTask（type 0 安卓 + type 1 网页各一次）。其余网易接口不动。
 
 final class NetEaseService {
     private let session = SessionStore.shared
@@ -175,11 +180,17 @@ final class NetEaseService {
         "user/cloud": Route(path: "/v1/cloud/get", channel: "weapi"),
         "playlist/detail": Route(path: "/v6/playlist/detail", channel: "weapi"),
         "playlist/track/all": Route(path: "/v6/playlist/detail", channel: "weapi"),
-        "song/url": Route(path: "/song/enhance/player/url/v1", channel: "weapi"),
+        // 每日签到（第 11 轮 kun 对齐：kun MusicAPI.dailySignIn，weapi
+        // /point/dailyTask，type 0 安卓 3 点 + type 1 网页 2 点；-2 = 当天已签）。
+        // 只走 Lizi 现有的网易登录会话（MUSIC_U），不重做登录。
+        "daily/signin": Route(path: "/point/dailyTask", channel: "weapi"),
+        "song/url": Route(path: "/song/enhance/player/url/v1", channel: "eapi"),
         "song/detail": Route(path: "/v3/song/detail", channel: "weapi"),
         "song/wiki": Route(path: "/song/play/about/block/page", channel: "weapi"),
         "lyric": Route(path: "/song/lyric/v1", channel: "weapi"),
-        "search": Route(path: "/search/get", channel: "weapi"),
+        // 搜索（第 11 轮 kun 对齐：kun MusicAPI.search 走 eapi /cloudsearch/pc，
+        // 不再走 weapi /search/get；回的歌自带 al.picUrl，封面不用再补调）。
+        "search": Route(path: "/cloudsearch/pc", channel: "eapi"),
         "personalized": Route(path: "/personalized/newsong", channel: "weapi"),
         "recommend/songs": Route(path: "/v1/discovery/recommend/songs", channel: "weapi"),
         "top/playlist": Route(path: "/personalized/playlist", channel: "weapi"),
@@ -361,6 +372,40 @@ extension NetEaseService {
             return .json(200, ["code": 200, "tracks": tracks.compactMap { toTrack($0) }])
         }
 
+        // 每日签到不走通用单次转发：kun dailySignIn() 的做法是 type 0（安卓）
+        // 和 type 1（网页）各调一次 /point/dailyTask，code 200 累加 point，
+        // code -2（当天已签）也算成功；两次都失败才算失败。未登录时根本
+        // 不调上游，直接回 301（和 kun 调用方「未登录不调」一致）。
+        if hit.key == "daily/signin" {
+            guard session.hasMusicU else {
+                return .json(200, ["code": 301, "loggedIn": false, "signedIn": false,
+                                   "message": "需要登录网易云音乐后才能签到"])
+            }
+            var gained = 0
+            var anyOK = false
+            var alreadySigned = false
+            var details: [[String: Any]] = []
+            for type in [0, 1] {
+                do {
+                    let r = try await weapiRequest("/point/dailyTask", ["type": type])
+                    let code = int(r.json, "code")
+                    let point = int(r.json, "point")
+                    details.append(["type": type, "code": code, "point": point])
+                    if code == 200 { anyOK = true; gained += point }
+                    if code == -2 { anyOK = true; alreadySigned = true }
+                } catch {
+                    details.append(["type": type, "code": 502, "point": 0,
+                                    "error": error.localizedDescription])
+                }
+            }
+            guard anyOK else {
+                return .json(502, ["code": 502, "signedIn": false,
+                                   "message": "签到失败，上游无响应", "details": details])
+            }
+            return .json(200, ["code": 200, "signedIn": true, "point": gained,
+                               "alreadySigned": alreadySigned, "details": details])
+        }
+
         // 参数整形。
         payload = shapePayload(routeKey: hit.key, payload: payload)
 
@@ -381,7 +426,7 @@ extension NetEaseService {
             let normalized = await normalize(routeKey: hit.key, data: result.json, payload: payload)
             if isSearch {
                 DiagLog.shared.recordSearch([
-                    "endpoint": "/search/get",
+                    "endpoint": "/cloudsearch/pc",
                     "ms": Int(Date().timeIntervalSince(t0) * 1000),
                     "http": result.status,
                     "code": normalized["code"] as Any,
@@ -393,7 +438,7 @@ extension NetEaseService {
         } catch {
             if hit.key == "search" {
                 DiagLog.shared.recordSearch([
-                    "endpoint": "/search/get",
+                    "endpoint": "/cloudsearch/pc",
                     "ms": Int(Date().timeIntervalSince(t0) * 1000),
                     "error": error.localizedDescription,
                     "at": Int(Date().timeIntervalSince1970),
@@ -413,12 +458,16 @@ extension NetEaseService {
             if let k = p["key"] { np["key"] = k }
             p = np
         case "song/url":
-            let levels = ["standard", "higher", "exhigh", "lossless", "hires", "jymaster", "jyeffect"]
+            // kun 对齐（MusicAPI.songURL）：level 原样透传，encodeType 恒为 flac；
+            // 只有 sky（环绕声）档加 immerseType c51。档位表按 kun
+            // AudioQuality.neteaseLevel 补齐 dolby / sky。
+            let levels = ["standard", "higher", "exhigh", "lossless", "hires", "dolby", "jymaster", "jyeffect", "sky"]
             let level = levels.contains(str(p, "level")) ? str(p, "level") : "exhigh"
-            let encodeType = (level == "standard" || level == "higher") ? "mp3" : "flac"
             let ids = idList(p["ids"])
-            p = ["ids": (try? JSONSerialization.data(withJSONObject: ids)).flatMap { String(data: $0, encoding: .utf8) } ?? "[]",
-                 "level": level, "encodeType": encodeType]
+            var np: [String: Any] = ["ids": (try? JSONSerialization.data(withJSONObject: ids)).flatMap { String(data: $0, encoding: .utf8) } ?? "[]",
+                 "level": level, "encodeType": "flac"]
+            if level == "sky" { np["immerseType"] = "c51" }
+            p = np
         case "playlist/detail", "playlist/track/all":
             p = ["id": int(p, "id"), "n": 1000, "s": 8]
         case "lyric":
@@ -433,8 +482,10 @@ extension NetEaseService {
         case "user/detail":
             p = ["uid": int(p, "uid") != 0 ? int(p, "uid") : int(p, "userId")]
         case "search":
+            // kun 对齐（MusicAPI.search）：eapi /cloudsearch/pc，total: true。
             p = ["s": str(p, "s").isEmpty ? str(p, "keywords") : str(p, "s"),
-                 "type": 1, "limit": intOr(p, "limit", 30), "offset": intOr(p, "offset", 0)]
+                 "type": 1, "limit": intOr(p, "limit", 30), "offset": intOr(p, "offset", 0),
+                 "total": true]
         case "top/playlist":
             p = ["cat": str(p, "cat").isEmpty ? "全部" : str(p, "cat"),
                  "order": str(p, "order").isEmpty ? "hot" : str(p, "order"),
@@ -456,11 +507,12 @@ extension NetEaseService {
         case "search":
             let result = dict(data, "result")
             let tracks = arr(result, "songs").compactMap { toTrack($0) }
-            // Folia 的做法：一次请求直接返回，不阻塞在补封面那步。
-            // /search/get 回的歌没有 al.picUrl（只有 picId，拼不出封面地址），
-            // 以前这里每搜一次都要再调 /v3/song/detail 全量补封面（最长 6 秒），
-            // 慢网下搜索全程被拖到 10 秒以上。改成先返回曲目，封面由前端
-            // 对可见行调 /api/song/detail 懒补（见 app.js renderTracks）。
+            // kun 对齐后搜索走 eapi /cloudsearch/pc：回的歌自带 al.picUrl，
+            // toTrack 直接取封面；前端对可见行调 /api/song/detail 懒补的
+            // 逻辑仍在（无害，云搜没给的字段才补）。旧 weapi /search/get
+            // 回的歌没有 al.picUrl（只有 picId，拼不出封面地址），那条
+            // 「每搜一次再调 /v3/song/detail 全量补封面」已被第 8 轮 Folia
+            // 化改掉，不再恢复。
             let songCount = (result["songCount"] as? Int) ?? tracks.count
             return ["code": code, "tracks": tracks, "songCount": songCount]
         case "song/url":
@@ -471,6 +523,8 @@ extension NetEaseService {
                     "url": url as Any,
                     "br": s["br"] as Any,
                     "size": s["size"] as Any,
+                    "type": s["type"] as Any,
+                    "time": s["time"] as Any,
                     "fee": s["fee"] as? Int ?? 0,
                     "reason": url != nil ? NSNull() : ((s["code"] as? Int) == -110 ? "vip" : "unavailable"),
                     "freeTrialInfo": s["freeTrialInfo"] as Any,

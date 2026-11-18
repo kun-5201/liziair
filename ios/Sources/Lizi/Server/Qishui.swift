@@ -734,6 +734,13 @@ final class QishuiService {
         throw QishuiError(code: "unsupported", message: "Qishui returned protected audio only; decryption is disabled", upstreamCode: nil)
     }
 
+    /// LRCLIB 兜底（第 11 轮）：元数据来自前端 srcLyric 传参，不再调一次
+    /// songDetail（lyrics() 内部已经查过详情；官方歌词为空时直接用传参查）。
+    private func lrclibFallback(req: HttpRequest) async -> (lyric: String, yrc: String)? {
+        await Lrclib.fetch(artist: req.string("artist"), track: req.string("s"),
+                           album: req.string("album"), duration: req.int("duration"))
+    }
+
     /// lyrics：复用 song_detail 取 display_info.lyric_info；lyric_entity.content 的路径包内没找到——
     /// 按 sidecars.md §4.5 的归一化层记录，取 lyrics.lyric_entity.content。
     private func lyrics(id: String) async throws -> [String: Any] {
@@ -1127,9 +1134,18 @@ final class QishuiService {
                         || content.range(of: #"\n\[\d+,\d+\]"#, options: .regularExpression) != nil
                     let lrc = isKrc ? krcToLrc(content) : content
                     let yrc = isKrc ? krcToYrc(content) : ""
+                    if lrc.isEmpty && yrc.isEmpty, let fb = await lrclibFallback(req: req) {
+                        return .json(200, ["code": 200, "lyric": fb.lyric, "yrc": "", "tlyric": "",
+                                           "format": "lrc"])
+                    }
                     return .json(200, ["code": 200, "lyric": lrc, "yrc": yrc, "tlyric": "",
                                        "format": !yrc.isEmpty ? "yrc" : (!lrc.isEmpty ? "lrc" : "none")])
                 } catch let e as QishuiError {
+                    // 第 11 轮：官方抛错也试一次兜底；兜底失败回原来的 error 形状。
+                    if let fb = await lrclibFallback(req: req) {
+                        return .json(200, ["code": 200, "lyric": fb.lyric, "yrc": "", "tlyric": "",
+                                           "format": "lrc"])
+                    }
                     return .json(200, ["code": 200, "lyric": "", "yrc": "", "tlyric": "", "format": "none",
                                        "error": e.message])
                 }

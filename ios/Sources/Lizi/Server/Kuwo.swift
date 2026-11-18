@@ -843,6 +843,17 @@ final class KuwoService {
             } catch let e { if error == nil { error = e.localizedDescription } }
         }
         let hasLyric = !parsed.lyric.isEmpty || !parsed.yrc.isEmpty
+        if !hasLyric {
+            // 第 11 轮：PC + H5 两路都空，走 LRCLIB 兜底；元数据来自前端
+            // srcLyric 传参（酷我没有现成的单曲详情接口，不新写）。
+            // 兜底命中时 source 记 lrclib，error 清掉；兜底也空时回原来的
+            // source/error，原样不变。
+            if let fb = await Lrclib.fetch(artist: req.string("artist"), track: req.string("s"),
+                                           album: req.string("album"), duration: req.int("duration")) {
+                return .json(200, ["code": 200, "lyric": fb.lyric, "yrc": fb.yrc,
+                                   "format": "lrc", "source": "lrclib", "error": NSNull()])
+            }
+        }
         return .json(200, ["code": 200, "lyric": parsed.lyric, "yrc": parsed.yrc,
                            "format": !parsed.yrc.isEmpty ? "yrc" : (!parsed.lyric.isEmpty ? "lrc" : "none"),
                            "source": source,

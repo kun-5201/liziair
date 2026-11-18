@@ -4221,6 +4221,10 @@ body.is-hero-flying .view--now .now__transport { opacity: 0; }
    #hall-plat 会按剩余空间自适应（fitPlatScale 重算），真机看一眼布局。 */
 .hall-rail.is-plat > .hall-cell--local { display: flex; }
 .hall-cell { padding: var(--sp-4) 0; display: flex; flex-direction: column; min-width: 0; }
+/* 2026-11-18 第 11 轮：本地音乐开关关掉时整块 hidden。作者样式的 display:flex
+   会压过 UA 的 [hidden]，而且铺色态那条 .hall-rail.is-plat > .hall-cell--local
+   也是 display:flex；用 ID 选择器才能稳稳压住，整块消失、不留占位。 */
+#hall-local-cell[hidden] { display: none; }
 .hall-cell + .hall-cell { border-top: 1px solid var(--rule-soft); }
 /* 2026-11-08：入口已改成铺色态面板左侧的竖向页签，普通态只剩登录引导，
    不再展示这一行。DOM 和 paintTools 先留着 —— 后面还要改，别急着拆。
@@ -8887,6 +8891,12 @@ body.is-stage .updtoast { bottom: 18px; }
   body.is-now #view-now .now__title {
     font-size: 20px; line-height: 1.25;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    /* 2026-11-18 第 11 轮：窄屏下标题在所有状态都是 20px，base 那条
+       transition: font-size 只会在进播放页时把 39px 缩到 20px 播 560ms，
+       连带 .now__meta 高度 70→56、传输排上下跳（横屏实测跳 52px）。
+       这里直接关掉过渡：第一帧就是 20px，不再有进场这一跳。
+       桌面版式（.is-lyrics-open 缩一档）不在这个作用域，不受影响。 */
+    transition: none;
   }
   body.is-now #view-now .now__sub {
     font-size: 14px;

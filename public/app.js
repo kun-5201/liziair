@@ -4160,6 +4160,29 @@
   $('set-hall-rail').addEventListener('click', () => setHallRail(!hallRailOn()));
   paintHallRailSwitch();
 
+  /* ---- 首页「本地音乐」区块开关（lizi.local.show，2026-11-18 第 11 轮）----
+     默认开（缺省 / '1' = 显示，'0' = 隐藏）。照「大厅内容轨」那套写法：
+     开关只写 localStorage + 画开关态 + 让大厅当场重画，不等重进大厅。
+     只管整块显示/隐藏，不管导入。 */
+  const LOCAL_SHOW_KEY = 'lizi.local.show';
+  function localShowOn() {
+    try { return localStorage.getItem(LOCAL_SHOW_KEY) !== '0'; } catch { return true; }
+  }
+  function paintLocalShowSwitch() {
+    const sw = $('set-local-show');
+    if (sw && sw.setAttribute) sw.setAttribute('aria-checked', String(localShowOn()));
+  }
+  function setLocalShow(on) {
+    on = !!on;
+    try { localStorage.setItem(LOCAL_SHOW_KEY, on ? '1' : '0'); } catch { /* 隐私模式：本次仍生效 */ }
+    paintLocalShowSwitch();
+    try { Hall.refreshLocalVisible(); } catch { /* 大厅还没挂载：下次进大厅本来就会按新值画 */ }
+    window.dispatchEvent(new CustomEvent('lizi:local-show'));
+  }
+  const localShowSwitch = $('set-local-show');
+  if (localShowSwitch) localShowSwitch.addEventListener('click', () => setLocalShow(!localShowOn()));
+  paintLocalShowSwitch();
+
   function openSettings() {
     show('settings');
     audioSummary();          // 「音质 · 预设」每次进来刷一次
@@ -4170,6 +4193,7 @@
     paintPlatAvatarSwitch(); // 「平台头像」同理：默认关，别的标签页改过也能对上
     paintPlatColorSwitch();  // 「用平台颜色铺色」默认关，别的标签页改过也能对上
     paintHallRailSwitch();   // 「大厅内容轨」默认开，别的标签页改过也能对上
+    paintLocalShowSwitch();  // 「本地音乐」开关默认开，别的标签页改过也能对上
     paintPlatformsRow();     // 「平台管理」右值（全部 N 个 / 已选 N 个）同理
     setupSettingsConsole();  // 控制台导航 / 观察器（幂等）
     setActiveSection('set-sec-account', false);
@@ -6444,6 +6468,7 @@
       lock: $('hall-hero-lock'),
       tools: $('hall-tools'), me: $('hall-me'),
       local: $('hall-local'),           // 本地音乐推荐区（文件 App 导入，见 paintLocal）
+      localCell: $('hall-local-cell'),  // 本地音乐整块（第 11 轮开关：整块显示/隐藏）
       rail: $('hall-rail'), plat: $('hall-plat'),
       platBar: $('hall-plat-bar'),
       srcMenu: $('hall-src-menu'),          // 左上角「每日推荐」的悬停来源浮层
@@ -11969,6 +11994,7 @@
     async function paintLocal() {
       const box = H.local;
       if (!box) return;
+      applyLocalVisible();               // 开关关着时整块从第一帧就是隐藏的
       if (localLoading) return;
       localLoading = true;
       let tracks = [];
@@ -12053,6 +12079,21 @@
 
     /* 原生导入完成事件：刷新本地列表（设置页的数量文案由 paintLocal 顺手更新）。 */
     window.addEventListener('lizi:local-imported', () => { paintLocal(); });
+
+    /* ---- 首页「本地音乐」整块开关（2026-11-18 第 11 轮）----
+       localStorage['lizi.local.show']：缺省 / '1' = 显示（默认开），'0' = 整块隐藏。
+       读法照「大厅内容轨」lizi.hall.rail（!= '0' 即开）。设置页开关改完调
+       Hall.refreshLocalVisible() 或发 lizi:local-show，这里当场整块隐藏/显示，
+       不留空白占位；paintLocal 本身不管显隐，只管块里的列表内容。 */
+    const LOCAL_SHOW_KEY = 'lizi.local.show';
+    function localShowOn() {
+      try { return localStorage.getItem(LOCAL_SHOW_KEY) !== '0'; } catch { return true; }
+    }
+    function applyLocalVisible() {
+      const cell = H.localCell || document.getElementById('hall-local-cell');
+      if (cell) cell.hidden = !localShowOn();
+    }
+    window.addEventListener('lizi:local-show', applyLocalVisible);
 
     /** 并发查 6 家真实状态，回来后整体重画一次 */
     async function meRefreshGrid(token, accounts) {
@@ -12686,6 +12727,8 @@
       refreshMe() { if (mounted) paintMe(true); },   // 登录/退出：跳过缓存，立刻重查
       /** 本地音乐：设置页导入按钮 / 导入完成事件调这里刷新列表 */
       refreshLocal() { paintLocal(); },
+      /** 本地音乐整块开关：设置页 #set-local-show 改完调这里，首页当场整块显/隐 */
+      refreshLocalVisible() { applyLocalVisible(); },
       /** 本地音乐：弹系统文件选择器（没有原生桥时静默跳过） */
       importLocal() { requestLocalImport(); },
       /** 设置页拖速度滑杆时调；下一帧 tick 就用新速度，不用切视图 */

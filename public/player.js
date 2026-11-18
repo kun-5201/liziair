@@ -48,7 +48,7 @@ const Player = (() => {
 
   const listeners = {};
   const on = (evt, fn) => (listeners[evt] ||= []).push(fn);
-  const emit = (evt, data) => (listeners[evt] || []).forEach((f) => f(data));
+  const emit = (evt, data) => (listeners[evt] || []).forEach((f) => { try { f(data); } catch (e) { console.warn('[player] listener failed:', evt, e); } });
 
   /* ------------------------------------------------------------------ *
    * 队列持久化
@@ -163,7 +163,74 @@ const Player = (() => {
    * 演示音轨：用 WebAudio 离线渲染一段和弦琶音，转成 wav blob
    * 只在拿不到真实播放地址时使用
    * ------------------------------------------------------------------ */
-  function makeDemoTrack(seconds = 40, seed = 1) {
+  /* 演示音缓存：seed -> Blob（同一首歌反复播不重新渲染；URL.createObjectURL
+     每次新建，load() 里的 revokeDeckBlob 照常安全）。第 10 轮：旧同步版在主线程
+     循环 882,000 采样 × 约 7 次 Math.sin，实测堵 395ms（手机上 1–3 秒），正好卡
+     在「点卡→播」窗口的正前方；改异步离线渲染，不可用时回退同步版。 */
+  const demoBlobCache = new Map();
+  function encodeWav(float32, sr) {
+    const n = float32.length, ab = new ArrayBuffer(44 + n * 2), dv = new DataView(ab);
+    const wr = (o, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); };
+    wr(0, 'RIFF'); dv.setUint32(4, 36 + n * 2, true); wr(8, 'WAVE');
+    wr(12, 'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+    dv.setUint32(24, sr, true); dv.setUint32(28, sr * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+    wr(36, 'data'); dv.setUint32(40, n * 2, true);
+    for (let i = 0; i < n; i++) dv.setInt16(44 + i * 2, Math.max(-1, Math.min(1, float32[i])) * 32767, true);
+    return new Blob([ab], { type: 'audio/wav' });
+  }
+  async function makeDemoTrackBlob(seconds = 40, seed = 1) {
+    const key = `${seconds}:${seed >>> 0 || 1}`;
+    if (demoBlobCache.has(key)) return demoBlobCache.get(key);
+    const p = (async () => {
+      const sr = 22050;
+      const ctx = new OfflineAudioContext(1, Math.floor(sr * seconds), sr);
+      const master = ctx.createGain();
+      master.gain.setValueAtTime(0, 0);
+      master.gain.linearRampToValueAtTime(1, 1.5);
+      master.gain.setValueAtTime(1, Math.max(1.5, seconds - 2));
+      master.gain.linearRampToValueAtTime(0, seconds);
+      master.connect(ctx.destination);
+      const chords = [[220, 261.63, 329.63], [174.61, 220, 261.63], [196, 246.94, 293.66], [164.81, 207.65, 246.94]];
+      const bars = Math.ceil(seconds / 2);
+      for (let b = 0; b < bars; b++) {
+        const chord = chords[b % chords.length];
+        const t0 = b * 2, t1 = Math.min(seconds, t0 + 2);
+        for (const f of chord) {
+          for (const [freq, g] of [[f, 0.13], [f * 1.004, 0.07]]) {
+            const o = ctx.createOscillator(); o.type = 'sine'; o.frequency.value = freq;
+            const gn = ctx.createGain(); gn.gain.value = g;
+            o.connect(gn); gn.connect(master); o.start(t0); o.stop(t1);
+          }
+        }
+        for (let s = 0; s < 4; s++) {
+          const t = t0 + s * 0.5; if (t >= seconds) break;
+          const note = chord[s % chord.length] * 2;
+          const o = ctx.createOscillator(); o.type = 'sine'; o.frequency.value = note;
+          const gn = ctx.createGain();
+          gn.gain.setValueAtTime(0.18, t);
+          gn.gain.exponentialRampToValueAtTime(0.001, Math.min(seconds, t + 0.5));
+          o.connect(gn); gn.connect(master); o.start(t); o.stop(Math.min(seconds, t + 0.5));
+        }
+      }
+      // 空气感噪声：种子与旧同步版同一 LCG（seed 是 16 进制 hash 字符串时 >>> 0 得 0 → 1，与旧行为一致）
+      let st = seed >>> 0 || 1;
+      const rnd = () => ((st = (st * 1664525 + 1013904223) >>> 0) / 4294967296);
+      const nbuf = ctx.createBuffer(1, sr, sr);
+      const ch = nbuf.getChannelData(0);
+      for (let i = 0; i < sr; i++) ch[i] = (rnd() - 0.5) * 2;
+      const ns = ctx.createBufferSource(); ns.buffer = nbuf; ns.loop = true;
+      const ng = ctx.createGain(); ng.gain.value = 0.003;
+      ns.connect(ng); ng.connect(master); ns.start(0); ns.stop(seconds);
+      const rendered = await ctx.startRendering();
+      const blob = encodeWav(rendered.getChannelData(0), sr);
+      if (demoBlobCache.size > 8) demoBlobCache.delete(demoBlobCache.keys().next().value);
+      return blob;
+    })().catch(() => null);
+    demoBlobCache.set(key, p);
+    return p;
+  }
+  // 旧同步实现（OfflineAudioContext 不可用时的回退）：返回值由 blob URL 改为 Float32Array，WAV 打包抽到 encodeWav。
+  function makeDemoTrackSync(seconds = 40, seed = 1) {
     const sr = 22050;
     const n = Math.floor(sr * seconds);
     const buf = new Float32Array(n);
@@ -200,18 +267,17 @@ const Player = (() => {
       buf[i] = Math.max(-1, Math.min(1, v));
     }
 
-    // 打包成 16-bit PCM WAV
-    const bytes = n * 2;
-    const ab = new ArrayBuffer(44 + bytes);
-    const dv = new DataView(ab);
-    const wr = (o, str) => { for (let i = 0; i < str.length; i++) dv.setUint8(o + i, str.charCodeAt(i)); };
-    wr(0, 'RIFF'); dv.setUint32(4, 36 + bytes, true); wr(8, 'WAVE');
-    wr(12, 'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
-    dv.setUint32(24, sr, true); dv.setUint32(28, sr * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
-    wr(36, 'data'); dv.setUint32(40, bytes, true);
-    for (let i = 0; i < n; i++) dv.setInt16(44 + i * 2, buf[i] * 32767, true);
-
-    return URL.createObjectURL(new Blob([ab], { type: 'audio/wav' }));
+    return buf;
+  }
+  // 对外签名由同步改异步：唯一调用点 fetchTrackUrl 已是 async，改一行 await 即可。
+  async function makeDemoTrack(seconds = 40, seed = 1) {
+    try {
+      if (typeof OfflineAudioContext !== 'undefined') {
+        const blob = await makeDemoTrackBlob(seconds, seed);
+        if (blob) return URL.createObjectURL(blob);
+      }
+    } catch { /* 回退同步版 */ }
+    return URL.createObjectURL(encodeWav(makeDemoTrackSync(seconds, seed), 22050));
   }
 
   /* ------------------------------------------------------------------ *
@@ -871,7 +937,7 @@ const Player = (() => {
 
     if (!url) {
       demo = true;
-      url = makeDemoTrack(40, track.id);
+      url = await makeDemoTrack(40, track.id);
       postDiagAudio(`取链均失败，走演示音：source=${src} id=${track.id ?? track.mid ?? track.hash ?? ''} reason=${reason || 'unavailable'} via=演示音`);
     }
     return { url, demo, reason, preview, clipStartMs, lxQuality, via: demo ? 'demo' : via };
@@ -1113,6 +1179,9 @@ const Player = (() => {
     if (autoplay) {
       try {
         await audio.play();
+        // 第 10 轮诊断：audio.play() 已 resolve，记下这首走的是哪一档。
+        // 真机崩溃后看 /api/diag/search，能确认崩的那首是 platform 还是 demo。
+        postDiagAudio(`播放开始：source=${track.source || 'netease'} id=${track.id ?? track.mid ?? track.hash ?? ''} via=${data.via} demo=${data.demo}`);
         // 音频上下文要等用户手势后才能跑，放歌时顺手续上
         Beat.resume();
         Beat.start();

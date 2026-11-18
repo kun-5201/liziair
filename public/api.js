@@ -151,6 +151,8 @@ const API = (() => {
        （Web Audio 取频谱用），直接挂 CDN 地址会被 CORS 拦成 net::ERR_FAILED。 */
     neteaseAudio: (u) => proxyAudioUrl('api/netease/audio', u),
     lyric: (id) => call('lyric', { id }),
+    /** 网易每日签到（第 11 轮 kun 对齐：后端 /api/daily/signin，weapi /point/dailyTask type 0+1；未登录回 {code:301, loggedIn:false}）。暂无界面入口，先把调用接好。 */
+    dailySignin: () => call('daily/signin', {}),
     search: (s, limit = 30) => call('search', { s, limit }),
     personalized: () => call('personalized'),
     /** 网易云「每日推荐」歌曲（和桌面大厅同一条路）；未登录时上游回空，调用方自己降级 */
@@ -207,7 +209,13 @@ const API = (() => {
     /** Spotify 骨架：PKCE 授权地址（没有 client_id 时服务端会回 { code:400, error } ） */
     srcLoginUrl: (src) => callSoft(`${src}/login/url`),
 
-    srcSearch: (src, s, limit = 20) => call(`${src}/search`, { s, limit }, 'GET'),
+    /* 搜索只走平台接口：落雪（LX）不参与搜索。LX 只作播放兜底（见 lxSongUrl）。
+       搜索入口（app.js searchOne / m.js searchTracks）只传 SEARCH_SOURCES /
+       PLATS 里的 5 个平台 id；这里再拦一道，免得将来有人把 'lx' 传进来。 */
+    srcSearch: (src, s, limit = 20) => {
+      if (src === 'lx') return Promise.reject(new Error('落雪不参与搜索'));
+      return call(`${src}/search`, { s, limit }, 'GET');
+    },
 
     /* 铺色态的内容（2026-11-06）：各平台能给的推荐 / 歌单都收在这里。
        形状和网易云那套对齐：tracks 是 { id,source,name,artists,... }，playlists 是 { id,name,cover,... } */
@@ -270,9 +278,22 @@ const API = (() => {
 
     srcLyric: (track) => {
       const src = track.source;
-      if (src === 'kugou') return call('kugou/lyric', { hash: track.hash || track.id, s: track.name || '' }, 'GET');
-      if (src === 'spotify') return call('spotify/lyric', { id: track.id }, 'GET');
-      return call(`${src}/lyric`, { id: track.id }, 'GET');
+      /* LRCLIB 兜底要的元数据（第 11 轮）：服务端官方歌词回空时用这些查。
+         artists 可能是数组（[{name}] 或 ['a','b']）也可能是拼好的字符串，
+         照 lxSongUrl 的写法两边都接。duration 各平台归一化后都是毫秒，
+         LRCLIB 要整秒。酷狗原来只传 hash + s，duration 一直是 0，
+         现在顺带补上，它的歌词搜索也能用上。 */
+      const meta = {
+        s: track.name || '',
+        artist: Array.isArray(track.artists)
+          ? track.artists.map((a) => a.name || a).join(' / ')
+          : (track.artists || ''),
+        album: track.album || '',
+        duration: Math.round((track.duration || 0) / 1000),
+      };
+      if (src === 'kugou') return call('kugou/lyric', { hash: track.hash || track.id, ...meta }, 'GET');
+      if (src === 'spotify') return call('spotify/lyric', { id: track.id, ...meta }, 'GET');
+      return call(`${src}/lyric`, { id: track.id, ...meta }, 'GET');
     },
 
     /**

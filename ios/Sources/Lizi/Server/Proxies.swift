@@ -247,6 +247,7 @@ enum Proxies {
                 for k in ["content-length", "content-range"] {
                     if let v = http.value(forHTTPHeaderField: k) { out[k] = v }
                 }
+                DiagLog.shared.recordPlaybackStep("\(source) audio \(http.statusCode) host=\(host) bytes=\(data.count)")
                 return HttpResponse(status: http.statusCode, headers: out, body: data)
             } catch {
                 return .error(502, String(describing: error))
@@ -276,6 +277,7 @@ enum Proxies {
             for k in ["content-length", "content-range"] {
                 if let v = http.value(forHTTPHeaderField: k) { out[k] = v }
             }
+            DiagLog.shared.recordPlaybackStep("\(source) audio \(http.statusCode) host=\(host) bytes=\(data.count)")
             return HttpResponse(status: http.statusCode, headers: out, body: data)
         } catch {
             return .error(502, String(describing: error))

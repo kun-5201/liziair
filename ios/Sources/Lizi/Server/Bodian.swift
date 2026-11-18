@@ -498,6 +498,13 @@ final class BodianService {
 
     // MARK: - 歌词（src/playback.cjs 的 decodeLyrics）
 
+    /// LRCLIB 兜底（第 11 轮）：元数据来自前端 srcLyric 传参。波点没有现成的
+    /// 单曲详情接口，不新写；传参缺歌名时 Lrclib 直接回 nil，不发请求。
+    private func lrclibFallback(req: HttpRequest) async -> (lyric: String, yrc: String)? {
+        await Lrclib.fetch(artist: req.string("artist"), track: req.string("s"),
+                           album: req.string("album"), duration: req.int("duration"))
+    }
+
     /// lyrics：GET mlyric /mobi.s?f=bodian&q=base64(...)&uid=&token=（未签名）；
     /// q 明文 `type=lyric&req=2&lrcx=1&rid={id}&songname=&artist=&corp=kuwo&fromchannel=bodian`；
     /// 响应 result.data.content 先 base64 解码再 decodeLyrics。
@@ -826,9 +833,18 @@ final class BodianService {
                 do {
                     let (mainText, wbw) = try await lyricsOp(id: req.string("id"))
                     let yrc = awlrcToYrc(wbw ?? "")
+                    if mainText.isEmpty && yrc.isEmpty, let fb = await lrclibFallback(req: req) {
+                        return .json(200, ["code": 200, "lyric": fb.lyric, "yrc": "", "tlyric": "",
+                                           "format": "lrc"])
+                    }
                     return .json(200, ["code": 200, "lyric": mainText, "yrc": yrc, "tlyric": "",
                                        "format": !yrc.isEmpty ? "yrc" : (!mainText.isEmpty ? "lrc" : "none")])
                 } catch let e as BodianError {
+                    // 第 11 轮：官方抛错也试一次兜底；兜底失败回原来的 error 形状。
+                    if let fb = await lrclibFallback(req: req) {
+                        return .json(200, ["code": 200, "lyric": fb.lyric, "yrc": "", "tlyric": "",
+                                           "format": "lrc"])
+                    }
                     return .json(200, ["code": 200, "lyric": "", "yrc": "", "tlyric": "", "format": "none",
                                        "error": e.message])
                 }

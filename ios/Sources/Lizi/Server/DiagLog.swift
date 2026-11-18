@@ -44,8 +44,19 @@ final class DiagLog {
         if events.count > 20 { events.removeFirst(events.count - 20) }
     }
 
+    /// 播放链面包屑（第 10 轮）：进程被杀后仍在，下次启动可从 /api/diag/search 看到崩前最后一步。
+    /// 只记步骤与结果（OK/EMPTY/主机名），不记完整直链（LX 直链可能含 key）。
+    func recordPlaybackStep(_ step: String) {
+        lock.lock(); defer { lock.unlock() }
+        var steps = UserDefaults.standard.stringArray(forKey: "lizi.playbackBreadcrumb") ?? []
+        steps.append("\(Int(Date().timeIntervalSince1970)) \(step)")
+        if steps.count > 30 { steps.removeFirst(steps.count - 30) }
+        UserDefaults.standard.set(steps, forKey: "lizi.playbackBreadcrumb")
+    }
+
     func json() -> [String: Any] {
         lock.lock(); defer { lock.unlock() }
-        return ["lastSearch": lastSearch, "requests": requests, "events": events, "logs": logs]
+        return ["lastSearch": lastSearch, "requests": requests, "events": events, "logs": logs,
+                "playbackBreadcrumb": UserDefaults.standard.stringArray(forKey: "lizi.playbackBreadcrumb") ?? []]
     }
 }

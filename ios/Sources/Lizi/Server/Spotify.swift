@@ -309,6 +309,13 @@ final class SpotifyService {
             return .json(200, ["code": 200, "id": req.string("id"), "url": "", "preview": false,
                                "reason": "drm", "error": Self.needAudio])
         case "lyric", "lyrics":
+            // 第 11 轮：Spotify 官方恒空（no-lyrics-api），LRCLIB 兜底在这里是
+            // 首次出词。元数据来自前端 srcLyric 传参；传参缺歌名时直接回原来的空。
+            if let fb = await Lrclib.fetch(artist: req.string("artist"), track: req.string("s"),
+                                           album: req.string("album"), duration: req.int("duration")) {
+                return .json(200, ["code": 200, "lyric": fb.lyric, "yrc": "", "tlyric": "",
+                                   "format": "lrc", "source": "lrclib"])
+            }
             return .json(200, ["code": 200, "lyric": "", "format": "none", "reason": "no-lyrics-api"])
         case "audio":
             return .json(200, ["code": 200, "url": "", "reason": "drm",

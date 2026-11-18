@@ -70,10 +70,15 @@ final class KugouService {
     /// 设备身份：guid（32 位 hex，删了等于换设备）+ dev 名 + mac，持久化。
     private struct Device { var guid: String; var dev: String; var mac: String; var mid: String }
     private var deviceCache: Device?
+    /// deviceCache 读写锁（第 10 轮）：device() 曾无同步，song/url 与 lyric 并发请求时
+    /// 存在 ARC 竞态；锁顺序单向（deviceLock → SessionStore 锁，无回拿），无死锁。
+    private let deviceLock = NSLock()
     /// 官方二维码图地址（key → 含 appid 的完整地址），最多 64 张，对标 start.mjs 的内存 Map。
     private var qrImages: [String: String] = [:]
 
     private func device() -> Device {
+        deviceLock.lock()
+        defer { deviceLock.unlock() }
         if let d = deviceCache { return d }
         let saved = session.sidecarAuth("kugou-device")
         let guid: String
@@ -722,6 +727,7 @@ extension KugouService {
         }
         let upstream = pick.upstream ?? ""
         let needLogin = upstream.range(of: "20028|需要验证|check r failed", options: .regularExpression) != nil
+        DiagLog.shared.recordPlaybackStep("kugou song/url hash=\(hash.prefix(8)) url=\(pick.url.isEmpty ? "EMPTY" : "OK") upstream=\(upstream)")
         return .json(200, ["code": 200, "hash": hash, "url": pick.url, "preview": pick.preview,
                             "quality": pick.preview ? "preview" : quality,
                             "reason": pick.url.isEmpty ? (needLogin ? "login" : "unavailable") : NSNull(),
@@ -796,6 +802,14 @@ extension KugouService {
         return nil
     }
 
+    /// LRCLIB 兜底（第 11 轮）：官方无候选/空内容/异常时，用前端 srcLyric 传来的
+    /// 元数据（s/artist/album/duration）查一次。成功回 syncedLyrics，失败回
+    /// nil，调用方保持原来的空返回——不把兜底失败伪装成别的东西。
+    private func lrclibFallback(req: HttpRequest) async -> (lyric: String, yrc: String)? {
+        await Lrclib.fetch(artist: req.string("artist"), track: req.string("s"),
+                           album: req.string("album"), duration: req.int("duration"))
+    }
+
     private func lyric(req: HttpRequest) async -> HttpResponse {
         let hash = req.string("hash").isEmpty ? req.string("id") : req.string("hash")
         let keyword = req.string("s")
@@ -825,6 +839,13 @@ extension KugouService {
                 DiagLog.shared.recordLog(category: "lyric",
                     message: "kugou lyric no candidate hash=\(hash.prefix(8)) s=\(keyword) candidates=\(candidates.count)",
                     fields: ["host": "lyrics.kugou.com", "reason": "lyric-no-candidate"])
+                DiagLog.shared.recordPlaybackStep("kugou lyric-no-candidate hash=\(hash.prefix(8))")
+                // 第 11 轮：官方无候选，走 LRCLIB 兜底；兜底也空才回 none。
+                if let fb = await lrclibFallback(req: req) {
+                    DiagLog.shared.recordPlaybackStep("kugou lyric-lrclib-ok hash=\(hash.prefix(8))")
+                    return .json(200, ["code": 200, "lyric": fb.lyric, "yrc": "", "tlyric": "",
+                                        "format": "lrc"])
+                }
                 return .json(200, ["code": 200, "lyric": "", "yrc": "", "tlyric": "", "format": "none"])
             }
             let lr = try await kgRequest(baseURL: Self.lyricsBase, path: "/download", method: "GET",
@@ -838,6 +859,13 @@ extension KugouService {
                 DiagLog.shared.recordLog(category: "lyric",
                     message: "kugou lyric empty content id=\(scStr(hit, "id"))",
                     fields: ["host": "lyrics.kugou.com", "reason": "lyric-empty-content"])
+                DiagLog.shared.recordPlaybackStep("kugou lyric-empty-content id=\(scStr(hit, "id"))")
+                // 第 11 轮：官方空内容，走 LRCLIB 兜底；兜底也空才回 none。
+                if let fb = await lrclibFallback(req: req) {
+                    DiagLog.shared.recordPlaybackStep("kugou lyric-lrclib-ok hash=\(hash.prefix(8))")
+                    return .json(200, ["code": 200, "lyric": fb.lyric, "yrc": "", "tlyric": "",
+                                        "format": "lrc"])
+                }
                 return .json(200, ["code": 200, "lyric": "", "yrc": "", "tlyric": "", "format": "none"])
             }
             let decoded: String
@@ -855,18 +883,34 @@ extension KugouService {
                 DiagLog.shared.recordLog(category: "lyric",
                     message: "kugou lyric ok format=\(yrc.isEmpty ? "lrc" : "yrc") lrcChars=\(lrc.count) yrcChars=\(yrc.count)",
                     fields: ["host": "lyrics.kugou.com", "reason": "lyric-ok"])
+                DiagLog.shared.recordPlaybackStep("kugou lyric-ok format=\(yrc.isEmpty ? "lrc" : "yrc")")
                 return .json(200, ["code": 200, "lyric": lrc, "yrc": yrc, "tlyric": "",
                                     "format": yrc.isEmpty ? "lrc" : "yrc"])
+            }
+            // 第 11 轮：解码后是空串（等价于官方空内容），先走兜底，别记 lyric-ok。
+            if decoded.isEmpty, let fb = await lrclibFallback(req: req) {
+                DiagLog.shared.recordPlaybackStep("kugou lyric-lrclib-ok hash=\(hash.prefix(8))")
+                return .json(200, ["code": 200, "lyric": fb.lyric, "yrc": "", "tlyric": "",
+                                    "format": "lrc"])
             }
             DiagLog.shared.recordLog(category: "lyric",
                 message: "kugou lyric ok format=lrc decodedChars=\(decoded.count)",
                 fields: ["host": "lyrics.kugou.com", "reason": "lyric-ok"])
+            DiagLog.shared.recordPlaybackStep("kugou lyric-ok format=lrc")
             return .json(200, ["code": 200, "lyric": decoded, "yrc": "", "tlyric": "",
                                 "format": decoded.isEmpty ? "none" : "lrc"])
         } catch {
             DiagLog.shared.recordLog(category: "lyric",
                 message: "kugou lyric failed: \((error as? KugouError)?.message ?? "酷狗歌词失败")",
                 fields: ["host": "lyrics.kugou.com", "reason": "lyric-error"])
+            // 第 11 轮：官方异常也试一次兜底（LRCLIB 是另一个 host，酷狗挂了它
+            // 未必挂）。官方异常日志上面已经记了，这里只记兜底命中，不把
+            // 官方异常伪装成兜底成功；兜底也失败时回原来的 error 形状。
+            if let fb = await lrclibFallback(req: req) {
+                DiagLog.shared.recordPlaybackStep("kugou lyric-lrclib-ok-after-error hash=\(hash.prefix(8))")
+                return .json(200, ["code": 200, "lyric": fb.lyric, "yrc": "", "tlyric": "",
+                                    "format": "lrc"])
+            }
             return .json(200, ["code": 200, "lyric": "", "yrc": "", "tlyric": "", "format": "none",
                                 "error": (error as? KugouError)?.message ?? "酷狗歌词失败"])
         }

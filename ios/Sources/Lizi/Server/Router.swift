@@ -65,6 +65,12 @@ final class LiziRouter {
                               "via": "custom"])
         }
         if path == "/api/lx/audio" { return await Proxies.proxySourceAudio(req, source: "lx") }
+        // 搜索不走落雪（第 10 轮）：/api/lx/search 不存在也不应存在。显式拦在这里，别让它
+        // 掉进底部的通用 /api/ 转发（NetEase handleApi 也会回 404，但文案会误导
+        // 成是网易云接口缺失）。播放兜底的 /api/lx/song/url 与 /api/lx/audio 不动。
+        if path == "/api/lx/search" {
+            return .json(404, ["error": "lx does not provide search"])
+        }
 
         // ---- 自定义源管理（设置 → 自定义源管理；见 LXSources.swift）----
         // 失败一律回 200 + { code:400, error }（不回 HTTP 400），前端 api.js 的

@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>LIZI</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -915,6 +915,20 @@ python -c "from pedalboard import load_plugin; p=load_plugin(r'C:\Program Files\
         <span class="setpage__label">导入音频文件</span>
         <span class="setpage__val" id="set-local-count">未导入</span>
         <button class="setpage__act" id="set-local-import" type="button">导入</button>
+      </div>
+      <!-- 2026-11-18 第 11 轮：首页「本地音乐」区块开关（默认开）。关掉后首页整块
+           消失、不留占位；只管显示/隐藏，不管导入。接线在 app.js（setLocalShow，
+           照「大厅内容轨」那套：localStorage['lizi.local.show'] + 当场重画）。 -->
+      <div class="setpage__row setpage__row--switch">
+        <span class="setpage__label-group">
+          <span class="setpage__label">在首页显示</span>
+          <span class="setpage__hint" id="set-local-show-hint">关闭后首页不再显示「本地音乐」区块；导入功能不受影响</span>
+        </span>
+        <button class="setpage__switch" id="set-local-show" type="button"
+                role="switch" aria-checked="true" aria-label="在首页显示本地音乐"
+                aria-describedby="set-local-show-hint">
+          <span class="setpage__switch-knob" aria-hidden="true"></span>
+        </button>
       </div>
       </section>
 

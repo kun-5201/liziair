@@ -2369,16 +2369,43 @@ extension QQService {
         return []
     }
 
+    /// LRCLIB 兜底（第 11 轮）：只在官方回空的兜底路径上查一次现成的
+    /// songDetail（get_song_detail_yqq，resolvePlayUrl/previewUrl 已在用，
+    /// 不新写接口），拿歌名/歌手/专辑/时长走 LRCLIB。
+    private func qqLrclibFallback(mid: String) async -> (lyric: String, yrc: String)? {
+        guard let detail = await songDetail(mid: mid), let t = qqTrack(detail) else { return nil }
+        let name = t["name"] as? String ?? ""
+        guard !name.isEmpty else { return nil }
+        return await Lrclib.fetch(artist: t["artists"] as? String ?? "", track: name,
+                                  album: t["album"] as? String ?? "",
+                                  duration: (t["duration"] as? Int ?? 0) / 1000)
+    }
+
     private func lyric(req: HttpRequest) async throws -> HttpResponse {
         let mid = req.string("mid").isEmpty ? req.string("id") : req.string("mid")
         guard !mid.isEmpty else { return .json(400, ["code": 400, "error": "mid required"]) }
-        let data = try await cgi(path: "/lyric/fcgi-bin/fcg_query_lyric_new.fcg",
+        let data: [String: Any]
+        do {
+            data = try await cgi(path: "/lyric/fcgi-bin/fcg_query_lyric_new.fcg",
                                  params: ["songmid": mid,
                                           "pcachetime": String(Int(Date().timeIntervalSince1970 * 1000))])
+        } catch {
+            // 上游抛错也试一次兜底（LRCLIB 是另一个 host）；兜底失败再原样抛，
+            // handle 回 502，不改变原来的失败面。
+            if let fb = await qqLrclibFallback(mid: mid) {
+                return .json(200, ["code": 200, "lyric": fb.lyric, "tlyric": "", "yrc": "",
+                                    "format": "lrc"])
+            }
+            throw error
+        }
         let lyricText = Data(base64Encoded: scStr(data, "lyric"))
             .flatMap { String(data: $0, encoding: .utf8) } ?? ""
         let tlyricText = Data(base64Encoded: scStr(data, "trans"))
             .flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        if lyricText.isEmpty, let fb = await qqLrclibFallback(mid: mid) {
+            return .json(200, ["code": 200, "lyric": fb.lyric, "tlyric": "", "yrc": "",
+                                "format": "lrc"])
+        }
         return .json(200, ["code": 200, "lyric": lyricText, "tlyric": tlyricText, "yrc": "",
                             "format": lyricText.isEmpty ? "none" : "lrc"])
     }
