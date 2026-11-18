@@ -169,6 +169,10 @@ final class NetEaseService {
         "logout": Route(path: "/logout", channel: "weapi"),
         "user/playlist": Route(path: "/user/playlist", channel: "weapi"),
         "user/detail": Route(path: "/v1/user/detail/:uid", channel: "weapi"),
+        // 我的云盘（第 7 轮第 8 件）：上游 NeteaseCloudMusicApi /user/cloud
+        // 就是 POST /weapi/v1/cloud/get {limit, offset}，登录态走 MUSIC_U。
+        // 未登录时上游回 301，前端云盘腿直接跳过这一档。
+        "user/cloud": Route(path: "/v1/cloud/get", channel: "weapi"),
         "playlist/detail": Route(path: "/v6/playlist/detail", channel: "weapi"),
         "playlist/track/all": Route(path: "/v6/playlist/detail", channel: "weapi"),
         "song/url": Route(path: "/song/enhance/player/url/v1", channel: "weapi"),
@@ -424,6 +428,8 @@ extension NetEaseService {
             p = ["songId": int(p, "id")]
         case "user/playlist":
             p = ["uid": int(p, "uid"), "limit": 1000, "offset": 0, "includeVideo": true]
+        case "user/cloud":
+            p = ["limit": intOr(p, "limit", 200), "offset": intOr(p, "offset", 0)]
         case "user/detail":
             p = ["uid": int(p, "uid") != 0 ? int(p, "uid") : int(p, "userId")]
         case "search":
@@ -515,6 +521,28 @@ extension NetEaseService {
                  "specialType": (p["specialType"] as? NSNumber)?.intValue ?? 0]
             }
             return ["code": code, "playlists": lists]
+        case "user/cloud":
+            // 上游 /v1/cloud/get 的 data 项：songId / songName / artist / album /
+            // fileSize / fileName / addTime。artist 可能是字符串也可能是对象数组，
+            // 都归一化成字符串，前端按 songId 或「歌名 + 歌手」匹配。
+            let songs = arr(data, "data").map { c -> [String: Any] in
+                let artists: String
+                if let a = c["artist"] as? String { artists = a }
+                else if let list = c["artists"] as? [[String: Any]] {
+                    artists = list.compactMap { $0["name"] as? String }.joined(separator: " / ")
+                } else if let a = c["artists"] as? String { artists = a }
+                else { artists = "" }
+                return [
+                    "songId": c["songId"] as Any,
+                    "name": str(c, "songName").isEmpty ? str(c, "name") : str(c, "songName"),
+                    "artists": artists,
+                    "album": str(c, "album").isEmpty ? str(c, "albumName") : str(c, "album"),
+                    "fileSize": c["fileSize"] as Any,
+                    "fileName": str(c, "fileName"),
+                ]
+            }
+            return ["code": code, "count": intOr(data, "count", songs.count),
+                    "hasMore": data["hasMore"] as? Bool ?? false, "songs": songs]
         case "user/detail":
             let p = dict(data, "profile")
             return [

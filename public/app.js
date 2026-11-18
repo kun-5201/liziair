@@ -3292,6 +3292,8 @@
     let timer = 0;
     let checking = false;      // 上一轮还没回来就跳过这一轮，避免并发轮询
     let starting = false;      // 拿码请求在飞时再点「登录/换一张」直接忽略，别起第二个会话
+    let keyCtl = null;         // 在飞的拿码请求的 AbortController：关面板时 abort，别让它跑完复活会话
+    let imgErrTries = 0;       // 二维码图片加载失败的重试次数：最多再试 2 次，图好了 onload 清零
     let refreshing = 0;        // 连续过期次数：连换 3 次就停手，别把上游惹毛
     let autoTries = 0;         // 过期自动换码时撞上 15s 冷却，最多再等 3 轮
     let channel = 'qqmusic';
@@ -3326,6 +3328,7 @@
     /** 关掉设置面板就收二维码、停轮询（不然收起来之后还在后台打接口） */
     function pause() {
       stop();
+      if (keyCtl) { keyCtl.abort(); keyCtl = null; }   // 在飞的拿码请求也停掉，别让它跑完复活会话
       if (key) { const oldKey = key; key = ''; API.qqQrCancel(oldKey).catch(() => {}); }
       wrap.hidden = true;
       paint();
@@ -3372,8 +3375,11 @@
 
       let d = null;
       try {
-        d = await API.qqQrKey(channel);
+        if (keyCtl) keyCtl.abort();                    // 旧的拿码请求不要了（换一张/重进都先停旧的）
+        keyCtl = new AbortController();
+        d = await API.qqQrKey(channel, keyCtl.signal);
       } catch (e) {
+        if (e && e.name === 'AbortError') { starting = false; return; }  // 关面板/换一张时 abort 的，静默
         box.innerHTML = '<span>边车没起来</span>';
         status.textContent = '启动失败：' + e.message;
         status.className = 'qq-qr__status is-error';
@@ -3405,8 +3411,13 @@
       key = d.key;
       const img = new Image();
       img.alt = 'QQ 音乐登录二维码';
-      img.onload = () => { box.innerHTML = ''; box.appendChild(img); };
-      img.onerror = () => { box.innerHTML = '<span>二维码图片加载失败</span>'; };
+      img.onload = () => { imgErrTries = 0; box.innerHTML = ''; box.appendChild(img); };
+      img.onerror = () => {
+        diagLog('qq', '二维码图片加载失败');
+        box.innerHTML = '<span>二维码图片加载失败</span>';
+        // 图坏了就换一张码再试（和 800 过期路径一致），最多 2 次，图好了 onload 清零。
+        if (imgErrTries < 2 && !logged) { imgErrTries++; setTimeout(() => { if (!logged) startQr(true); }, 600); }
+      };
       img.src = d.qrimg;                         // data:image/png;base64,...
       status.textContent = CH_LABEL[channel] || CH_LABEL.qqmusic;
       timer = setInterval(check, 2000);
@@ -4142,6 +4153,7 @@
     paintPlatAvatarSwitch(); // 「平台头像」同理：默认关，别的标签页改过也能对上
     paintPlatColorSwitch();  // 「用平台颜色铺色」默认关，别的标签页改过也能对上
     paintHallRailSwitch();   // 「大厅内容轨」默认开，别的标签页改过也能对上
+    paintPlatformsRow();     // 「平台管理」右值（全部 N 个 / 已选 N 个）同理
     setupSettingsConsole();  // 控制台导航 / 观察器（幂等）
     setActiveSection('set-sec-account', false);
     /* 「跟随平台」的色盘初值取决于**当前大厅平台**，而平台可能在设置页关着的
@@ -4767,6 +4779,59 @@
     if (i && i.focus) i.focus();
   }
   mebgRow.addEventListener('click', () => mebgOpen(!!mebgPanel.hidden));
+
+  /* ---- 平台管理（#row-platforms → #plat-panel）----
+     2026-11-18 第 7 轮：这行之前点不动 —— 全仓库没有任何 JS 引用 #row-platforms，
+     注释说的 onboard-intro/intro.js 根本不存在，目标面板也不存在；而且
+     PLAT_LOGO / PLATS_KEY / platIdsSelected 都在 Hall 闭包里，外层设置页代码
+     根本够不到（直接引用会 ReferenceError），所以读写走 Hall.platIds /
+     Hall.platTotal / Hall.platSave（挂在 Hall 返回对象上，见 platColor 旁边）。
+     修复：照 #row-mebg / #mebg-panel 同一套行内展开模式，点行就展开多选面板；
+     勾选只改 localStorage['lizi.platforms.v1']（没存 = 全部；全选 = 删键），
+     改完发 lizi:platforms 让大厅就地重画「我的」和顶部平台条（refreshPlatformUI
+     已在监听），不碰登录、播放、音频。
+     至少保留一个：全取消在现有语义下等于全部显示，为避免面板状态和实际显示
+     对不上，取消最后一格时把那格勾回来。 */
+  function platCheckedIds() {
+    return [...document.querySelectorAll('#plat-list input[type="checkbox"][data-plat]')]
+      .filter((c) => c.checked).map((c) => c.dataset.plat);
+  }
+  function paintPlatformsRow() {
+    let ids = null, total = 5;
+    try { ids = Hall.platIds(); total = Hall.platTotal(); } catch { /* 大厅还没挂载 */ }
+    const t = $('set-platforms');
+    if (t && t.textContent !== undefined) t.textContent = ids ? `已选 ${ids.length} 个` : `全部 ${total} 个`;
+    document.querySelectorAll('#plat-list input[type="checkbox"][data-plat]').forEach((c) => {
+      c.checked = !ids || ids.includes(c.dataset.plat);
+    });
+  }
+  function platOpen(on) {
+    const panel = $('plat-panel'), row = $('row-platforms');
+    if (panel) panel.hidden = !on;
+    if (row && row.setAttribute) row.setAttribute('aria-expanded', String(!!on));
+    if (on) paintPlatformsRow();
+  }
+  function platSave() {
+    try { Hall.platSave(platCheckedIds()); } catch { /* 大厅还没挂载 */ }
+    paintPlatformsRow();
+  }
+  $('row-platforms').addEventListener('click', () => platOpen(!!$('plat-panel').hidden));
+  $('plat-list').addEventListener('change', (e) => {
+    const box = e.target && e.target.closest ? e.target.closest('input[data-plat]') : null;
+    if (!box) return;
+    /* 刚取消的是最后一格：勾回来，至少留一个（全取消按旧语义 = 全部显示，
+       面板却显示全不勾，对不上）。 */
+    if (!box.checked && !document.querySelector('#plat-list input[type="checkbox"]:checked')) {
+      box.checked = true;
+      return;
+    }
+    platSave();
+  });
+  $('plat-all').addEventListener('click', () => {
+    document.querySelectorAll('#plat-list input[type="checkbox"]').forEach((c) => { c.checked = true; });
+    platSave();
+  });
+  $('plat-done').addEventListener('click', () => platOpen(false));
   /** 地址 / 文件二选一：视频前缀或视频扩展名 → video，其它都当图片 */
   function mebgKindOf(u) {
     return /^data:video\//i.test(u) || /\.(mp4|webm|ogv|m4v|mov)(?:[?#]|$)/i.test(u) ? 'video' : 'image';
@@ -5849,8 +5914,11 @@
 
   function applyStage(id, fromHall) {
     /* 记来源：形态长廊面传 true，舞台操作条的返回键据此决定回大厅还是回播放器；
-       其余入口（播放器里的形态菜单 / 整页画廊）不传，保持原路回播放器。 */
-    stageFromHall = !!fromHall;
+       其余入口（播放器里的形态菜单 / 整页画廊）不传，保持原路回播放器。
+       但切形态（已在舞台里）不传 fromHall 时要保留来源——否则从大厅进来
+       切一次形态，stageFromHall 就被清掉，返回键回播放页不回大厅
+       （第 7 轮第 1 件复现 D 路径实测）。 */
+    if (fromHall !== undefined || view !== 'stage') stageFromHall = !!fromHall;
     const s = StageHost.load(id);
     if (menuVal) menuVal.textContent = s.name;
     markCurrent(s.id);
@@ -8127,7 +8195,7 @@
     }
 
     /* ================== 平台筛选（lizi.platforms.v1） ==================
-       开场多选 / 设置「平台管理」写入数组；没存过 = 全部 7 个（老用户不丢卡片）。
+       开场多选 / 设置「平台管理」写入数组；没存过 = 全部 5 个（老用户不丢卡片）。
        只影响「我的」方块和铺色态顶部平台条，不碰登录、播放、音频。 */
     const PLATS_KEY = 'lizi.platforms.v1';
 
@@ -8143,7 +8211,7 @@
     }
 
     /* 极端兜底：账号列表还没到、或当前 rows 里一个都匹配不上时，不能让大厅
-       变成空网格。这里用平台 logo 表补出 7 个未登录行。 */
+       变成空网格。这里用平台 logo 表补出 5 个未登录行。 */
     function platFallbackRows() {
       const acc = Array.isArray(window.LIZI_ACCOUNTS) ? window.LIZI_ACCOUNTS : [];
       return Object.keys(PLAT_LOGO).map((id) => {
@@ -11887,15 +11955,28 @@
       } catch { /* 服务端没起来 / 老版本：当作空列表 */ }
       localLoading = false;
       /* 内部统一用字符串 artists（artistLinks / document.title 都按字符串拼）；
-         API 给的是数组，元数据里有歌手就拼出来，没有就标「本地音乐」。 */
-      localTracks = tracks.map((t) => ({
-        id: t.id,
-        source: 'local',
-        name: t.name || '',
-        artists: (t.artists && t.artists.length ? t.artists.join(' / ') : '本地音乐'),
-        duration: t.duration || 0,
-        size: t.size || 0,
-      }));
+         /api/local/list 给的是数组，元数据里有歌手就拼出来，没有就标「本地音乐」。
+         逐条容错（2026-11-18）：一条脏数据绝不能把整块本地音乐拖空白——
+         实测 artists 不是数组（字符串）时旧写法在 .join 上抛错，#hall-local
+         一直留空，首页上这块只剩 32px 空条、看起来就是「区块不见了」。
+         脏条目直接跳过；全坏 / 全空都画空态 + 导入按钮，永不留白。 */
+      localTracks = [];
+      for (const t of tracks) {
+        try {
+          if (!t || typeof t !== 'object') continue;
+          const artists = Array.isArray(t.artists)
+            ? t.artists.filter((a) => typeof a === 'string' && a).join(' / ')
+            : (typeof t.artists === 'string' ? t.artists.trim() : '');
+          localTracks.push({
+            id: t.id,
+            source: 'local',
+            name: t.name || '',
+            artists: artists || '本地音乐',
+            duration: Number(t.duration) || 0,
+            size: Number(t.size) || 0,
+          });
+        } catch { /* 单条脏数据跳过，不影响其它行和整个区块 */ }
+      }
       const n = localTracks.length;
       const head = `<div class="hall-cell__h"><b>本地音乐</b><span>${n ? n + ' 首' : '文件 App 导入'}</span></div>`;
       if (!n) {
@@ -12588,6 +12669,21 @@
       setMarqSpeed(v) { marqSpeedPx = marqSpeedOf(v); },
       /** 平台品牌底色：设置页平台行的小色块复用大厅这套 PLAT_BG，别另抄 hex */
       platColor(id) { const b = PLAT_BG[id]; return b ? b.bg : ''; },
+      /** 设置页「平台管理」：读 / 写 lizi.platforms.v1（platIdsSelected 那套语义：
+          没存 = 全部；全选 = 删键），写完发 lizi:platforms 让大厅就地重画。
+          外层设置页代码够不到 Hall 闭包里的 PLAT_LOGO / PLATS_KEY，只能走这里；
+          之前没有任何写入口，所以那行点了也没反应。 */
+      platIds() { return platIdsSelected(); },
+      platTotal() { return Object.keys(PLAT_LOGO).length; },
+      platSave(ids) {
+        const all = Object.keys(PLAT_LOGO);
+        const list = (Array.isArray(ids) ? ids : []).filter((id) => !!PLAT_LOGO[id]);
+        try {
+          if (list.length >= all.length) localStorage.removeItem(PLATS_KEY);
+          else localStorage.setItem(PLATS_KEY, JSON.stringify(list));
+        } catch { /* 写不进去只影响下次启动 */ }
+        window.dispatchEvent(new CustomEvent('lizi:platforms'));
+      },
       /** 设置页切换「大厅内容轨」：立刻重画左上角 + 跑马带，不重进大厅。
           新旧模式都回到每日推荐（旧模式左上角恢复平台名）。 */
       refreshRailMode() {

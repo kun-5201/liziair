@@ -695,8 +695,12 @@ extension KugouService {
             "clientver": 11430,
         ]
         do {
+            // 注意：上游 song_url.js 写的是 notSign: true，但 request.js 只认
+            // notSignature，所以上游实际是带 android 签名的（key 也进签名集）。
+            // 这里绝不能加 notSignature: true——不带签名上游回 errcode 20006
+            // "err signature"，平台取址直接断（2026-11-18 实测）。
             let resp = try await kgRequest(path: "/v5/url", method: "GET", params: params,
-                                           encryptType: "android", encryptKey: true, notSignature: true,
+                                           encryptType: "android", encryptKey: true,
                                            extraHeaders: ["x-router": "trackercdn.kugou.com"],
                                            jarOverride: jarOverride)
             return kgUrlOf(resp.json ?? [:])
@@ -799,13 +803,17 @@ extension KugouService {
             return .json(400, ["code": 400, "error": "hash or s required"])
         }
         do {
+            // 注意：上游 search_lyric.js 写的是 notSign: true，但 request.js 只认
+            // notSignature，所以上游实际是带 android 签名的。这里绝不能加
+            // notSignature: true——不带签名 lyrics.kugou.com 回 200 空体
+            // （2026-11-18 实测：无签名 len 0，有签名 3480 字节正常出候选）。
             let sr = try await kgRequest(baseURL: Self.lyricsBase, path: "/v1/search", method: "GET",
                                          params: ["album_audio_id": req.int("album_audio_id", 0),
                                                   "appid": Self.appid, "clientver": Self.clientver,
                                                   "duration": req.int("duration", 0), "hash": hash,
                                                   "keyword": keyword.isEmpty ? hash : keyword,
                                                   "lrctxt": 1, "man": "no"],
-                                         encryptType: "android", notSignature: true, clearDefaultParams: true)
+                                         encryptType: "android", clearDefaultParams: true)
             let sBody = sr.json ?? [:]
             let candidates = (sBody["candidates"] as? [[String: Any]])
                 ?? ((sBody["data"] as? [String: Any])?["candidates"] as? [[String: Any]]) ?? []

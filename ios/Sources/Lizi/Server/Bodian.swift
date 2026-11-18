@@ -221,12 +221,15 @@ final class BodianService {
     }
 
     /// login_qr_create：二维码内容为波点登录页地址，用 scQRCodeDataURL 生成。
+    /// 前端（app.js 两处取码流程）只读 c.qrimg，必须同时给 qrimg 和 imageUrl，只给 imageUrl
+    /// 时前端判 `!c.qrimg` 直接抛「二维码生成失败」。
     private func loginQrCreate(key: String) throws -> [String: Any] {
         guard let exp = qrSessions[key], Date() < exp else {
             throw BodianError(code: "auth-required", message: "二维码已过期，请重新获取", upstreamCode: nil)
         }
         let content = "https://bodian-oia.kuwo.cn/bodian/download.html?pageName=login_pc&pt=3&id=\(key)"
-        return ["imageUrl": scQRCodeDataURL(content)]
+        let img = scQRCodeDataURL(content)
+        return ["qrimg": img, "imageUrl": img]
     }
 
     /// login_qr_check：GET /api/ucenter/login/qrCodeStatus（qrCode={key}）；

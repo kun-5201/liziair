@@ -38,6 +38,7 @@ const Player = (() => {
     queue: [],        // 当前曲目数组
     index: -1,        // 当前下标
     playing: false,
+    fallbackRetried: false, // 取址后地址是死的时，只按优先级往下一档重试一次
     mode: 'order',    // order | single | shuffle
     lyric: [],        // [{ t, text, tr }]
     lyricIndex: -1,
@@ -783,8 +784,8 @@ const Player = (() => {
     let preview = false;
     let lxQuality = '';
     let clipStartMs = 0;
-    // via：这条地址从哪来（lx / platform / local / demo）。播放器拿它决定：
-    // LX 地址进播放器才失败时，改走平台备用再试一次；平台地址失败就不再兜圈。
+    // via：这条地址从哪来（platform / cloud / lx / local / demo）。播放器拿它决定：
+    // 地址进了播放器才失败时，按优先级往下一档重试一次；演示音不再兜圈。
     let via = '';
 
     /* 本地文件：地址就是本机 /api/local/file，不走 LX、不走平台接口。 */
@@ -792,29 +793,13 @@ const Player = (() => {
       return { url: API.localFile(track.id), demo: false, reason: '', preview: false, clipStartMs: 0, lxQuality: '', via: 'local' };
     }
 
-    /* 落雪优先：netease / qq / kugou / kuwo 先试 LX 解析（用户自加的自定义源），
-       拿到真地址就直接用；LX 拿不到再走平台接口。lx.quality 是实际拿到的档位，界面按它显示。
-       opts.skipLX：播放中重试时用——LX 地址已证实是死的，直接走平台备用，别再取一次。 */
-    if (!opts.skipLX && (src === 'netease' || src === 'qq' || src === 'kugou' || src === 'kuwo')) {
-      try {
-        const lx = await API.lxSongUrl(track);
-        if (lx && lx.url) {
-          url = API.lxAudio(lx.url);
-          lxQuality = lx.quality || '';
-          reason = '';
-          preview = false;
-          via = 'lx';
-        } else if (lx && lx.code !== 0 && lx.code !== undefined) {
-          // LX 探活结果记诊断：零自定义源时 code=2「全部音源均失败」是常态，
-          // 每首记一条，正好证明 LX 腿跑过且让路给了平台备用。
-          postDiagAudio(`LX 取链失败：source=${src} id=${track.id ?? track.mid ?? track.hash ?? ''} code=${lx.code} ${lx.error || ''}`);
-        }
-      } catch (e) {
-        postDiagAudio(`LX 取链异常：source=${src} id=${track.id ?? track.mid ?? track.hash ?? ''} ${String((e && e.message) || e)}`);
-      }
-    }
-
-    if (!url) try {
+    /* 取链顺序（2026-11-18 第 7 轮第 8 件：平台官方 → 已登录账号的个人云盘 →
+       落雪自定义源兜底 → 演示音；推翻 2026-11-17 的「落雪优先、平台备用」）：
+       平台先试，拿不到才往下走；每一档只在上一档明确拿不到地址时才跑，
+       这样平台有地址的歌绝不会被 LX / 云盘抢走，也不会多花一次请求。
+       opts.skipPlatform / skipCloud / skipLX：播放中重试时用——已证实是死的
+       那一档直接跳过，从下一档开始试。 */
+    if (!opts.skipPlatform) try {
       if (isQQ) {
         /* QQ 给的是 http 的 vkey 直链（会过期、CDN 挑 referer），统一走本机代理；
            没登录/没会员时上游只给试听片段，如实标 preview，不假装能放全曲。 */
@@ -849,24 +834,154 @@ const Player = (() => {
       if (url) via = 'platform';
     } catch { reason = 'network'; }
 
+    /* 个人云盘（只接网易「我的云盘」：QQ / 酷狗 / 酷我没有同等的个人云盘
+       取链口，见 fetchCloudUrl 注释）：平台拿不到地址、且已登录时才试，
+       按歌名 + 歌手在云盘里找这首歌，命中后用云盘 songId 再调一次
+       /song/url 取可播地址。没登录直接跳过，不弹登录、不报错。 */
+    if (!url && !opts.skipCloud && src === 'netease') {
+      const cloud = await fetchCloudUrl(track);
+      if (cloud && cloud.url) {
+        url = cloud.url;
+        via = 'cloud';
+        reason = '';
+      }
+    }
+
+    /* 落雪兜底：netease / qq / kugou / kuwo 在平台、云盘都拿不到地址时，
+       才试 LX 解析（用户自加的自定义源）。lx.quality 是实际拿到的档位，
+       界面按它显示。 */
+    if (!url && !opts.skipLX && (src === 'netease' || src === 'qq' || src === 'kugou' || src === 'kuwo')) {
+      try {
+        const lx = await API.lxSongUrl(track);
+        if (lx && lx.url) {
+          url = API.lxAudio(lx.url);
+          lxQuality = lx.quality || '';
+          reason = '';
+          preview = false;
+          via = 'lx';
+        } else if (lx && lx.code !== 0 && lx.code !== undefined) {
+          // LX 探活结果记诊断：零自定义源时 code=2「全部音源均失败」是常态，
+          // 每首记一条，正好证明 LX 腿跑过且让路给了演示音。
+          postDiagAudio(`LX 取链失败：source=${src} id=${track.id ?? track.mid ?? track.hash ?? ''} code=${lx.code} ${lx.error || ''}`);
+        }
+      } catch (e) {
+        postDiagAudio(`LX 取链异常：source=${src} id=${track.id ?? track.mid ?? track.hash ?? ''} ${String((e && e.message) || e)}`);
+      }
+    }
+
     if (!url) {
       demo = true;
       url = makeDemoTrack(40, track.id);
-      postDiagAudio(`平台无地址，走演示音：source=${src} id=${track.id ?? track.mid ?? track.hash ?? ''} reason=${reason || 'unavailable'}`);
+      postDiagAudio(`取链均失败，走演示音：source=${src} id=${track.id ?? track.mid ?? track.hash ?? ''} reason=${reason || 'unavailable'} via=演示音`);
     }
     return { url, demo, reason, preview, clipStartMs, lxQuality, via: demo ? 'demo' : via };
   }
 
-  /* LX 地址进了播放器才发现是死的（代理 502/403、解码失败）时，改走平台备用
-     再试一次：fetchTrackUrl 只在取址前做 LX→平台降级，取址后失败原来是死路，
-     只能显示「播放失败」。每首只重试一次，且只在用户还没切歌时才换源；
-     手势拦截（NotAllowedError）不重试。 */
-  async function retryWithPlatform(track, token) {
-    if (!track || token !== state.token || state.lxRetried) return false;
-    state.lxRetried = true;
+  /* ------------------------------------------------------------------ *
+   * 个人云盘（网易「我的云盘」）
+   *
+   * 为什么只接网易：QQ 音乐没有个人云盘上传/取链功能；酷狗的云盘
+   * （cloudlist.service.*）在代码库里只有歌单读写，没有「列出我上传
+   * 的歌 + 取可播地址」的口；酷我 / 汽水 / 波点 / Spotify 同样没有。
+   * 所以云盘这一档只对 src === 'netease' 生效，其它平台跳过。
+   *
+   * 匹配：云盘歌有独立 songId。先按 track.id 精确匹配（用户上传的
+   * 就是这首歌时 id 一致）；再按「歌名 + 歌手」归一化匹配（上传的
+   * 文件和曲库 id 不同是最常见的情况）。归一化去大小写 / 空白 /
+   * 标点 / 括号后缀，歌手只比第一位。
+   * 缓存：云盘列表按会话缓存 10 分钟（登录态 + 列表一起刷），平台
+   * 失败的歌不会每首拉一次全量列表；翻页最多 5 页（1000 首）。
+   * 超时：不新设——列表和取链都走 api.js 的 60 秒上限，不收短。
+   * ------------------------------------------------------------------ */
+  let cloudCache = { at: 0, loggedIn: false, songs: [] };
+  const CLOUD_CACHE_TTL_MS = 10 * 60 * 1000;
+  const CLOUD_MAX_PAGES = 5;
+  const CLOUD_PAGE_SIZE = 200;
+  const normCloudKey = (s) => String(s || '').toLowerCase()
+    .replace(/[\s\-_·•()（）【】\[\]{}'"“”‘’.,，。、!！?？:：;；|/\\]+/g, '');
+  function cloudArtistKey(track) {
+    const a = track.artists;
+    const first = Array.isArray(a) ? (a[0] && (a[0].name || a[0])) : String(a || '').split('/')[0];
+    return normCloudKey(first);
+  }
+  function findCloudSong(track) {
+    const tid = track.id;
+    if (tid != null && tid !== '') {
+      const byId = cloudCache.songs.find((c) => String(c.songId) === String(tid));
+      if (byId) return byId;
+    }
+    const nameKey = normCloudKey(track.name);
+    if (!nameKey) return null;
+    const artistKey = cloudArtistKey(track);
+    return cloudCache.songs.find((c) => {
+      if (normCloudKey(c.name) !== nameKey) return false;
+      if (!artistKey) return true;
+      const ca = normCloudKey(c.artists);
+      return !ca || ca.includes(artistKey) || artistKey.includes(ca);
+    }) || null;
+  }
+  async function fetchCloudUrl(track) {
+    const now = Date.now();
+    if (now - cloudCache.at > CLOUD_CACHE_TTL_MS) {
+      let loggedIn = false;
+      try { const s = await API.session(); loggedIn = !!(s && s.loggedIn); } catch { loggedIn = false; }
+      let songs = [];
+      if (loggedIn) {
+        // 未登录不拉列表；列表按页翻到底（最多 5 页），某一页失败就停，
+        // 用已拿到的页继续匹配，别因为翻页失败把整档废掉。
+        for (let page = 0; page < CLOUD_MAX_PAGES; page++) {
+          let d = null;
+          try { d = await API.neteaseCloud(CLOUD_PAGE_SIZE, page * CLOUD_PAGE_SIZE); } catch { break; }
+          if (!d) break;
+          const rows = Array.isArray(d.songs) ? d.songs
+            : (Array.isArray(d.data) ? d.data.map((c) => ({
+              songId: c.songId, name: c.songName || c.name,
+              artists: c.artist || c.artists || '', album: c.album || c.albumName || '',
+            })) : []);
+          songs.push(...rows);
+          if (!d.hasMore || rows.length < CLOUD_PAGE_SIZE) break;
+        }
+      }
+      cloudCache = { at: now, loggedIn, songs };
+    }
+    if (!cloudCache.loggedIn) return null;   // 没登录：跳过这一档，不弹登录
+    if (!cloudCache.songs.length) return null;
+    const hit = findCloudSong(track);
+    if (!hit) {
+      postDiagAudio(`云盘无匹配，走落雪：source=netease id=${track.id ?? ''} name=${track.name || ''} via=云盘`);
+      return null;
+    }
+    try {
+      const d = await API.songUrl(hit.songId);
+      const item = (d.data || [])[0];
+      if (item && item.url) {
+        postDiagAudio(`云盘取链成功：source=netease id=${track.id ?? ''} cloudSongId=${hit.songId} via=云盘`);
+        return { url: API.neteaseAudio(item.url), cloudSongId: hit.songId };
+      }
+      postDiagAudio(`云盘取链失败：source=netease id=${track.id ?? ''} cloudSongId=${hit.songId} code=${item ? item.code : ''} via=云盘`);
+    } catch (e) {
+      postDiagAudio(`云盘取链异常：source=netease id=${track.id ?? ''} cloudSongId=${hit.songId} ${String((e && e.message) || e)}`);
+    }
+    return null;
+  }
+
+  /* 取址后地址进了播放器才发现是死的（代理 502/403、解码失败）时，
+     按优先级往下一档重试一次：fetchTrackUrl 只在取址前按「平台 → 云盘 →
+     LX」降级，取址后失败原来是死路，只能显示「播放失败」。每首只重试一次，
+     且只在用户还没切歌时才换源；手势拦截（NotAllowedError）不重试。
+     skip 掉的档 = 取址时已经给过地址、播放失败的那一档（以及它之前
+     明确拿不到地址的档）；LX 是最后一档，LX 地址死了就没下一档可试。 */
+  async function retryWithFallback(track, token) {
+    if (!track || token !== state.token || state.fallbackRetried) return false;
+    const via = (state.lastFetch && state.lastFetch.via) || '';
+    if (via !== 'platform' && via !== 'cloud') return false;   // lx/demo/local：没下一档可试
+    state.fallbackRetried = true;
+    const skips = via === 'platform'
+      ? { skipPlatform: true }
+      : { skipPlatform: true, skipCloud: true };
     let data;
     try {
-      data = await fetchTrackUrl(track, { skipLX: true });
+      data = await fetchTrackUrl(track, skips);
     } catch { return false; }
     if (token !== state.token || !data || !data.url || data.demo) return false;
     revokeDeckBlob(audio);
@@ -987,9 +1102,9 @@ const Player = (() => {
 
     revokeDeckBlob(audio);
     if (data.demo) { deckBlobs.set(audio, data.url); state.objectUrl = data.url; }
-    // 记下这首的地址来源：error 事件里靠它判断要不要改走平台备用重试。
+    // 记下这首的地址来源：error 事件里靠它判断要不要往下一档重试。
     state.lastFetch = { via: data.via, track, token };
-    state.lxRetried = false;
+    state.fallbackRetried = false;
 
     audio.preload = 'metadata';
     audio.src = data.url;
@@ -1005,9 +1120,9 @@ const Player = (() => {
         emit('playstate', true);
       } catch (e) {
         // 手势拦截（NotAllowedError）不是地址问题，不重试；地址问题（error 已挂上）
-        // 且是 LX 地址时，改走平台备用再试一次，成了就直接返回。
-        if (e && e.name !== 'NotAllowedError' && audio.error && data.via === 'lx' && token === state.token) {
-          const ok = await retryWithPlatform(track, token);
+        // 且是平台/云盘地址时，往下一档重试一次，成了就直接返回。
+        if (e && e.name !== 'NotAllowedError' && audio.error && (data.via === 'platform' || data.via === 'cloud') && token === state.token) {
+          const ok = await retryWithFallback(track, token);
           if (ok) return { demo: data.demo };
         }
         state.playing = false;
@@ -1099,9 +1214,9 @@ const Player = (() => {
 
     const token = ++state.token;
     startTrackMeta(prepared.track, prepared.index, token);
-    // 过渡落点也要记地址来源，否则这首的 error 事件认不出是 LX 地址、重试走不到。
+    // 过渡落点也要记地址来源，否则这首的 error 事件认不出是哪一档的地址、重试走不到。
     state.lastFetch = { via: prepared.via, track: prepared.track, token };
-    state.lxRetried = false;
+    state.fallbackRetried = false;
 
     state.objectUrl = deckBlobs.get(incoming) || null;
     emit('source', {
@@ -1160,14 +1275,16 @@ const Player = (() => {
       if (el !== audio) return;
       if (!el.src) return;
       const detail = audioErrorDetail(el);
-      // 刚才是 LX 的地址：给平台备用一次机会；重试本身失败时再报 sourceerror。
+      // 刚才的地址是平台/云盘的：往下一档重试一次；重试本身失败时再报 sourceerror。
+      // LX 已是最后一档，LX 地址死了没有下一档可试，直接报 sourceerror。
       // 旧行为只发 {}，界面和日志都看不到原因；现在把真实原因带出去。
-      if (state.lastFetch && state.lastFetch.via === 'lx' && state.lastFetch.token === state.token) {
-        console.warn('[player] LX 地址播放失败，改走平台备用：', detail);
-        postDiagAudio(`LX 地址播放失败，改走平台备用：code=${detail.code} host=${detail.host} ns=${detail.networkState} rs=${detail.readyState}`);
-        retryWithPlatform(state.lastFetch.track, state.lastFetch.token).then((ok) => {
+      if (state.lastFetch && (state.lastFetch.via === 'platform' || state.lastFetch.via === 'cloud') && state.lastFetch.token === state.token) {
+        const failedVia = state.lastFetch.via === 'platform' ? '平台' : '云盘';
+        console.warn(`[player] ${failedVia}地址播放失败，往下一档重试：`, detail);
+        postDiagAudio(`${failedVia}地址播放失败，往下一档重试：code=${detail.code} host=${detail.host} ns=${detail.networkState} rs=${detail.readyState}`);
+        retryWithFallback(state.lastFetch.track, state.lastFetch.token).then((ok) => {
           if (!ok) {
-            postDiagAudio(`平台备用重试失败：code=${detail.code} host=${detail.host} ns=${detail.networkState} rs=${detail.readyState}`);
+            postDiagAudio(`下一档重试失败：code=${detail.code} host=${detail.host} ns=${detail.networkState} rs=${detail.readyState}`);
             emit('sourceerror', detail);
           }
         });

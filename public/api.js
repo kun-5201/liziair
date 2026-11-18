@@ -18,7 +18,7 @@ const API = (() => {
      还原成原始直链。只动音频代理这四处，不动 /api/img 等其它路由。 */
   const proxyAudioUrl = (prefix, u) => (u ? `/${prefix}?url=${encodeURIComponent(encodeURIComponent(u))}` : '');
 
-  async function call(path, params, method = 'POST') {
+  async function call(path, params, method = 'POST', extraSignal) {
     const url = new URL('/api/' + path, location.origin);
     let body;
     if (method === 'POST') {
@@ -27,7 +27,14 @@ const API = (() => {
       for (const [k, v] of Object.entries(params || {})) url.searchParams.set(k, v);
     }
     const headers = method === 'POST' ? { 'Content-Type': 'application/json' } : undefined;
-    const opts = { method, headers, body, signal: timeout(60000) };
+    /* 外部 abort（例如关掉 QQ 登录面板时停掉在飞的拿码请求）与 60 秒超时二选一：
+       AbortSignal.any 能同时要两个时就都要，老 WebKit 没有它时以外层信号为准
+       （服务端拿码本身约 43 秒封顶，不会无限挂起）。 */
+    const t = timeout(60000);
+    const signal = extraSignal
+      ? (t && typeof AbortSignal.any === 'function' ? AbortSignal.any([t, extraSignal]) : extraSignal)
+      : t;
+    const opts = { method, headers, body, signal };
     try {
       const res = await fetch(url, opts);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -42,7 +49,7 @@ const API = (() => {
       if (!isNet) throw e;
       await new Promise((r) => setTimeout(r, 300));
       try {
-        const res2 = await fetch(url, { method, headers, body, signal: timeout(60000) });
+        const res2 = await fetch(url, { method, headers, body, signal });
         if (!res2.ok) throw new Error(`HTTP ${res2.status}`);
         return res2.json();
       } catch (e2) {
@@ -123,6 +130,9 @@ const API = (() => {
     logout: () => call('logout'),
 
     userPlaylists: (uid) => call('user/playlist', { uid }),
+    /** 网易「我的云盘」（用户自己上传的歌）：取链第二档用。{ code, songs:[{songId,name,artists,album,fileSize,fileName}], count, hasMore }。
+       未登录时上游回 301，调用方（player.js 云盘腿）直接跳过这一档，不弹登录。 */
+    neteaseCloud: (limit = 200, offset = 0) => call('user/cloud', { limit, offset }, 'GET'),
     /** 个人主页：头像/背景图/签名/等级/听歌量/关注粉丝。匿名可读公开信息 */
     userDetail: (uid) => call('user/detail', { uid }),
     playlistDetail: (id) => call('playlist/detail', { id }),
@@ -159,7 +169,7 @@ const API = (() => {
     /** 登录已失效时，本地旧凭据里还能读到的公开身份（uid / nickname / avatar），不是登录态 */
     qqCachedProfile: () => callSoft('qq/cached-profile'),
     /** 拿二维码：一次就回 { key, qrimg }，qrimg 是 data:image/png;base64,... */
-    qqQrKey: (channel = 'qqmusic') => call('qq/login/qr/key', { channel }, 'GET'),
+    qqQrKey: (channel = 'qqmusic', signal) => call('qq/login/qr/key', { channel }, 'GET', signal),
     /** 801 等待 / 802 待确认 / 803 成功 / 800 过期 */
     qqQrCheck: (key) => call('qq/login/qr/check', { key }, 'GET'),
     /** 取消旧的扫码会话（关掉它的 MQTT 驱动）：换一张/关面板时调，别留着旧驱动空跑 */
@@ -266,7 +276,7 @@ const API = (() => {
     },
 
     /**
-     * 落雪（LX）优先：播放地址默认先走 /api/lx/song/url（用户自加的自定义源），
+     * 落雪（LX）兜底：平台、云盘都拿不到地址时才走 /api/lx/song/url（用户自加的自定义源），
      * quality 不传时服务端默认从 master 向下回退，返回的 quality 是实际档位。
      * undefined 的字段不进查询串，别让服务端收到 mid=undefined。
      */

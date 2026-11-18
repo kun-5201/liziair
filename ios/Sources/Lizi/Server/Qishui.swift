@@ -383,6 +383,12 @@ final class QishuiService {
         ("signature", "cf9024ea72d9c71813238b13ea107a3d"),
     ]
 
+    /// 上游 qrcode 是裸 base64 PNG（无 data: 前缀）；前端 img.src 要求 data:image/png;base64,...，
+    /// 其余三家（酷狗/网易/QQ）回的都是带前缀的 data URL。已带前缀时不重复加。
+    private static func qsQRDataURL(_ raw: String) -> String {
+        raw.hasPrefix("data:") ? raw : "data:image/png;base64,\(raw)"
+    }
+
     /// login_qr_key：GET open.douyin.com/oauth/get_qrcode/；本地 key 为随机 16 字节 hex，内存 5 分钟。
     private func loginQrKey() async throws -> [String: Any] {
         let urlStr = "https://open.douyin.com/oauth/get_qrcode/?" + qsFormEncodePairs(Self.qsQRParams)
@@ -398,14 +404,14 @@ final class QishuiService {
         }
         let key = (0..<16).map { _ in String(format: "%02x", UInt8.random(in: 0...255)) }.joined()
         pending[key] = QSPending(token: token, qr: qrcode, expires: Date().addingTimeInterval(300))
-        return ["key": key, "qrimg": qrcode, "imageUrl": qrcode, "url": "https://open.douyin.com/oauth/get_qrcode/"]
+        return ["key": key, "qrimg": Self.qsQRDataURL(qrcode), "imageUrl": Self.qsQRDataURL(qrcode), "url": "https://open.douyin.com/oauth/get_qrcode/"]
     }
 
     private func loginQrCreate(key: String) throws -> [String: Any] {
         guard let p = pending[key], Date() < p.expires else {
             throw QishuiError(code: "auth-required", message: "二维码已过期，请重新获取", upstreamCode: nil)
         }
-        return ["qrimg": p.qr, "imageUrl": p.qr]
+        return ["qrimg": Self.qsQRDataURL(p.qr), "imageUrl": Self.qsQRDataURL(p.qr)]
     }
 
     /// 换 ticket：POST open-client.douyin.com/passport/open/get_access_ticket/

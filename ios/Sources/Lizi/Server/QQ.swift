@@ -21,7 +21,7 @@ private let qqCgiBase = "https://c.y.qq.com"
 private let qqUCommonSign = "zzannc1o6o9b4i971602f3554385022046ab796512b7012"
 private let qqUA = "QQMusic 14090008(android 10)"
 private let qqLiteUA = "okhttp/3.14.9"
-private let qqChannels = ["qq", "wechat", "qqmusic"]
+private let qqChannels = ["qq", "wechat", "qqmusic", "ptlogin"]
 private let qqQrTTL: TimeInterval = 180
 private let qqQrCooldown: TimeInterval = 15
 private let qqQrRateLimitCooldown: TimeInterval = 30
@@ -129,6 +129,18 @@ actor QQService {
     private var nextQrAllowedAt: Date = .distantPast
     private var creatingSession = false
     private var searchCache: [(key: String, at: Date, data: [String: Any])] = []
+
+    /// ptlogin 专用会话：ephemeral + 禁重定向 + 不接管 cookie。
+    /// cookie 全部由每会话的 ptCookies jar 手工收发（见 ptCollectCookies），
+    /// 不走共享 jar——两个 host 的同名 qrsig 会互相顶掉，扫完也被报过期。
+    private let ptSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.httpShouldSetCookies = false
+        config.httpCookieAcceptPolicy = .never
+        config.timeoutIntervalForRequest = 10
+        config.timeoutIntervalForResource = 30
+        return URLSession(configuration: config, delegate: QQPtNoRedirectDelegate(), delegateQueue: nil)
+    }()
 
     // MARK: 设备
 
@@ -430,7 +442,215 @@ actor QQService {
         var listenerFailed: String?
         var wsTask: URLSessionWebSocketTask?
         var driverTask: Task<Void, Never>?
+        // ptlogin（Moumusic 形状）：每会话独立 cookie jar，不走共享 jar；
+        // qrsig 单次有效，旧值绝不复用。
+        var ptQrsig: String?
+        var ptLoginSig: String?
+        var ptCookies: [String: String] = [:]
+        var ptPollErrors: Int = 0
     }
+}
+
+// MARK: - ptlogin 扫码（Moumusic QQMusicAPI.swift 的接口形状移植）
+//
+// Moumusic 的 QQ 登录不走 Android MQTT，走 QQ 网页 ptlogin：
+//   xlogin 拿 pt_login_sig → ptqrshow 拿图 + qrsig → ptqrlogin 轮询
+//   → 0 成功后手动跟 check_sig 跳转链 → graph authorize 换 code
+//   → musicu QQLogin 换 musickey。
+// 关键形状原样保留：禁重定向会话（每跳 Set-Cookie 都是会话的一部分）、
+// 每会话独立 cookie jar（qrsig 单次有效，旧值残留会让新码扫完也被报过期）、
+// 65 与 68 都算过期、图片先验 magic 再发给前端。
+// Lizi 侧只改接口与流程，不搬 Moumusic 的 SwiftUI。
+
+/// 禁重定向：check_sig 跳转链必须逐跳暴露响应，否则中间 Set-Cookie 会丢。
+private final class QQPtNoRedirectDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
+    }
+}
+
+private let qqPtUA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148"
+
+/// JS 语义的 hash33（ptqrtoken 用）：Double 累加 + 32 位截断，与
+/// Moumusic 的 Swift 移植逐行一致。
+private func qqPtHash33(_ value: String) -> Int {
+    var result: Double = 0
+    for unit in value.utf16 {
+        result += Double(qqPtToInt32Shift(result)) + Double(unit)
+    }
+    return Int(qqPtToInt32(result) & 0x7FFF_FFFF)
+}
+
+/// JS 语义的 hash5381（g_tk 用）。
+private func qqPtHash5381(_ value: String) -> Int {
+    var result: Double = 5381
+    for unit in value.utf16 {
+        result += Double(qqPtToInt32Shift(result)) + Double(unit)
+    }
+    return Int(qqPtToInt32(result) & 0x7FFF_FFFF)
+}
+
+private func qqPtToInt32Shift(_ value: Double) -> Int32 {
+    Int32(bitPattern: qqPtToUInt32(value) &* 32)
+}
+
+private func qqPtToInt32(_ value: Double) -> Int32 {
+    Int32(bitPattern: qqPtToUInt32(value))
+}
+
+private func qqPtToUInt32(_ value: Double) -> UInt32 {
+    var remainder = value.truncatingRemainder(dividingBy: 4_294_967_296)
+    if remainder < 0 { remainder += 4_294_967_296 }
+    return UInt32(remainder)
+}
+
+/// QQ 偶尔回 200 的 HTML 反爬页：只认图片 magic，否则一律当取码失败。
+private func qqPtLooksLikeImage(_ data: Data) -> Bool {
+    let bytes = [UInt8](data.prefix(12))
+    if bytes.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) { return true }
+    if bytes.starts(with: [0xFF, 0xD8, 0xFF]) { return true }
+    if bytes.starts(with: [0x47, 0x49, 0x46, 0x38]) { return true }
+    return bytes.count >= 12 && Array(bytes[0...3]) == [0x52, 0x49, 0x46, 0x46]
+        && Array(bytes[8...11]) == [0x57, 0x45, 0x42, 0x50]
+}
+
+private func qqPtImageMime(_ data: Data) -> String {
+    let bytes = [UInt8](data.prefix(12))
+    if bytes.starts(with: [0xFF, 0xD8, 0xFF]) { return "image/jpeg" }
+    if bytes.starts(with: [0x47, 0x49, 0x46, 0x38]) { return "image/gif" }
+    if bytes.count >= 12 && Array(bytes[0...3]) == [0x52, 0x49, 0x46, 0x46]
+        && Array(bytes[8...11]) == [0x57, 0x45, 0x42, 0x50] { return "image/webp" }
+    return "image/png"
+}
+
+/// ptuiCB('66',...) / ptui_callback('66',...)：不认回调名，只取括号里的字段。
+private func qqPtParseCallback(_ body: String) -> (code: String, url: URL?)? {
+    let fields = qqPtCallbackFields(body)
+    guard fields.count >= 3, let code = fields.first else { return nil }
+    let candidate = fields.dropFirst().first(where: { $0.hasPrefix("http") })
+    return (code, candidate.flatMap(URL.init(string:)))
+}
+
+private func qqPtCallbackFields(_ body: String) -> [String] {
+    guard let start = body.firstIndex(of: "("),
+          let end = body.lastIndex(of: ")"), start < end else { return [] }
+    let payload = body[body.index(after: start)..<end]
+    return payload.split(separator: ",", omittingEmptySubsequences: false).map { value in
+        var item = String(value).trimmingCharacters(in: .whitespacesAndNewlines)
+        if item.hasPrefix("'") && item.hasSuffix("'") && item.count >= 2 {
+            item.removeFirst()
+            item.removeLast()
+        } else if item.hasPrefix("\"") && item.hasSuffix("\"") && item.count >= 2 {
+            item.removeFirst()
+            item.removeLast()
+        }
+        return item
+            .replacingOccurrences(of: "\\'", with: "'")
+            .replacingOccurrences(of: "\\\"", with: "\"")
+    }
+}
+
+private func qqPtFormEncode(_ fields: [String: String]) -> String {
+    var allowed = CharacterSet.alphanumerics
+    allowed.insert(charactersIn: "-._~")
+    return fields.map { key, value in
+        let escapedKey = key.addingPercentEncoding(withAllowedCharacters: allowed) ?? key
+        let escapedValue = value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
+        return "\(escapedKey)=\(escapedValue)"
+    }.joined(separator: "&")
+}
+
+private func qqPtExtractCode(from urlString: String) -> String? {
+    guard let url = URL(string: urlString),
+          let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+        return nil
+    }
+    return components.queryItems?.first(where: { $0.name == "code" })?.value
+}
+
+/// graph.qq.com 通常把 code 放 302 Location；个别边缘节点回 200 HTML，
+/// 里面同样带跳转 URL。两种都认，但绝不把任意 body 当凭证。
+private func qqPtExtractCode(from data: Data, response: HTTPURLResponse) -> String? {
+    if let location = response.value(forHTTPHeaderField: "Location"),
+       let code = qqPtExtractCode(from: location),
+       !code.isEmpty {
+        return code
+    }
+    guard let body = String(data: data, encoding: .utf8), !body.isEmpty else { return nil }
+    let candidates = [body, body.replacingOccurrences(of: "&amp;", with: "&")]
+    for candidate in candidates {
+        if let match = candidate.range(of: #"(?:[?&])code=([^&#\"'\s<>]+)"#, options: .regularExpression) {
+            let fragment = String(candidate[match])
+            let value = fragment
+                .split(separator: "=", maxSplits: 1)
+                .dropFirst()
+                .first.map(String.init) ?? ""
+            if let decoded = value.removingPercentEncoding, !decoded.isEmpty {
+                return decoded
+            }
+        }
+    }
+    return nil
+}
+
+private func qqPtText(_ value: Any?) -> String? {
+    if let value = value as? String, !value.isEmpty { return value }
+    if let value = value as? NSNumber { return value.stringValue }
+    return nil
+}
+
+private func qqPtFirstInteger(in object: [String: Any], containers: [String], keys: [String]) -> Int? {
+    for container in containers {
+        if let nested = object[container] as? [String: Any],
+           let value = qqPtInteger(in: nested, keys: keys) {
+            return value
+        }
+    }
+    return qqPtInteger(in: object, keys: keys)
+}
+
+private func qqPtInteger(in object: [String: Any], keys: [String]) -> Int? {
+    for key in keys {
+        if let value = object[key] as? NSNumber { return value.intValue }
+        if let value = object[key] as? String, let number = Int(value) { return number }
+    }
+    return nil
+}
+
+/// 兜底：有的版本把 musickey 藏在 data/result 之下，递归找一遍。
+private func qqPtFindCredentials(_ value: Any) -> (key: String?, id: String?) {
+    if let dictionary = value as? [String: Any] {
+        var key: String?
+        var id: String?
+        for (name, child) in dictionary {
+            switch name.lowercased() {
+            case "musickey", "qm_keyst", "qqmusic_key", "music_key":
+                if key == nil, let v = qqPtText(child), !v.isEmpty { key = v }
+            case "musicid", "uin", "loginuin", "qqmusic_uin":
+                if id == nil, let v = qqPtText(child), !v.isEmpty, v != "0" { id = v }
+            default:
+                break
+            }
+            let nested = qqPtFindCredentials(child)
+            if key == nil { key = nested.key }
+            if id == nil { id = nested.id }
+            if key != nil && id != nil { return (key, id) }
+        }
+        return (key, id)
+    }
+    if let array = value as? [Any] {
+        for child in array {
+            let found = qqPtFindCredentials(child)
+            if found.key != nil || found.id != nil { return found }
+        }
+    }
+    return (nil, nil)
 }
 
 /// MQTT 固定头 + 变长剩余长度 + 载荷。
@@ -644,6 +864,9 @@ extension QQService {
         s.failureReason = reason
         s.listenerFailed = reason
         qrSessions[key] = s
+        // 驱动失败是唯一的落点（MQTT 握手/重定向/CONNACK/SUBACK/数据异常都走
+        // 这里）：以前静默，只剩前端一句 800，真机排障无从下手。
+        DiagLog.shared.recordLog(category: "qq", message: "二维码会话失败", fields: ["reason": reason])
         nextQrAllowedAt = Date().addingTimeInterval(qqQrCooldown)
         s.wsTask?.cancel()
         s.driverTask?.cancel()
@@ -1016,12 +1239,22 @@ extension QQService {
             s.driverTask?.cancel()
             qrSessions.removeValue(forKey: k)
         }
+        if !superseded.isEmpty {
+            DiagLog.shared.recordLog(category: "qq", message: "顶掉旧二维码会话",
+                                     fields: ["reason": "\(superseded.count) 个"])
+        }
         creatingSession = true
         defer { creatingSession = false }
         do {
             try await refreshAndroidSession()
         } catch {
-            throw QQAuthError(502, "QQ 设备会话建立失败")
+            // 别把上游原因吞掉：以前这里只回一句固定文案，真机排障时
+            // 分不清是 GetSession 超时、被拒还是解析失败。
+            let detail = (error as? QQUpstreamError)?.message ?? error.localizedDescription
+            let code = (error as? QQUpstreamError)?.code ?? -1
+            DiagLog.shared.recordLog(category: "qq", message: "QQ 设备会话建立失败",
+                                     fields: ["code": code, "reason": detail])
+            throw QQAuthError(502, "QQ 设备会话建立失败：\(detail)")
         }
         let key = qqRandomHex(48)
         qrSessions[key] = QQSession(key: key, channel: ch, state: "created", createdAt: now,
@@ -1035,24 +1268,96 @@ extension QQService {
         guard s.state == "created" else { throw QQAuthError(409, "QR session is not in created state") }
         if s.channel == "wechat" {
             let (uuid, img) = try await wechatCreateQr()
+            // 同下：上游调用回来之后会话可能已被取消/顶掉，别把死会话写回字典。
+            guard qrSessions[key] != nil else {
+                DiagLog.shared.recordLog(category: "qq", message: "二维码已生成但会话已取消",
+                                         fields: ["reason": "session gone during wechatCreateQr"])
+                throw QQAuthError(404, "QR code expired")
+            }
+            if let existingImg = qrSessions[key]?.imageUrl, !existingImg.isEmpty { return existingImg }
             s.wxUuid = uuid
             s.imageUrl = img
             s.state = "waiting"
             qrSessions[key] = s
             return img
         }
-        let data = try await musicuAuth(module: "music.login.LoginServer", method: "CreateQRCode",
+        // ptlogin 优先（Moumusic 形状）：取码 + 轮询都是轻量 HTTPS，
+        // 取码那一刻不启动任何 WebSocket/驱动——二维码「一准备转出来」
+        // 正是旧链路同时起 MQTT 驱动的时刻。ptlogin 失败才走 MQTT 兜底。
+        if s.channel == "qqmusic" || s.channel == "ptlogin" {
+            do {
+                let img = try await ptQrCodeWithRetry(key: key)
+                guard qrSessions[key] != nil else {
+                    DiagLog.shared.recordLog(category: "qq", message: "二维码已生成但会话已取消，不起轮询",
+                                             fields: ["reason": "session gone during ptQrshow"])
+                    throw QQAuthError(404, "QR code expired")
+                }
+                if let existingImg = qrSessions[key]?.imageUrl, !existingImg.isEmpty { return existingImg }
+                if var s2 = qrSessions[key] {
+                    s2.imageUrl = img
+                    s2.state = "waiting"
+                    s2.channel = "ptlogin"
+                    // 客户端侧过期只做兜底（300 秒）：服务端 65/68 先到为准，
+                    // 别让 180 秒的 MQTT TTL 提前掐掉一张还有效的码。
+                    s2.expiresAt = max(s2.expiresAt, Date().addingTimeInterval(300))
+                    qrSessions[key] = s2
+                }
+                return img
+            } catch let e as QQAuthError {
+                // 404 是会话已死，别再兜底；其它失败走 MQTT。
+                if e.code == 404 { throw e }
+                DiagLog.shared.recordLog(category: "qq", message: "ptlogin 取码失败，走 MQTT 兜底",
+                                         fields: ["reason": e.message])
+            } catch {
+                DiagLog.shared.recordLog(category: "qq", message: "ptlogin 取码失败，走 MQTT 兜底",
+                                         fields: ["reason": error.localizedDescription])
+            }
+        }
+        let t0 = Date()
+        let data: [String: Any]
+        do {
+            data = try await musicuAuth(module: "music.login.LoginServer", method: "CreateQRCode",
                                         param: ["tmeAppID": "qqmusic", "ct": 11, "cv": 14090008],
                                         commOverride: ["ct": 23, "cv": 0], timeout: 10)
+        } catch {
+            // CreateQRCode 本身失败（超时/上游码）：别再回固定文案，把真原因带给前端。
+            let detail = (error as? QQUpstreamError)?.message ?? error.localizedDescription
+            let code = (error as? QQUpstreamError)?.code ?? -1
+            DiagLog.shared.recordLog(category: "qq", message: "CreateQRCode 失败",
+                                     fields: ["code": code, "reason": detail])
+            throw QQAuthError(502, "二维码生成失败：\(detail)（上游 \(code)）")
+        }
+        // 上游调用回来之后、写回字典之前，会话可能已被取消/顶掉（用户关面板、
+        // 又点了一次登录）：这时绝不能把旧会话写回字典、更不能起驱动——
+        // 以前这里无条件写回，死会话带着一条活 MQTT 连接被复活，重复点
+        // 几次就攒出几条孤儿连接（第 5 轮「会话堆积」修的正是这类泄漏，
+        // 但只拦住了 supersede 那一刻已在字典里的会话，没拦住还悬在
+        // await 里、事后才写回的这一个）。
+        guard qrSessions[key] != nil else {
+            DiagLog.shared.recordLog(category: "qq", message: "二维码已生成但会话已取消，不起驱动",
+                                     fields: ["reason": "session gone during CreateQRCode"])
+            throw QQAuthError(404, "QR code expired")
+        }
+        if let existingImg = qrSessions[key]?.imageUrl, !existingImg.isEmpty {
+            return existingImg // 另一路 createQr 已先完成，不再起第二个驱动
+        }
         let qrcodeId = scStr(data, "qrcodeID")
         guard !qrcodeId.isEmpty else {
-            throw QQAuthError(502, "二维码生成失败（上游没给图片）")
+            DiagLog.shared.recordLog(category: "qq", message: "CreateQRCode 缺 qrcodeID",
+                                     fields: ["reason": "empty qrcodeID"])
+            throw QQAuthError(502, "二维码生成失败：上游没给 qrcodeID")
         }
         let qrcodeRaw = scStr(data, "qrcode")
         let b64 = qrcodeRaw.split(separator: ",").last.map(String.init) ?? qrcodeRaw
-        guard let png = Data(base64Encoded: b64),
-              png.prefix(8).map({ String(format: "%02x", $0) }).joined() == "89504e470d0a1a0a" else {
-            throw QQAuthError(502, "二维码生成失败（上游没给图片）")
+        guard let png = Data(base64Encoded: b64) else {
+            DiagLog.shared.recordLog(category: "qq", message: "二维码 base64 解码失败",
+                                     fields: ["reason": "收到 \(b64.count) 字符"])
+            throw QQAuthError(502, "二维码生成失败：图片损坏（base64 解码失败）")
+        }
+        guard png.prefix(8).map({ String(format: "%02x", $0) }).joined() == "89504e470d0a1a0a" else {
+            DiagLog.shared.recordLog(category: "qq", message: "二维码非 PNG",
+                                     fields: ["reason": "收到 \(png.count) 字节"])
+            throw QQAuthError(502, "二维码生成失败：图片格式异常（非 PNG）")
         }
         let img = "data:image/png;base64,\(b64)"
         s.qrcodeId = qrcodeId
@@ -1063,6 +1368,8 @@ extension QQService {
         qrSessions[key] = s
         s.driverTask = Task { await self.runMqttDriver(key: key) }
         qrSessions[key] = s
+        DiagLog.shared.recordLog(category: "qq", message: "二维码已生成",
+                                 fields: ["code": 200, "reason": "png=\(png.count)B 耗时=\(Int(Date().timeIntervalSince(t0) * 1000))ms"])
         // 监听器只等 3 秒就回码：SUBACK 正常 <1 秒；3 秒还没到就先把码给
         // 用户、驱动后台继续连——check 轮询会在监听器失败时立刻报 800 +
         // 原因，前端自动换码。以前等满 20 秒才回，慢网下整个拿码请求能拖
@@ -1072,6 +1379,12 @@ extension QQService {
         if !ready, let failed = qrSessions[key]?.listenerFailed {
             await failSession(key: key, reason: failed)
             throw QQAuthError(502, failed)
+        }
+        // 等监听器的 3 秒里会话也可能被取消：字典里没了就别把码交给前端，
+        // 否则前端拿着一个已死的 key 开始轮询，下一轮 800 又触发自动换码。
+        guard qrSessions[key] != nil else {
+            s.driverTask?.cancel()
+            throw QQAuthError(404, "QR code expired")
         }
         return img
     }
@@ -1158,6 +1471,378 @@ extension QQService {
         }
     }
 
+    // MARK: ptlogin 扫码（Moumusic 形状）
+
+    /// 收 Set-Cookie 进本会话的 jar（Moumusic collectCookies 的同款做法，
+    /// 只是落点从共享 HTTPCookieStorage 换成每会话字典）。
+    private func ptCollectCookies(key: String, response: URLResponse) {
+        guard let http = response as? HTTPURLResponse, let url = http.url,
+              var s = qrSessions[key] else { return }
+        var headers: [String: String] = [:]
+        for (k, v) in http.allHeaderFields { headers[String(describing: k)] = String(describing: v) }
+        for cookie in HTTPCookie.cookies(withResponseHeaderFields: headers, for: url) {
+            s.ptCookies[cookie.name] = cookie.value
+        }
+        qrSessions[key] = s
+    }
+
+    /// 全量 cookie 头（check_sig 链 / authorize 用：要送全部 ptlogin 票据，
+    /// 不只账号那几颗）。
+    private func ptFullCookieHeader(key: String) -> String {
+        guard let s = qrSessions[key] else { return "" }
+        return s.ptCookies.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: "; ")
+    }
+
+    /// 会话 cookie 头（musicu QQLogin 用：只留 QQ 网页端那套身份/凭证名。
+    /// 其中 skey 是某些 check_sig 变体回的凭证，丢了它 graph 会拒掉
+    /// 一次 otherwise 成功的扫码）。
+    private func ptSessionCookieHeader(key: String) -> String {
+        let allowed = Set(["uin", "wxuin", "p_uin", "wxopenid", "skey", "p_skey",
+                           "pt2gguin", "pt4_token", "qqmusic_uin", "qqmusic_key", "qm_keyst",
+                           "music_key", "wxskey", "wx_skey", "musickey", "musicid", "loginUin",
+                           "pskey", "pt_login_sig", "pt4_aid", "ptnick", "nick", "nickname",
+                           "psrf_access_token", "psrf_qq_access_token", "psrf_qqopenid"])
+        guard let s = qrSessions[key] else { return "" }
+        return s.ptCookies.filter { allowed.contains($0.key) }
+            .map { "\($0.key)=\($0.value)" }.sorted().joined(separator: "; ")
+    }
+
+    /// Moumusic qrCode()：xlogin 拿 pt_login_sig → ptqrshow 拿图 + qrsig。
+    /// 每会话独立 jar；qrsig 单次有效，重试前先清掉旧值。
+    private func ptQrCode(key: String) async throws -> String {
+        guard qrSessions[key] != nil else { throw QQAuthError(404, "QR code expired") }
+        if var s = qrSessions[key] {
+            s.ptCookies.removeValue(forKey: "qrsig")
+            s.ptCookies.removeValue(forKey: "pt_login_sig")
+            s.ptQrsig = nil
+            s.ptLoginSig = nil
+            qrSessions[key] = s
+        }
+        let t0 = Date()
+        // 1. 登录页拿 pt_login_sig（拿不到也不致命：轮询时 login_sig 送空串，
+        // Moumusic 同样 try? 容错）。
+        if let xlogin = URL(string: "https://xui.ptlogin2.qq.com/cgi-bin/xlogin?appid=716027609&daid=383&style=33&login_text=%E7%99%BB%E5%BD%95&hide_title_bar=1&hide_border=1&target=self&s_url=https%3A%2F%2Fgraph.qq.com%2Foauth2.0%2Flogin_jump&pt_3rd_aid=100497308&theme=2&verify_theme=") {
+            var req = URLRequest(url: xlogin, timeoutInterval: 5)
+            req.setValue(qqPtUA, forHTTPHeaderField: "User-Agent")
+            if let (_, resp) = try? await ptSession.data(for: req) {
+                ptCollectCookies(key: key, response: resp)
+                if var s = qrSessions[key], let sig = s.ptCookies["pt_login_sig"], !sig.isEmpty {
+                    s.ptLoginSig = sig
+                    qrSessions[key] = s
+                }
+            }
+        }
+        // 2. 取二维码图（图本身就是 body；qrsig 在 Set-Cookie 里）。
+        var comps = URLComponents(string: "https://ssl.ptlogin2.qq.com/ptqrshow") ?? URLComponents()
+        comps.queryItems = [
+            URLQueryItem(name: "appid", value: "716027609"),
+            URLQueryItem(name: "e", value: "2"),
+            URLQueryItem(name: "l", value: "M"),
+            URLQueryItem(name: "s", value: "3"),
+            URLQueryItem(name: "d", value: "72"),
+            URLQueryItem(name: "v", value: "4"),
+            URLQueryItem(name: "t", value: String(format: "%.6f", Double.random(in: 0...1))),
+            URLQueryItem(name: "daid", value: "383"),
+            URLQueryItem(name: "pt_3rd_aid", value: "100497308"),
+        ]
+        guard let showURL = comps.url else { throw QQAuthError(502, "二维码生成失败：上游没给图片") }
+        var req = URLRequest(url: showURL, timeoutInterval: 10)
+        req.setValue(qqPtUA, forHTTPHeaderField: "User-Agent")
+        req.setValue("https://xui.ptlogin2.qq.com/", forHTTPHeaderField: "Referer")
+        let data: Data
+        let resp: URLResponse
+        do {
+            let r = try await ptSession.data(for: req)
+            data = r.0
+            resp = r.1
+        } catch {
+            throw QQAuthError(502, "二维码生成失败：\(error.localizedDescription)")
+        }
+        ptCollectCookies(key: key, response: resp)
+        guard qrSessions[key] != nil else { throw QQAuthError(404, "QR code expired") }
+        if (resp as? HTTPURLResponse)?.statusCode == 403 {
+            throw QQAuthError(502, "QQ 当前拒绝了二维码请求，请稍后重试")
+        }
+        guard (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) == true,
+              let qrsig = qrSessions[key]?.ptCookies["qrsig"], !qrsig.isEmpty else {
+            throw QQAuthError(502, "二维码生成失败：上游没给 qrsig")
+        }
+        // QQ 偶尔回 200 的 HTML 反爬页：绝不把它当二维码图发给前端
+        //（否则前端一直转圈、码永远出不来）。
+        guard qqPtLooksLikeImage(data) else {
+            throw QQAuthError(502, "QQ 当前拒绝了二维码请求，请稍后重试")
+        }
+        if var s = qrSessions[key] {
+            s.ptQrsig = qrsig
+            s.ptLoginSig = s.ptCookies["pt_login_sig"]
+            qrSessions[key] = s
+        }
+        let img = "data:\(qqPtImageMime(data));base64,\(data.base64EncodedString())"
+        DiagLog.shared.recordLog(category: "qq", message: "二维码已生成（ptlogin）",
+                                 fields: ["code": 200, "reason": "png=\(data.count)B 耗时=\(Int(Date().timeIntervalSince(t0) * 1000))ms"])
+        return img
+    }
+
+    /// Moumusic requestQRCodeWithRetry()：3 次，间隔 700ms。
+    private func ptQrCodeWithRetry(key: String) async throws -> String {
+        var lastError: Error?
+        for attempt in 0..<3 {
+            do {
+                return try await ptQrCode(key: key)
+            } catch {
+                lastError = error
+                // 会话已死别再试；只对上游失败重试。
+                if let e = error as? QQAuthError, e.code == 404 { throw e }
+                if attempt < 2 { try? await Task.sleep(nanoseconds: 700_000_000) }
+            }
+        }
+        throw lastError ?? QQAuthError(502, "QQ 当前拒绝了二维码请求，请稍后重试")
+    }
+
+    /// Moumusic poll(qrsig:)：一次 ptqrlogin，只返回状态码 + 跳转地址，
+    /// OAuth 交换由调用方在 0 时做。返回码：66 等待 / 67 已扫 /
+    /// 65·68 过期 / 0 成功。
+    private func ptPoll(key: String) async throws -> (code: String, jumpURL: URL?) {
+        guard let s = qrSessions[key], let qrsig = s.ptQrsig, !qrsig.isEmpty else {
+            throw QQAuthError(404, "QR code expired")
+        }
+        // 签名同时留在 jar 里：后继 check_sig 必须送同一个 qrsig。
+        if var s2 = qrSessions[key] { s2.ptCookies["qrsig"] = qrsig; qrSessions[key] = s2 }
+        var comps = URLComponents(string: "https://ssl.ptlogin2.qq.com/ptqrlogin") ?? URLComponents()
+        comps.queryItems = [
+            URLQueryItem(name: "u1", value: "https://graph.qq.com/oauth2.0/login_jump"),
+            URLQueryItem(name: "ptqrtoken", value: String(qqPtHash33(qrsig))),
+            URLQueryItem(name: "ptredirect", value: "0"),
+            URLQueryItem(name: "h", value: "1"),
+            URLQueryItem(name: "t", value: "1"),
+            URLQueryItem(name: "g", value: "1"),
+            URLQueryItem(name: "from_ui", value: "1"),
+            URLQueryItem(name: "ptlang", value: "2052"),
+            URLQueryItem(name: "action", value: "0-0-\(Int(Date().timeIntervalSince1970 * 1000))"),
+            URLQueryItem(name: "js_ver", value: "22080914"),
+            URLQueryItem(name: "js_type", value: "1"),
+            URLQueryItem(name: "login_sig", value: qrSessions[key]?.ptLoginSig ?? ""),
+            URLQueryItem(name: "pt_uistyle", value: "40"),
+            URLQueryItem(name: "aid", value: "716027609"),
+            URLQueryItem(name: "daid", value: "383"),
+            URLQueryItem(name: "pt_3rd_aid", value: "100497308"),
+            // 缺了它也能回 0，但后继 check_sig 链拿不到 skey/p_skey，
+            // 音乐凭证换不出来。
+            URLQueryItem(name: "o1vId", value: "49283d5cbb01a744d46314da4608d929"),
+        ]
+        guard let url = comps.url else { throw QQAuthError(502, "QQ 轮询失败") }
+        var req = URLRequest(url: url, timeoutInterval: 10)
+        var pollCookie = "qrsig=\(qrsig)"
+        if let sig = qrSessions[key]?.ptLoginSig, !sig.isEmpty { pollCookie += "; pt_login_sig=\(sig)" }
+        req.setValue(pollCookie, forHTTPHeaderField: "Cookie")
+        req.setValue(qqPtUA, forHTTPHeaderField: "User-Agent")
+        req.setValue("https://xui.ptlogin2.qq.com/", forHTTPHeaderField: "Referer")
+        let (data, resp) = try await ptSession.data(for: req)
+        ptCollectCookies(key: key, response: resp)
+        guard (resp as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) == true,
+              let body = String(data: data, encoding: .utf8),
+              let parsed = qqPtParseCallback(body) else {
+            throw QQAuthError(502, "QQ 轮询失败：上游返回无法识别")
+        }
+        if parsed.code != "66" {
+            DiagLog.shared.recordLog(category: "qq", message: "扫码状态 \(parsed.code)",
+                                     fields: ["reason": String(body.prefix(160))])
+        }
+        return (code: parsed.code, jumpURL: parsed.url)
+    }
+
+    /// Moumusic completeOAuth：手动跟 check_sig 跳转链（每跳都收
+    /// Set-Cookie，自动跟随会丢中间凭证）→ graph authorize 换 code
+    /// （3 档 scope/openapi 依次试）→ musicu QQLogin 换 musickey。
+    /// 返回与 MQTT 链路同一形状的凭证字典（musickey + musicid）。
+    private func ptCompleteOAuth(key: String, redirectURL: URL) async throws -> [String: Any] {
+        var currentURL = redirectURL
+        // 跳转链最多 6 跳；no-redirect 会话把每跳的 3xx 暴露出来。
+        for _ in 0..<6 {
+            var req = URLRequest(url: currentURL, timeoutInterval: 10)
+            req.setValue(qqPtUA, forHTTPHeaderField: "User-Agent")
+            req.setValue("https://xui.ptlogin2.qq.com/", forHTTPHeaderField: "Referer")
+            req.setValue(ptFullCookieHeader(key: key), forHTTPHeaderField: "Cookie")
+            let (_, resp) = try await ptSession.data(for: req)
+            ptCollectCookies(key: key, response: resp)
+            guard let http = resp as? HTTPURLResponse,
+                  (300...399).contains(http.statusCode),
+                  let location = http.value(forHTTPHeaderField: "Location"), !location.isEmpty else { break }
+            if let absolute = URL(string: location), absolute.scheme != nil {
+                currentURL = absolute
+            } else if let resolved = URL(string: location, relativeTo: currentURL) {
+                currentURL = resolved
+            } else {
+                break
+            }
+        }
+        let credential = qrSessions[key]?.ptCookies["qqmusic_key"]
+            ?? qrSessions[key]?.ptCookies["p_skey"]
+            ?? qrSessions[key]?.ptCookies["skey"] ?? ""
+        guard !credential.isEmpty else {
+            DiagLog.shared.recordLog(category: "qq", message: "check_sig 完成但无凭证", fields: [:])
+            throw QQAuthError(502, "QQ 扫码成功，但音乐登录凭证获取失败，请重新扫码")
+        }
+        // graph authorize：3 档依次试，取第一个吐 code 的。
+        let variants: [(scope: String, openapi: String)] = [
+            ("get_user_info,get_app_friends", "1010_1030"),
+            ("get_user_info,get_app_friends", "80901010_1030"),
+            ("all", "80901010_1030"),
+        ]
+        var foundCode: String?
+        for variant in variants {
+            let fields: [String: String] = [
+                "response_type": "code",
+                "client_id": "100497308",
+                "redirect_uri": "https://y.qq.com/portal/wx_redirect.html?login_type=1&surl=https://y.qq.com/",
+                "scope": variant.scope,
+                "state": "state",
+                "switch": "",
+                "from_ptlogin": "1",
+                "src": "1",
+                "update_auth": "1",
+                "openapi": variant.openapi,
+                "g_tk": String(qqPtHash5381(credential)),
+                "auth_time": String(Int(Date().timeIntervalSince1970 * 1000)),
+                "ui": "DFEC5395-9E69-4D3E-96A6-300BB770874D",
+            ]
+            var authReq = URLRequest(url: URL(string: "https://graph.qq.com/oauth2.0/authorize")!, timeoutInterval: 10)
+            authReq.httpMethod = "POST"
+            authReq.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+            authReq.setValue(qqPtUA, forHTTPHeaderField: "User-Agent")
+            authReq.setValue("https://graph.qq.com/oauth2.0/show?which=Login&display=pc&client_id=100497308", forHTTPHeaderField: "Referer")
+            authReq.setValue("https://graph.qq.com", forHTTPHeaderField: "Origin")
+            authReq.setValue(ptFullCookieHeader(key: key), forHTTPHeaderField: "Cookie")
+            authReq.httpBody = qqPtFormEncode(fields).data(using: .utf8)
+            let (authData, authResp) = try await ptSession.data(for: authReq)
+            ptCollectCookies(key: key, response: authResp)
+            if let http = authResp as? HTTPURLResponse,
+               let code = qqPtExtractCode(from: authData, response: http), !code.isEmpty {
+                foundCode = code
+                break
+            }
+            DiagLog.shared.recordLog(category: "qq", message: "authorize 未取得 code",
+                                     fields: ["reason": "scope=\(variant.scope) openapi=\(variant.openapi) http=\((authResp as? HTTPURLResponse)?.statusCode ?? -1)"])
+        }
+        guard let code = foundCode else {
+            throw QQAuthError(502, "QQ 扫码成功，但音乐登录凭证获取失败，请重新扫码")
+        }
+        // musicu QQLogin：注意是 "req" 不是 "req_0"，不能走 musicu()。
+        let loginPayload: [String: Any] = [
+            "comm": ["g_tk": 5381, "platform": "yqq", "ct": 24, "cv": 0],
+            "req": ["module": "QQConnectLogin.LoginServer", "method": "QQLogin", "param": ["code": code]],
+        ]
+        guard let loginBody = qqJSONData(loginPayload),
+              let loginURL = URL(string: qqMusicuURL) else {
+            throw QQAuthError(502, "QQ 扫码成功，但音乐登录凭证获取失败，请重新扫码")
+        }
+        let (loginData, loginResp) = try await Upstream.fetch(
+            loginURL,
+            headers: ["Content-Type": "application/json; charset=utf-8", "User-Agent": qqPtUA,
+                      "Referer": "https://y.qq.com/", "Cookie": ptSessionCookieHeader(key: key)],
+            timeout: 10, method: "POST", body: loginBody)
+        guard (200..<300).contains(loginResp.statusCode),
+              let root = Upstream.jsonObject(loginData) else {
+            throw QQAuthError(502, "QQ 扫码成功，但音乐登录凭证获取失败，请重新扫码")
+        }
+        if let codeValue = qqPtFirstInteger(in: root, containers: ["req", "req_0"], keys: ["code", "ret"]),
+           codeValue != 0 {
+            throw QQAuthError(502, "QQ 扫码成功，但音乐登录凭证获取失败，请重新扫码")
+        }
+        var musicKey: String?
+        var musicID: String?
+        for container in [(root["req"] as? [String: Any])?["data"] as? [String: Any],
+                          (root["req_0"] as? [String: Any])?["data"] as? [String: Any],
+                          root["data"] as? [String: Any]].compactMap({ $0 }) {
+            if musicKey == nil, let v = qqPtText(container["musickey"]), !v.isEmpty { musicKey = v }
+            if musicID == nil, let v = qqPtText(container["musicid"]), !v.isEmpty { musicID = v }
+        }
+        if musicKey == nil || musicID == nil {
+            let found = qqPtFindCredentials(root)
+            if musicKey == nil { musicKey = found.key }
+            if musicID == nil { musicID = found.id }
+        }
+        guard let keyValue = musicKey, !keyValue.isEmpty,
+              let idValue = musicID, !idValue.isEmpty, idValue != "0" else {
+            throw QQAuthError(502, "QQ 扫码成功，但音乐登录凭证获取失败，请重新扫码")
+        }
+        if var s = qrSessions[key] {
+            s.ptCookies["musickey"] = keyValue
+            s.ptCookies["qm_keyst"] = keyValue
+            s.ptCookies["qqmusic_key"] = keyValue
+            s.ptCookies["uin"] = idValue
+            qrSessions[key] = s
+        }
+        // loginType 6 = Lizi 里 QQ 音乐 App 登录的默认值（MQTT qqmusic 通道同款）；
+        // ptlogin 凭证没有 refresh_key，不走静默刷新，过期靠 status() 重验。
+        return ["musicid": idValue, "str_musicid": idValue, "musickey": keyValue,
+                "loginType": 6, "musickeyCreateTime": Date().timeIntervalSince1970,
+                "keyExpiresIn": 259200]
+    }
+
+    /// checkQr 侧的 ptlogin 驱动：前端每 2 秒调一次 check，这里只做一轮
+    /// ptqrlogin（Moumusic 的 sheet 每 2.5 秒 poll 一次是同一形状）。
+    /// 连续 8 轮网络/解析失败才判死（Moumusic 同款容忍度），单轮抖动只回 801。
+    private func ptPollOnce(key: String) async -> [String: Any] {
+        guard var s = qrSessions[key] else {
+            return ["code": 800, "message": "QR code expired"]
+        }
+        let poll: (code: String, jumpURL: URL?)
+        do {
+            poll = try await ptPoll(key: key)
+        } catch {
+            s.ptPollErrors += 1
+            qrSessions[key] = s
+            if s.ptPollErrors >= 8 {
+                await failSession(key: key, reason: "QQ 轮询失败")
+                return ["code": 800, "message": "QR login failed", "error": "QQ 轮询失败"]
+            }
+            return ["code": 801, "message": "Waiting for QR scan"]
+        }
+        s.ptPollErrors = 0
+        qrSessions[key] = s
+        switch poll.code {
+        case "66":
+            return ["code": 801, "message": "Waiting for QR scan"]
+        case "67":
+            if var s2 = qrSessions[key] { s2.state = "scanned"; qrSessions[key] = s2 }
+            return ["code": 802, "message": "QR code scanned"]
+        case "65", "68":
+            // 68 是 token 被作废/顶掉（比如又刷了一张码）：绝不能当等待，
+            // 否则前端一直轮一张死码；qrsig 同时清掉，永不复用。
+            // 这里只标过期、不进 failSession（不设 15 秒冷却），前端
+            // 800 自动换码才能立刻重取。
+            if var s2 = qrSessions[key] {
+                s2.state = "expired"
+                s2.ptQrsig = nil
+                s2.ptCookies.removeValue(forKey: "qrsig")
+                qrSessions[key] = s2
+            }
+            return ["code": 800, "message": "QR code expired"]
+        case "0":
+            guard let jumpURL = poll.jumpURL else {
+                await failSession(key: key, reason: "QQ 扫码成功，但音乐登录凭证获取失败，请重新扫码")
+                return ["code": 800, "message": "QR login failed", "error": "QQ 扫码成功，但音乐登录凭证获取失败，请重新扫码"]
+            }
+            if var s2 = qrSessions[key] { s2.state = "exchanging"; qrSessions[key] = s2 }
+            do {
+                let cred = try await ptCompleteOAuth(key: key, redirectURL: jumpURL)
+                await finalizeCredential(key: key, cred: cred)
+                var out: [String: Any] = ["code": 803, "message": "Authorization login successful", "loggedIn": true]
+                if let profile = await getLoginProfile() {
+                    out["nickname"] = profile["nickname"] as? String ?? ""
+                    out["avatar"] = profile["avatar"] as? String ?? ""
+                }
+                return out
+            } catch {
+                await failSession(key: key, reason: "换凭证失败")
+                return ["code": 800, "message": "QR login failed", "error": "换凭证失败"]
+            }
+        default:
+            return ["code": 801, "message": "Waiting for QR scan"]
+        }
+    }
+
     private func checkQr(key: String) async -> [String: Any] {
         guard var s = qrSessions[key] else {
             return ["code": 800, "message": "QR code expired"]
@@ -1169,6 +1854,9 @@ extension QQService {
         if s.channel == "wechat" && ["created", "waiting", "scanned"].contains(s.state) {
             await advanceWechat(key: key)
             s = qrSessions[key] ?? s
+        }
+        if s.channel == "ptlogin" && ["created", "waiting", "scanned"].contains(s.state) {
+            return await ptPollOnce(key: key)
         }
         switch s.state {
         case "confirmed":
@@ -1566,14 +2254,14 @@ extension QQService {
                                     "retryAfterMs": e.retryAfterMs.map { NSNumber(value: $0) } ?? NSNull(), "error": e.message])
             } catch {
                 return .json(200, ["code": 502, "key": key, "qrimg": "", "channel": channel,
-                                    "retryAfterMs": NSNull(), "error": "二维码生成失败（上游没给图片）"])
+                                    "retryAfterMs": NSNull(), "error": "二维码生成失败：\(error.localizedDescription)"])
             }
         } catch let e as QQAuthError {
             return .json(200, ["code": e.code, "key": NSNull(), "channel": channel,
                                 "retryAfterMs": e.retryAfterMs ?? NSNull(), "error": e.message])
         } catch {
             return .json(200, ["code": 502, "key": NSNull(), "channel": channel,
-                                "retryAfterMs": NSNull(), "error": "拿不到二维码 key"])
+                                "retryAfterMs": NSNull(), "error": "拿不到二维码 key：\(error.localizedDescription)"])
         }
     }
 
@@ -1586,7 +2274,7 @@ extension QQService {
         } catch let e as QQAuthError {
             return .json(200, ["code": e.code, "key": key, "qrimg": "", "error": e.message])
         } catch {
-            return .json(200, ["code": 502, "key": key, "qrimg": "", "error": "二维码生成失败（上游没给图片）"])
+            return .json(200, ["code": 502, "key": key, "qrimg": "", "error": "二维码生成失败：\(error.localizedDescription)"])
         }
     }
 

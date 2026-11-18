@@ -228,7 +228,8 @@ final class LiziRouter {
         do {
             // 取歌链（LXSourceRegistry）：启用的自定义源（列表顺序，只试它声明覆盖
             // 的平台），每个候选 URL 校验能打开才返回；全部失败抛错，
-            // 由 player.js 走平台接口备用。自动切换开关控制是否多源重试。
+            // 由 player.js 在平台、云盘之后兜底（第 7 轮第 8 件：LX 是最后一档，
+            // 再拿不到才走演示音）。自动切换开关控制是否多源重试。
             let r = try await LXSourceRegistry.shared.resolveMusicUrl(
                 source: lxSource, songId: songId, quality: quality,
                 autoSwitch: LXSourceRegistry.shared.autoSwitchEnabled)
