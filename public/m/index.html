@@ -900,7 +900,16 @@ python -c "from pedalboard import load_plugin; p=load_plugin(r'C:\Program Files\
         <button class="setpage__act" id="bodian-login" type="button">登录</button>
         <button class="setpage__act" id="bodian-logout" type="button" hidden>退出</button>
       </div>
-      <!-- 酷我 / Spotify 已下线（2026-11-09）：设置页不再有这两行。 -->
+      <!-- 第 13 轮（2026-11-19）：酷我加回，Cookie 登录（没有扫码接口）。 -->
+      <div class="setpage__row setpage__row--src" data-src-row="kuwo">
+        <span class="setpage__src-chip" aria-hidden="true"></span>
+        <span class="setpage__label">酷我音乐</span>
+        <span class="src-limit">没有扫码登录 · 粘贴 Cookie</span>
+        <span class="setpage__val" id="kuwo-state">未连接</span>
+        <button class="setpage__act" id="kuwo-login" type="button">登录</button>
+        <button class="setpage__act" id="kuwo-logout" type="button" hidden>退出</button>
+      </div>
+      <!-- Spotify 已下线（2026-11-09）：设置页不再有这一行。 -->
       <div class="qq-qr" id="src-qr" hidden>
         <div class="qq-qr__box" id="src-qr-box"></div>
         <p class="qq-qr__status" id="src-qr-status">用手机扫码</p>

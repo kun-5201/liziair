@@ -633,14 +633,16 @@ final class LXScriptInstance {
     }
 
     /// 按档位从高到低回退，返回 (url, 实际档位)。只跑脚本，不回退内置解析。
-    func resolveMusicUrl(source: String, songId: String, quality: String) async throws -> (String, String) {
+    /// songName：酷我分支另传的真歌名（Router 酷我分支），引擎里填
+    /// musicInfo.name；其余平台为空，name 回退到 songId（原行为）。
+    func resolveMusicUrl(source: String, songId: String, quality: String, songName: String = "") async throws -> (String, String) {
         guard !songId.isEmpty else {
             throw NSError(domain: "LXScript", code: 6, userInfo: [NSLocalizedDescriptionKey: "缺少歌曲 ID"])
         }
         var lastError: Error?
         for tier in Self.tiersFrom(quality) {
             do {
-                let url = try await callScriptMusicUrl(source: source, songId: songId, quality: tier)
+                let url = try await callScriptMusicUrl(source: source, songId: songId, quality: tier, songName: songName)
                 return (url, tier)
             } catch {
                 lastError = error
@@ -658,9 +660,9 @@ final class LXScriptInstance {
 
     // MARK: - 调脚本（带单档位 20 秒上限）
 
-    private func callScriptMusicUrl(source: String, songId: String, quality: String) async throws -> String {
+    private func callScriptMusicUrl(source: String, songId: String, quality: String, songName: String = "") async throws -> String {
         try await withThrowingTaskGroup(of: String.self) { group in
-            group.addTask { try await self.callScriptMusicUrlOnce(source: source, songId: songId, quality: quality) }
+            group.addTask { try await self.callScriptMusicUrlOnce(source: source, songId: songId, quality: quality, songName: songName) }
             group.addTask {
                 try await Task.sleep(nanoseconds: 20_000_000_000)
                 throw NSError(domain: "LXScript", code: -1, userInfo: [NSLocalizedDescriptionKey: "落雪脚本超时（\(source)/\(quality)）"])
@@ -673,7 +675,7 @@ final class LXScriptInstance {
         }
     }
 
-    private func callScriptMusicUrlOnce(source: String, songId: String, quality: String) async throws -> String {
+    private func callScriptMusicUrlOnce(source: String, songId: String, quality: String, songName: String = "") async throws -> String {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
             Self.jsQueue.async { [weak self] in
                 guard let self else {
@@ -697,7 +699,10 @@ final class LXScriptInstance {
                     var musicInfo: [String: Any] = ["songmid": songId, "songId": songId, "source": source]
                     switch source {
                     case "kw", "mg":
-                        musicInfo["name"] = songId
+                        // 歌名另传（Router 酷我分支）：songId 是 rid（新音源后端
+                        // 只要 rid，传歌名回 parameter error），name 仍填真歌名，
+                        // 旧脚本读 name 不受影响；没传歌名时回退到 songId（原行为）。
+                        musicInfo["name"] = songName.isEmpty ? songId : songName
                     case "kg":
                         if songId.count == 32 && songId.allSatisfy({ $0.isHexDigit }) {
                             musicInfo["hash"] = songId

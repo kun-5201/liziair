@@ -8979,6 +8979,67 @@ body.is-stage .updtoast { bottom: 18px; }
 }
 
 /* ==========================================================================
+   播放页尺寸分档（2026-11-19，第 11 轮第 7 件 + 全局收紧统一规则）
+   --------------------------------------------------------------------------
+   全 App 共用的一套 iOS 尺寸档（不要另起第二套断点；封面比例、关键尺寸
+   都按这档走，规则只写在这里）：
+     tier-xs  小屏竖屏   ≤380px 竖屏      例 iPhone SE 375×667（短屏 667 高）
+     tier-sm  常规竖屏   381–420px 竖屏   例 390×844 / 414×896
+     tier-lg  大屏竖屏   ≥421px 竖屏      例 430×932（Plus / Max）
+     tier-ls  横屏       ≤900px 横屏      例 844×390
+   封面流（.cf__item）每档的框比例：
+     xs 4:3 —— 短屏纵向预算紧（舞台 64px 上垫 + 封面 + 歌词 + 歌名/控制 +
+               62px 下垫），框矮一档省 ~47px 高，宽 188px 与 3D 偏移不动；
+     sm 1:1 —— 专辑图本身是正方形，常规竖屏整图展示（改动前就是 1:1）；
+     lg 5:6 —— 大屏纵向空间充裕（932 高），框略高、封面更突出，仍在歌词
+               弹性区内；宽 188px 与 3D 偏移不动；
+     ls 1:1 —— 横屏用户截图的参考态（《发如雪》正方形 + 倒影），纵向只有
+               390px，正方形是塞得下的最高框。
+   只动框比例：宽（188 / 歌词拉起 148 / 横屏 140 / 110）与 3D 偏移、
+   倾斜、倒影、滑动逻辑一律不动；图本身永远不拉伸（img object-fit: cover，
+   居中裁剪，见下面 .cf__item img）；倒影是 img 上的 -webkit-box-reflect，
+   跟着框走。轨道高按框高反推：框高 ×1.04（中间卡放大）+ 倒影余量
+   （竖屏常规 58px / 歌词拉起 44px，与改动前一致）。
+   每档关键块实测稳态高（CSS px；Playwright r11-global-probe.cjs /
+   r11-global-probe2.cjs，2026-11-19；加载 → 封面到 → 切平台 → 搜结果 →
+   切歌 → 进舞台，全程不变；改尺寸时以这张表为准，跑偏了就是回归）：
+     首页 hero：xs 316 / sm 418 / lg 469 / ls 112
+     首页长条 #hall-plat：xs 65 / sm 139 / lg 197 / ls 298
+     跑马带 #hall-marq：xs/sm/lg 219 / ls 228
+     本地音乐格（空态）：xs/sm 167 / lg/ls 147
+     封面流轨道 #cf-track：xs 160 / sm 198 / lg 229 / ls 154
+     播放页歌名 25 / 歌手 22 / meta 62（横屏 56）/ 传输排 64 —— 全档一致
+     设置页 hero 101（横屏 107），账号区随宽度换行（741/741/714/641）
+   两处看着像“跳”但不是尺寸 bug，别动手：
+     (a) #tracks 从 0 长到 N 行——结果列表随内容长，搜索框 38px 与
+         音源切换 34px 两件固定 chrome 从头到尾不动；
+     (b) nowRise 进场动画：.now__art > * 与 .now__lyrics 在进播放页时
+         translateY(14px)→0（620ms，只动 transform + opacity），量到的
+         传输排 top 会差 14px；所有高度全程不变，动画一过就定住，切歌
+         也不再动——这是有意的进场动效，不是布局跳动。
+   缩放锁（全局收紧第 1 条）：全部 95 个 HTML 文档都有 viewport
+   user-scalable=no + maximum-scale=1 + minimum-scale=1（第 4 件锁了 91 个，
+   本轮补齐剩下的 4 个：stages/628-paper-flash.html、_507-lab.html、
+   _ab/blank.html、_ab/fill.html；win-controls.html 是没有 <head> 的片段，
+   不用加）；交互控件另有 touch-action（none / manipulation / pan-y），
+   无 gesturestart，双击只绑了功能切换（dblToggle），不走缩放。
+   ========================================================================== */
+@media (max-width: 380px) and (orientation: portrait) {
+  /* tier-xs：框 4:3（188×141 / 拉起 148×111），轨道跟着收短 */
+  body.is-now #view-now .cf__item { aspect-ratio: 4 / 3; }
+  body.is-now #view-now .cf__track { height: 205px; }
+  body.is-now #view-now.is-lyrics-open .cf__item { aspect-ratio: 4 / 3; }
+  body.is-now #view-now.is-lyrics-open .cf__track { height: 160px; }
+}
+@media (min-width: 421px) and (max-width: 900px) and (orientation: portrait) {
+  /* tier-lg：框 5:6（188×226 / 拉起 148×178），轨道跟着放高 */
+  body.is-now #view-now .cf__item { aspect-ratio: 5 / 6; }
+  body.is-now #view-now .cf__track { height: 293px; }
+  body.is-now #view-now.is-lyrics-open .cf__item { aspect-ratio: 5 / 6; }
+  body.is-now #view-now.is-lyrics-open .cf__track { height: 229px; }
+}
+
+/* ==========================================================================
    竖屏舞台页顶栏（2026-11-18，第 6 轮第 4 件）
    --------------------------------------------------------------------------
    用户截图（竖屏 603 舞台）：.stagebar 顶栏 top:0 + padding-top:16px，

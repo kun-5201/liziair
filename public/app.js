@@ -3061,12 +3061,14 @@
      人站在大厅里挑形态，看完返回不该被丢回经典播放页 —— 原路回大厅那张海报。 */
   let stageFromHall = false;
 
-  // 舞台操作条：返回
+  // 舞台操作条：返回（第 12 轮，2026-11-19 用户定夺：舞台点「返回」一律回首页，
+  // 不按来源回默认播放器。stageFromHall / stageDetour 只保留给 applyStage 的
+  // classic 绕道记账，不再决定返回落点；播放页自己的 #btn-back 本来就回首页，
+  // 两处现在一致。）
   $('stage-back').addEventListener('click', () => {
-    if (stageFromHall) { stageFromHall = false; show('hall'); return; }
-    /* 显式点返回离场 = 舞台会话结束：classic 绕道标记清掉，下次从播放页
-       菜单再进舞台是全新进入，回播放页（不是把上一次的大厅来源留下来）。 */
-    stageDetour = false; show('now');
+    stageFromHall = false;
+    stageDetour = false;
+    show('hall');
   });
 
   /* ---- 形态下拉（「形态」按钮）----
@@ -3613,9 +3615,13 @@
     { id: 'kugou', label: '酷狗音乐', note: '第三方协议，用你自己的账号登录，风险自担。未登录能搜，但播放被酷狗风控拦（20028 需要验证）。' },
     { id: 'qishui', label: '汽水音乐', note: '抖音扫码授权。未登录只有 30 秒试听片段；边车需要本机 Node ≥ 24。' },
     { id: 'bodian', label: '波点音乐', note: '扫码登录。未登录只有 30 秒试听；播放只放行中国大陆网络。' },
-    /* 酷我 / Spotify 已整块下线（2026-11-09）：桌面和安卓都不再露出。
-       酷我只有粘贴 Cookie 的登录方式，Spotify 的 OAuth 回调在本机也回不来，
-       这一版先不带给用户。边车服务和 /api 路由保留，只是不再有入口。 */
+    /* 第 13 轮（2026-11-19，用户定夺加回）：酷我只有粘贴 Cookie 的登录方式，
+       没有扫码接口（Kuwo.swift 的 login/qr/* 回 501）；cookie: true 让登录按钮
+       走 cookieLogin → openKuwoCookieDialog，不走扫码流程。Spotify 仍下线。 */
+    { id: 'kuwo', label: '酷我音乐', cookie: true, note: '酷我没有扫码登录，粘贴 www.kuwo.cn 的 Cookie 登录。' },
+    /* Spotify 已整块下线（2026-11-09）：桌面和安卓都不再露出。
+       Spotify 的 OAuth 回调在本机也回不来，这一版先不带给用户。
+       边车服务和 /api 路由保留，只是不再有入口。 */
   ];
 
   const Sources = (() => {
@@ -12461,8 +12467,14 @@
            「平台账号」，不再在这里弹扫码卡片（扫码那套代码还留着，只是没入口）。 */
         if (b.classList.contains('is-off')) { openAccountSettings(); return; }
         if (pid === platMode) {
-          platOptOut = true;
-          applyHallTheme('');
+          /* 2026-11-18 第 11 轮第 6 件：点当前平台图标不再退出铺色。之前这里直接
+             applyHallTheme('') 把 #hall-plat 整块藏掉（长条 + 跑马带/3D 封面一起
+             消失），而「我的」在有已登录平台时画空（meHallHtml 直接 return ''）、
+             platOptOut 又拦住回大厅自动恢复，整页不重载就回不来（用户 23:52 录屏
+             + 23:54「只有重启 App 才能复现」）。现在点当前台 = 留在当前台，
+             重新铺一次同平台（重画长条 + 跑马带，状态不变）。退出铺色走面板收起
+             （is-plat-folded）或「我的」卡。 */
+          applyHallTheme(pid, b);
           return;
         }
         applyHallTheme(pid, b);
@@ -12650,6 +12662,16 @@
           meAttach();                    // 上次离开大厅时摘掉了，回来要接上
           measureMePin();
           requestAnimationFrame(updateMe);
+          /* 2026-11-18 第 11 轮第 6 件：回大厅时铺色态掉了要能回来，不用重启 App。
+             platOptOut 只是「本次会话别在账号刷新时自动拉回」，不是「回大厅也不
+             恢复」；这里是用户主动回到首页，有已登录平台就按记忆/默认重新铺色
+             （restoreHallTheme 自己按 stored/默认挑台；没行/没登录就原样不动）。
+             点当前图标退出铺色那条路已在长条点击里去掉，这里不会把用户主动
+             退出的状态又拉回来。 */
+          if (!platMode) {
+            platOptOut = false;
+            restoreHallTheme(platRows);
+          }
           /* 手机铺色态的分屏抓手：上次在设置页登录时大厅不可见，没建成，这里补一次 */
           if (platMode) { ensureHeroGrip(); if (mobileHeroFoldOn()) syncFoldBtn(); }
           /* 铺色态回来：流色和跑马带都等视图过渡（opacity/transform）落定再开。

@@ -913,16 +913,18 @@ const Player = (() => {
       }
     }
 
-    /* 落雪兜底：netease / qq / kugou / kuwo 在平台、云盘都拿不到地址时，
+    /* 落雪兜底：netease / qq / kugou / kuwo / qishui 在平台、云盘都拿不到地址时，
        才试 LX 解析（用户自加的自定义源）。lx.quality 是实际拿到的档位，
-       界面按它显示。 */
-    if (!url && !opts.skipLX && (src === 'netease' || src === 'qq' || src === 'kugou' || src === 'kuwo')) {
+       界面按它显示。汽水是第 11 轮第 9 件接进来的：新音源上报 qs 平台，
+       取链实测通（320k）；波点没有 LX 解析（新音源也不支持 bd），不接。
+       注意：LX 成功时保留平台那档失败的 reason（不清空）——万一 LX 地址
+       进了播放器才死，兜底演示音的角标才能说清真正原因（VIP/无版权）。 */
+    if (!url && !opts.skipLX && (src === 'netease' || src === 'qq' || src === 'kugou' || src === 'kuwo' || src === 'qishui')) {
       try {
         const lx = await API.lxSongUrl(track);
         if (lx && lx.url) {
           url = API.lxAudio(lx.url);
           lxQuality = lx.quality || '';
-          reason = '';
           preview = false;
           via = 'lx';
         } else if (lx && lx.code !== 0 && lx.code !== undefined) {
@@ -1036,7 +1038,9 @@ const Player = (() => {
      LX」降级，取址后失败原来是死路，只能显示「播放失败」。每首只重试一次，
      且只在用户还没切歌时才换源；手势拦截（NotAllowedError）不重试。
      skip 掉的档 = 取址时已经给过地址、播放失败的那一档（以及它之前
-     明确拿不到地址的档）；LX 是最后一档，LX 地址死了就没下一档可试。 */
+     明确拿不到地址的档）；LX 是最后一档，LX 地址死了没有下一档可试，
+     第 11 轮第 8 件起改放演示音（fallbackToDemo），不再直接报 sourceerror
+     卡住 —— 取链失败走演示音、播放失败也走演示音，兜底才算走通。 */
   async function retryWithFallback(track, token) {
     if (!track || token !== state.token || state.fallbackRetried) return false;
     const via = (state.lastFetch && state.lastFetch.via) || '';
@@ -1053,7 +1057,7 @@ const Player = (() => {
     revokeDeckBlob(audio);
     audio.preload = 'metadata';
     audio.src = data.url;
-    state.lastFetch = { via: data.via, track, token };
+    state.lastFetch = { via: data.via, track, token, reason: data.reason };
     emit('source', { demo: data.demo, track, reason: data.reason, preview: data.preview, clipStartMs: data.clipStartMs, lxQuality: data.lxQuality });
     try {
       await audio.play();
@@ -1061,6 +1065,41 @@ const Player = (() => {
       Beat.start();
       state.playing = true;
       emit('playstate', true);
+      return true;
+    } catch {
+      state.playing = false;
+      emit('playstate', false);
+      return false;
+    }
+  }
+
+  /* LX 地址进了播放器才死时的最后一档：第 11 轮第 8 件。
+     取链阶段 LX 失败会走演示音（fetchTrackUrl 末尾），但播放阶段
+     （代理 502/403、解码失败）原来直接报 sourceerror 卡住 ——
+     用户看到的就是「播不出、也不出声」。这里改放演示音：界面照常
+     走完（歌词、进度、演示音轨角标），角标 reason 沿用平台那档失败的
+     原因（vip/无版权等），用户才知道为什么不是真歌。
+     同步占位 state.fallbackRetried：error 事件和 load() 里 play() 的
+     catch 可能同时触发，只放一次演示音；演示音本身再报错不循环。 */
+  async function fallbackToDemo(track, token, reason) {
+    if (!track || token !== state.token || state.fallbackRetried) return false;
+    state.fallbackRetried = true;
+    try {
+      const url = await makeDemoTrack(40, track.id);
+      if (token !== state.token) { URL.revokeObjectURL(url); return false; }
+      revokeDeckBlob(audio);
+      deckBlobs.set(audio, url);
+      state.objectUrl = url;
+      audio.preload = 'metadata';
+      audio.src = url;
+      state.lastFetch = { via: 'demo', track, token, reason };
+      emit('source', { demo: true, track, reason, preview: false, clipStartMs: 0, lxQuality: '' });
+      await audio.play();
+      Beat.resume();
+      Beat.start();
+      state.playing = true;
+      emit('playstate', true);
+      postDiagAudio(`落雪地址播放失败，已改放演示音：source=${track.source || 'netease'} id=${track.id ?? track.mid ?? track.hash ?? ''} reason=${reason || 'unavailable'}`);
       return true;
     } catch {
       state.playing = false;
@@ -1169,7 +1208,8 @@ const Player = (() => {
     revokeDeckBlob(audio);
     if (data.demo) { deckBlobs.set(audio, data.url); state.objectUrl = data.url; }
     // 记下这首的地址来源：error 事件里靠它判断要不要往下一档重试。
-    state.lastFetch = { via: data.via, track, token };
+    // reason 一起记：LX 地址播放失败改放演示音时，角标要说清真正原因。
+    state.lastFetch = { via: data.via, track, token, reason: data.reason };
     state.fallbackRetried = false;
 
     audio.preload = 'metadata';
@@ -1193,6 +1233,12 @@ const Player = (() => {
         if (e && e.name !== 'NotAllowedError' && audio.error && (data.via === 'platform' || data.via === 'cloud') && token === state.token) {
           const ok = await retryWithFallback(track, token);
           if (ok) return { demo: data.demo };
+        }
+        // LX 地址在 play() 这一步就失败：同样改放演示音（和 error 事件同一入口，
+        // fallbackToDemo 里有同步占位，两边同时触发也只放一次）。
+        if (e && e.name !== 'NotAllowedError' && audio.error && data.via === 'lx' && token === state.token) {
+          const ok = await fallbackToDemo(track, token, data.reason || 'unavailable');
+          if (ok) return { demo: true };
         }
         state.playing = false;
         emit('playstate', false);
@@ -1284,7 +1330,7 @@ const Player = (() => {
     const token = ++state.token;
     startTrackMeta(prepared.track, prepared.index, token);
     // 过渡落点也要记地址来源，否则这首的 error 事件认不出是哪一档的地址、重试走不到。
-    state.lastFetch = { via: prepared.via, track: prepared.track, token };
+    state.lastFetch = { via: prepared.via, track: prepared.track, token, reason: prepared.reason };
     state.fallbackRetried = false;
 
     state.objectUrl = deckBlobs.get(incoming) || null;
@@ -1344,8 +1390,19 @@ const Player = (() => {
       if (el !== audio) return;
       if (!el.src) return;
       const detail = audioErrorDetail(el);
+      // LX 地址播放失败：第 11 轮第 8 件起改放演示音，不再直接报 sourceerror
+      // 卡住（取链失败走演示音、播放失败也走演示音，兜底才算走通）。
+      if (state.lastFetch && state.lastFetch.via === 'lx' && state.lastFetch.token === state.token) {
+        const failedTrack = state.lastFetch.track;
+        const failedReason = state.lastFetch.reason || 'unavailable';
+        console.warn('[player] 落雪地址播放失败，改放演示音：', detail);
+        postDiagAudio(`落雪地址播放失败，改放演示音：code=${detail.code} host=${detail.host} ns=${detail.networkState} rs=${detail.readyState}`);
+        fallbackToDemo(failedTrack, state.lastFetch.token, failedReason).then((ok) => {
+          if (!ok) emit('sourceerror', detail);
+        });
+        return;
+      }
       // 刚才的地址是平台/云盘的：往下一档重试一次；重试本身失败时再报 sourceerror。
-      // LX 已是最后一档，LX 地址死了没有下一档可试，直接报 sourceerror。
       // 旧行为只发 {}，界面和日志都看不到原因；现在把真实原因带出去。
       if (state.lastFetch && (state.lastFetch.via === 'platform' || state.lastFetch.via === 'cloud') && state.lastFetch.token === state.token) {
         const failedVia = state.lastFetch.via === 'platform' ? '平台' : '云盘';

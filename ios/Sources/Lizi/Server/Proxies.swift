@@ -218,6 +218,45 @@ enum Proxies {
         return looksLikeAudio(data) ?? audioExtensionMIME(url) ?? upstreamCT ?? "audio/mpeg"
     }
 
+    /// 音频代理的单次 Range 上限（2MB，第 11 轮第 8/9 件）：
+    /// 播放器（Chromium / AVFoundation）常发 bytes=0- 这种不封口的 Range；
+    /// 旧代码原样透传，Upstream.fetch（data(for:) 整段缓冲）会把整首歌
+    /// （master FLAC 常 100MB+）下完才回包——VM 上 12 秒、手机弱网下超
+    /// 30 秒超时 → 502 → 播放器报 code=4（00:17/00:19 三首歌全是这个死法）。
+    /// 这里把 Range 截成 ≤2MB 的闭区间；无 Range 时注入 bytes=0-2MB-1。
+    /// 上游回 206 + Content-Range，播放器按需再要下一段，首字节几秒内就到。
+    /// 各家 CDN 都认 Range（VM 实测 QQ/网易/酷狗/酷我/汽水全回 206）。
+    private static let audioRangeCap = 2 * 1024 * 1024
+
+    /// 见 audioRangeCap 注释：只处理最常见的 bytes=<start>-<end?> 形；
+    /// 解析失败（多段 Range、后缀 Range 等罕见形状）原样透传，不乱改。
+    private static func cappedRangeHeader(_ raw: String?) -> String {
+        guard let raw, !raw.isEmpty else { return "bytes=0-\(audioRangeCap - 1)" }
+        let s = raw.trimmingCharacters(in: .whitespaces)
+        guard s.hasPrefix("bytes=") else { return raw }
+        let body = String(s.dropFirst("bytes=".count))
+        let parts = body.split(separator: "-", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2, let start = Int(String(parts[0])) else { return raw }
+        if parts[1].isEmpty {
+            return "bytes=\(start)-\(start + audioRangeCap - 1)"
+        }
+        guard let end = Int(String(parts[1])) else { return raw }
+        if end - start + 1 > audioRangeCap {
+            return "bytes=\(start)-\(start + audioRangeCap - 1)"
+        }
+        return raw
+    }
+
+    /// 音频代理拉上游失败时留痕（第 11 轮第 8/9 件）：原来 catch / 502 只回状态，
+    /// 诊断里只有播放器侧的 code=4，分不清是上游 DNS 挂了、超时、403 还是 502。
+    /// 只记主机 + 状态/原因，不记完整直链（LX 直链可能含 key）。
+    private static func recordAudioProxyFailure(source: String, host: String, reason: String) {
+        DiagLog.shared.recordPlaybackStep("\(source) audio FAIL host=\(host) \(reason)")
+        DiagLog.shared.recordLog(category: "audio",
+            message: "音频代理拉上游失败：source=\(source) host=\(host) \(reason)",
+            fields: ["host": host, "reason": "proxy-upstream", "lane": "proxy"])
+    }
+
     /// /api/<source>/audio?url=：音频代理，转发 Range，返回上游状态码原样。
     static func proxySourceAudio(_ req: HttpRequest, source: String) async -> HttpResponse {
         guard let raw = req.query["url"], let url = Upstream.url(from: raw),
@@ -232,11 +271,15 @@ enum Proxies {
                 return .json(403, ["error": "host not allowed"])
             }
             var headers: [String: String] = ["User-Agent": "Mozilla/5.0", "Referer": "https://y.qq.com/"]
-            if let range = req.headers["range"] { headers["Range"] = range }
+            headers["Range"] = cappedRangeHeader(req.headers["range"])
             do {
                 let (data, http) = try await Upstream.fetch(url, headers: headers, timeout: 30)
+                if !(200..<300).contains(http.statusCode) {
+                    recordAudioProxyFailure(source: source, host: host, reason: "upstream HTTP \(http.statusCode)")
+                }
                 if let err = audioBodyError(status: http.statusCode, data: data,
                                             contentType: http.value(forHTTPHeaderField: "Content-Type"), url: url) {
+                    recordAudioProxyFailure(source: source, host: host, reason: err)
                     return .error(502, err)
                 }
                 var out: [String: String] = [
@@ -250,6 +293,7 @@ enum Proxies {
                 DiagLog.shared.recordPlaybackStep("\(source) audio \(http.statusCode) host=\(host) bytes=\(data.count)")
                 return HttpResponse(status: http.statusCode, headers: out, body: data)
             } catch {
+                recordAudioProxyFailure(source: source, host: host, reason: "fetch error: \(error.localizedDescription)")
                 return .error(502, String(describing: error))
             }
         }
@@ -262,11 +306,15 @@ enum Proxies {
         }
         var headers: [String: String] = ["User-Agent": "Mozilla/5.0"]
         if let ref = audioReferer[source], !ref.isEmpty { headers["Referer"] = ref }
-        if let range = req.headers["range"] { headers["Range"] = range }
+        headers["Range"] = cappedRangeHeader(req.headers["range"])
         do {
             let (data, http) = try await Upstream.fetch(url, headers: headers, timeout: 30)
+            if !(200..<300).contains(http.statusCode) {
+                recordAudioProxyFailure(source: source, host: host, reason: "upstream HTTP \(http.statusCode)")
+            }
             if let err = audioBodyError(status: http.statusCode, data: data,
                                         contentType: http.value(forHTTPHeaderField: "Content-Type"), url: url) {
+                recordAudioProxyFailure(source: source, host: host, reason: err)
                 return .error(502, err)
             }
             var out: [String: String] = [
@@ -280,6 +328,7 @@ enum Proxies {
             DiagLog.shared.recordPlaybackStep("\(source) audio \(http.statusCode) host=\(host) bytes=\(data.count)")
             return HttpResponse(status: http.statusCode, headers: out, body: data)
         } catch {
+            recordAudioProxyFailure(source: source, host: host, reason: "fetch error: \(error.localizedDescription)")
             return .error(502, String(describing: error))
         }
     }

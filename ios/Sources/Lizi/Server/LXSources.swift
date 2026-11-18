@@ -367,7 +367,7 @@ final class LXSourceRegistry {
     /// 有的脚本只拼 URL 不验证上游（长青直接拼 PHP 地址），返回的地址
     /// 可能是死的；校验不过就试下一个候选，别把死链交给播放器。
     /// 整条链路 30 秒总期限：超时就抛错走平台备用，别吃掉前端 60 秒超时。
-    func resolveMusicUrl(source: String, songId: String, quality: String, autoSwitch: Bool) async throws -> (String, String, String) {
+    func resolveMusicUrl(source: String, songId: String, quality: String, songName: String = "", autoSwitch: Bool) async throws -> (String, String, String) {
         try await withThrowingTaskGroup(of: (String, String, String).self) { group in
             group.addTask {
                 var lastError: Error?
@@ -376,8 +376,8 @@ final class LXSourceRegistry {
                 for meta in tryList {
                     do {
                         let inst = try self.instance(for: meta)
-                        let (url, tier) = try await inst.resolveMusicUrl(source: source, songId: songId, quality: quality)
-                        if await Self.audioURLReachable(url) {
+                        let (url, tier) = try await inst.resolveMusicUrl(source: source, songId: songId, quality: quality, songName: songName)
+                        if await Self.audioURLReachable(url, source: source) {
                             return (url, tier, "custom:\(meta.id)")
                         }
                         lastError = NSError(domain: "LXSources", code: 2, userInfo: [NSLocalizedDescriptionKey: "音源 \(meta.name) 返回的地址打不开"])
@@ -411,41 +411,87 @@ final class LXSourceRegistry {
     /// 用 bytes(for:) 只读 1 字节就停：data(for:) 会把整段正文下完，遇到
     /// 上游无视 Range 回 200 整包时会把整个文件（上百 MB 的 FLAC）拉下来探活。
     /// 跟随重定向（URLSession 默认）。
-    static func audioURLReachable(_ urlString: String, timeout: TimeInterval = 8) async -> Bool {
+    /// （第 11 轮第 8/9 件改动）
+    ///  - 探活头对齐播放时代理会发的头：tx（QQ 流媒体）补 Referer
+    ///    https://y.qq.com/（代理一直这么发，探活裸 UA 可能被边缘节点误杀）。
+    ///  - 超时 / 无响应 = 结论不明，不再判死：弱网下首字节 >8 秒很常见
+    ///    （VM 上冷边缘首字节 1.5–2.3 秒），判死会把能播的歌推给演示音；
+    ///    这时交回 true 让播放器自己试（播失败有 fallbackToDemo 兜底），
+    ///    并留一条面包屑。只有拿到明确 HTTP 响应才判死（4xx/5xx、
+    ///    200 + 非音频 Content-Type、空正文），判死时把主机 + 状态/CT
+    ///    记进诊断（不记完整直链），不再只剩一句「打不开」。
+    static func audioURLReachable(_ urlString: String, source: String, timeout: TimeInterval = 10) async -> Bool {
         guard let url = Upstream.url(from: urlString),
               url.scheme == "http" || url.scheme == "https" else { return false }
-        // 非 throwing task group：两个子任务都不抛错（bytes 失败自己吞掉变 false，
-        // sleep 用 try?），先回来哪个算哪个，另一个取消。
+        let host = url.host ?? ""
+        // 非 throwing task group：两个子任务都不抛错（bytes 失败自己吞掉变
+        // 结论不明，sleep 用 try?），先回来哪个算哪个，另一个取消。
         return await withTaskGroup(of: Bool.self) { group in
             group.addTask {
                 do {
                     var req = URLRequest(url: url, timeoutInterval: timeout)
                     req.setValue("bytes=0-1", forHTTPHeaderField: "Range")
                     req.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+                    if source == "tx" {
+                        req.setValue("https://y.qq.com/", forHTTPHeaderField: "Referer")
+                    }
                     let (bytes, resp) = try await URLSession.shared.bytes(for: req)
-                    guard let http = resp as? HTTPURLResponse else { return false }
-                    guard http.statusCode == 200 || http.statusCode == 206 else { return false }
+                    guard let http = resp as? HTTPURLResponse else {
+                        DiagLog.shared.recordLog(category: "audio",
+                            message: "LX 探活无 HTTP 响应：source=\(source) host=\(host)（结论不明，交给播放器试）",
+                            fields: ["host": host, "reason": "lx-probe-no-response", "lane": "lx"])
+                        DiagLog.shared.recordPlaybackStep("lx probe inconclusive source=\(source) host=\(host) reason=no-http-response")
+                        return true
+                    }
+                    guard http.statusCode == 200 || http.statusCode == 206 else {
+                        DiagLog.shared.recordLog(category: "audio",
+                            message: "LX 探活判死：source=\(source) host=\(host) HTTP \(http.statusCode)",
+                            fields: ["host": host, "reason": "lx-probe-status-\(http.statusCode)", "code": http.statusCode, "lane": "lx"])
+                        return false
+                    }
                     let ct = (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
                     let audioCT = ct.hasPrefix("audio/") || ct.hasPrefix("video/")
                         || ct == "application/octet-stream" || ct == "binary/octet-stream"
                     if http.statusCode == 200 {
                         // 200 可能是错误页：必须有音频 Content-Type 才认。
-                        guard audioCT else { return false }
-                    } else {
+                        guard audioCT else {
+                            DiagLog.shared.recordLog(category: "audio",
+                                message: "LX 探活判死：source=\(source) host=\(host) HTTP 200 但 Content-Type 不是音频（\(ct.isEmpty ? "缺失" : ct)）",
+                                fields: ["host": host, "reason": "lx-probe-not-audio", "lane": "lx"])
+                            return false
+                        }
+                    } else if !ct.isEmpty && !audioCT {
                         // 206 是真分片：Content-Type 缺失也认，有值时必须是音频。
-                        if !ct.isEmpty && !audioCT { return false }
+                        DiagLog.shared.recordLog(category: "audio",
+                            message: "LX 探活判死：source=\(source) host=\(host) HTTP 206 但 Content-Type 不是音频（\(ct)）",
+                            fields: ["host": host, "reason": "lx-probe-not-audio", "lane": "lx"])
+                        return false
                     }
                     var it = bytes.makeAsyncIterator()
-                    return try await it.next() != nil
+                    guard try await it.next() != nil else {
+                        DiagLog.shared.recordLog(category: "audio",
+                            message: "LX 探活判死：source=\(source) host=\(host) HTTP \(http.statusCode) 但正文为空",
+                            fields: ["host": host, "reason": "lx-probe-empty", "lane": "lx"])
+                        return false
+                    }
+                    return true
                 } catch {
-                    return false
+                    // 超时 / DNS 失败 / 连接被重置：没拿到响应，结论不明——
+                    // 交给播放器试，别在弱网上误杀能播的链。
+                    DiagLog.shared.recordLog(category: "audio",
+                        message: "LX 探活无响应（\(error.localizedDescription)）：source=\(source) host=\(host)（结论不明，交给播放器试）",
+                        fields: ["host": host, "reason": "lx-probe-inconclusive", "lane": "lx"])
+                    DiagLog.shared.recordPlaybackStep("lx probe inconclusive source=\(source) host=\(host)")
+                    return true
                 }
             }
             group.addTask {
                 try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                return false
+                guard !Task.isCancelled else { return false }
+                DiagLog.shared.recordPlaybackStep("lx probe timeout source=\(source) host=\(host) (inconclusive, handing to player)")
+                return true
             }
-            let first = await group.next() ?? false
+            let first = await group.next() ?? true
             group.cancelAll()
             return first
         }

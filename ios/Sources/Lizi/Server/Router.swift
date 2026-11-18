@@ -216,6 +216,7 @@ final class LiziRouter {
             return .json(200, ["code": 6, "error": "该音源没有 LX 解析: \(source)"])
         }
         var songId = ""
+        var songName = ""
         switch source {
         case "qq":
             songId = req.string("mid").isEmpty ? req.string("id") : req.string("mid")
@@ -225,7 +226,17 @@ final class LiziRouter {
                 songId = [req.string("name"), req.string("artists")].filter({ !$0.isEmpty }).joined(separator: " ")
             }
         case "kuwo":
-            songId = req.string("name").isEmpty ? req.string("id") : req.string("name")
+            // 酷我：新音源（聆澜）后端只要裸 rid（数字），传歌名回 parameter error；
+            // 旧脚本要 musicInfo.name（歌名）。两边都要：songId 走 rid，
+            // 歌名另传 songName，引擎里分别填 songmid / name（见 LXScriptEngine）。
+            var kwId = req.string("id")
+            if kwId.hasPrefix("MUSIC_") { kwId = String(kwId.dropFirst(6)) }
+            if !kwId.isEmpty && kwId.allSatisfy({ $0.isNumber }) {
+                songId = kwId
+                songName = req.string("name")
+            } else {
+                songId = req.string("name").isEmpty ? req.string("id") : req.string("name")
+            }
         default:
             songId = req.string("id")
         }
@@ -237,11 +248,18 @@ final class LiziRouter {
             // 由 player.js 在平台、云盘之后兜底（第 7 轮第 8 件：LX 是最后一档，
             // 再拿不到才走演示音）。自动切换开关控制是否多源重试。
             let r = try await LXSourceRegistry.shared.resolveMusicUrl(
-                source: lxSource, songId: songId, quality: quality,
+                source: lxSource, songId: songId, quality: quality, songName: songName,
                 autoSwitch: LXSourceRegistry.shared.autoSwitchEnabled)
+            // 第 11 轮第 8 件：LX 成功/失败都留面包屑 + 失败原因进诊断日志——
+            // 只写步骤与结果，不写完整直链（LX 直链可能含 key）。
+            DiagLog.shared.recordPlaybackStep("lx song/url source=\(source) lx=\(lxSource) via=\(r.2) quality=\(r.1)")
             return .json(200, ["code": 0, "url": r.0, "quality": r.1, "lxSource": lxSource,
                                 "via": r.2])
         } catch {
+            DiagLog.shared.recordPlaybackStep("lx song/url failed source=\(source) lx=\(lxSource) reason=\(error.localizedDescription)")
+            DiagLog.shared.recordLog(category: "audio",
+                message: "LX 取链失败：source=\(source) lx=\(lxSource) 原因=\(error.localizedDescription)",
+                fields: ["reason": "lx-resolve"])
             return .json(200, ["code": 2, "error": error.localizedDescription])
         }
     }

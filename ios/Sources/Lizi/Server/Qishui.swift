@@ -165,8 +165,14 @@ final class QishuiService {
             throw QishuiError(code: "network", message: "client_token 返回无法解析", upstreamCode: nil)
         }
         let checked = try Self.checkQishuiResponse(obj)
-        let d = (checked["data"] as? [String: Any]) ?? [:]
-        guard let token = d["client_token"] as? String, !token.isEmpty else {
+        // 顶层优先、data 兜底：Node 原版（client.cjs）http() 回的 data 就是整个包体，
+        // 它读的是顶层 client_token；真机复刻也证实上游回顶层（无 data 键）。只读
+        // data.client_token 时每次都抛「client_token 缺失」（invalid-response→400），
+        // 搜索连 /search/ 都到不了——视频里那个 400 也可能是这一处，不只是缺 result_groups 那一处。
+        let token = scStr(checked, "client_token").isEmpty
+            ? scStr((checked["data"] as? [String: Any]) ?? [:], "client_token")
+            : scStr(checked, "client_token")
+        guard !token.isEmpty else {
             throw QishuiError(code: "invalid-response", message: "client_token 缺失", upstreamCode: nil)
         }
         tokenEntry = token
@@ -182,6 +188,12 @@ final class QishuiService {
     /// platform(path)：POST open.douyin.com/api/luna/v1/platform{path}?{公共查询}。
     /// body 平铺业务参数 + common_params（登录时含 user_id）；28001008 仅可重试路径重试一次。
     private func platform(path: String, body: [String: Any] = [:], auth: QSAuth = .public, attempt: Int = 0) async throws -> [String: Any] {
+        try await platformRaw(path: path, body: body, auth: auth, attempt: attempt).data
+    }
+
+    /// platform 的带原始响应版：search() 需要在上游软失败时把原始 payload 记进诊断，
+    /// 只返回 data 的版本会把原始包丢掉。其它调用方继续用 platform()，形状不变。
+    private func platformRaw(path: String, body: [String: Any] = [:], auth: QSAuth = .public, attempt: Int = 0) async throws -> (data: [String: Any], raw: String) {
         let cred: [String: Any]?
         let devId: String
         switch auth {
@@ -223,11 +235,11 @@ final class QishuiService {
             guard let d = checked["data"] as? [String: Any] else {
                 throw QishuiError(code: "invalid-response", message: "汽水返回缺 data", upstreamCode: nil)
             }
-            return d
+            return (d, String(data: data, encoding: .utf8) ?? "")
         } catch let e as QishuiError {
             if e.upstreamCode == "28001008", attempt == 0, Self.retryableReads.contains(path) {
                 tokenEntry = nil
-                return try await platform(path: path, body: body, auth: auth, attempt: 1)
+                return try await platformRaw(path: path, body: body, auth: auth, attempt: 1)
             }
             throw e
         }
@@ -602,6 +614,35 @@ final class QishuiService {
 
     // MARK: - 业务 op（src/catalog.cjs、src/feed.cjs、src/playback.cjs、src/library.cjs）
 
+    /// 取一页搜索结果。上游软失败（err_no==0 但 data 缺 result_groups）时不再直接抛
+    /// invalid-response（那会一路变成 HTTP 400）：先把原始 payload 的关键结构记进诊断
+    ///（只记结构：data 的键名 + 原始包前 500 字符，不记整包），短暂间隔后换一次新请求
+    ///（新的 _timestamp/_nonce，同一 search_id、同一 device_id）重试一次；重试仍缺时
+    /// 抛 upstream-search-unavailable，路由层回 HTTP 200 + 体内 502，前端显示
+    /// 「汽水搜索暂不可用」。device_id 全程稳定复用（内存缓存 + 落盘，见 deviceId()），
+    /// 重试不换 device_id：换 id 只会让上游把重试当成另一台设备，救不了这次失败。
+    private func searchPage(query: String, type: String, cursor: Int, searchId: String) async throws -> [[String: Any]] {
+        let body: [String: Any] = [
+            "q": query, "cursor": String(cursor), "search_id": searchId, "from_search_id": searchId,
+            "search_method": "input", "search_type": type, "search_scene": "normal",
+            "scene_name": "search", "ab_param": "", "last_viewed_media": [:] as [String: Any],
+        ]
+        for attempt in 1...2 {
+            let (data, raw) = try await platformRaw(path: "/search/", body: body)
+            if let groups = data["result_groups"] as? [[String: Any]] { return groups }
+            DiagLog.shared.recordLog(category: "search",
+                message: "汽水搜索上游软失败：err_no==0 但缺 result_groups（第 \(attempt) 次）",
+                fields: ["query": query, "type": type, "cursor": cursor, "attempt": attempt,
+                         "deviceId": deviceId(),
+                         "dataKeys": data.keys.sorted().joined(separator: ","),
+                         "payload": String(raw.prefix(500))])
+            if attempt == 1 {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+        throw QishuiError(code: "upstream-search-unavailable", message: "汽水搜索暂不可用", upstreamCode: nil)
+    }
+
     private func search(query: String, type: String, limit: Int, offset: Int) async throws -> [String: Any] {
         if query.isEmpty { return ["items": [], "total": 0, "hasMore": false, "nextOffset": offset] }
         var cursor = offset
@@ -609,14 +650,7 @@ final class QishuiService {
         var lastMore = false
         let searchId = UUID().uuidString
         while items.count < limit {
-            let data = try await platform(path: "/search/", body: [
-                "q": query, "cursor": String(cursor), "search_id": searchId, "from_search_id": searchId,
-                "search_method": "input", "search_type": type, "search_scene": "normal",
-                "scene_name": "search", "ab_param": "", "last_viewed_media": [:] as [String: Any],
-            ])
-            guard let groups = data["result_groups"] as? [[String: Any]] else {
-                throw QishuiError(code: "invalid-response", message: "汽水搜索返回缺 result_groups", upstreamCode: nil)
-            }
+            let groups = try await searchPage(query: query, type: type, cursor: cursor, searchId: searchId)
             let group = groups.first { scStr($0, "id") == "\(type)s" } ?? groups.first ?? [:]
             let rows = (group["data"] as? [[String: Any]]) ?? []
             let batch = rows.compactMap { ($0["entity"] as? [String: Any])?[type] as? [String: Any] }
@@ -1042,11 +1076,14 @@ final class QishuiService {
 
     /// failBody 错误映射（spec §4.2）：auth-required→401、not-playable→403、
     /// unsupported→400、invalid-response→400、unavailable/network→502、其余 502。
+    /// upstream-search-unavailable 单独列出：上游软失败是服务端侧问题，绝不能回 400
+    ///（400 会让前端以为是客户端请求错）；即使哪天有路由直接走 qsFail，它也是 502。
     private static func qsHTTPCode(_ e: QishuiError) -> Int {
         switch e.code {
         case "auth-required": return 401
         case "not-playable": return 403
         case "unsupported", "invalid-response": return 400
+        case "upstream-search-unavailable": return 502
         default: return 502
         }
     }
@@ -1056,6 +1093,17 @@ final class QishuiService {
         var body: [String: Any] = ["code": code, "source": "qishui", "error": e.message]
         for (k, v) in empty { body[k] = v }
         return .json(code, body)
+    }
+
+    /// 搜索上游软失败的回包：HTTP 200 + 体内 code 502 + error。
+    /// 不能直接回 HTTP 502：前端 srcSearch 用严格 call()，任何非 2xx 都只抛
+    /// `HTTP <status>`、根本不读体，HTTP 502 到界面只会是「搜索失败：HTTP 502」。
+    /// 走 200 + 体内 502，searchOne（app.js）才能把 error 原样显示成「汽水搜索暂不可用」
+    ///（同文件 /song/url、/lyric 上游失败时回 HTTP 200 + error 的做法）。
+    private func qsSearchUpstreamFail(_ e: QishuiError, empty: [String: Any] = [:]) -> HttpResponse {
+        var body: [String: Any] = ["code": 502, "source": "qishui", "error": e.message]
+        for (k, v) in empty { body[k] = v }
+        return .json(200, body)
     }
 
     private func qsAuthFail(_ e: QishuiError) -> HttpResponse {
@@ -1107,6 +1155,9 @@ final class QishuiService {
                     return .json(200, ["code": 200, "source": "qishui", "tracks": tracks,
                                        "songCount": tracks.count, "more": (r["hasMore"] as? NSNumber)?.boolValue == true])
                 } catch let e as QishuiError {
+                    if e.code == "upstream-search-unavailable" {
+                        return qsSearchUpstreamFail(e, empty: ["tracks": []])
+                    }
                     return qsFail(e, empty: ["tracks": []])
                 }
             case ["api", "qishui", "song", "url"]:
@@ -1213,6 +1264,9 @@ final class QishuiService {
                         .filter { !scStr($0, "id").isEmpty }
                     return .json(200, ["code": 200, "source": "qishui", "playlists": lists])
                 } catch let e as QishuiError {
+                    if e.code == "upstream-search-unavailable" {
+                        return qsSearchUpstreamFail(e, empty: ["playlists": []])
+                    }
                     return qsFail(e, empty: ["playlists": []])
                 }
             case ["api", "qishui", "recent_played"]:
