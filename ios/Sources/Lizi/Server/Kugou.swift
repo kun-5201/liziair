@@ -820,6 +820,11 @@ extension KugouService {
             let hit = candidates.first(where: { !scStr($0, "id").isEmpty && !scStr($0, "accesskey").isEmpty })
                 ?? candidates.first
             guard let hit, !scStr(hit, "id").isEmpty, !scStr(hit, "accesskey").isEmpty else {
+                // 2026-11-18 第 9 轮：真机上酷狗播了没歌词，分不清是取不到还是显示不出；
+                // 之前 lyric() 全程零日志。记一条，进设置页诊断（/api/diag/search）就能看到。
+                DiagLog.shared.recordLog(category: "lyric",
+                    message: "kugou lyric no candidate hash=\(hash.prefix(8)) s=\(keyword) candidates=\(candidates.count)",
+                    fields: ["host": "lyrics.kugou.com", "reason": "lyric-no-candidate"])
                 return .json(200, ["code": 200, "lyric": "", "yrc": "", "tlyric": "", "format": "none"])
             }
             let lr = try await kgRequest(baseURL: Self.lyricsBase, path: "/download", method: "GET",
@@ -830,6 +835,9 @@ extension KugouService {
             let lBody = lr.json ?? [:]
             let content = scStr(lBody, "content")
             guard !content.isEmpty else {
+                DiagLog.shared.recordLog(category: "lyric",
+                    message: "kugou lyric empty content id=\(scStr(hit, "id"))",
+                    fields: ["host": "lyrics.kugou.com", "reason": "lyric-empty-content"])
                 return .json(200, ["code": 200, "lyric": "", "yrc": "", "tlyric": "", "format": "none"])
             }
             let decoded: String
@@ -843,12 +851,22 @@ extension KugouService {
             if isKrc {
                 let lrc = krcToLrc(decoded)
                 let yrc = krcToYrc(decoded)
+                // 只记行数/长度，不记歌词正文。
+                DiagLog.shared.recordLog(category: "lyric",
+                    message: "kugou lyric ok format=\(yrc.isEmpty ? "lrc" : "yrc") lrcChars=\(lrc.count) yrcChars=\(yrc.count)",
+                    fields: ["host": "lyrics.kugou.com", "reason": "lyric-ok"])
                 return .json(200, ["code": 200, "lyric": lrc, "yrc": yrc, "tlyric": "",
                                     "format": yrc.isEmpty ? "lrc" : "yrc"])
             }
+            DiagLog.shared.recordLog(category: "lyric",
+                message: "kugou lyric ok format=lrc decodedChars=\(decoded.count)",
+                fields: ["host": "lyrics.kugou.com", "reason": "lyric-ok"])
             return .json(200, ["code": 200, "lyric": decoded, "yrc": "", "tlyric": "",
                                 "format": decoded.isEmpty ? "none" : "lrc"])
         } catch {
+            DiagLog.shared.recordLog(category: "lyric",
+                message: "kugou lyric failed: \((error as? KugouError)?.message ?? "酷狗歌词失败")",
+                fields: ["host": "lyrics.kugou.com", "reason": "lyric-error"])
             return .json(200, ["code": 200, "lyric": "", "yrc": "", "tlyric": "", "format": "none",
                                 "error": (error as? KugouError)?.message ?? "酷狗歌词失败"])
         }

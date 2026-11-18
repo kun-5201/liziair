@@ -88,8 +88,13 @@
   const DRAG_THRESHOLD = 8;        // 跑马带上：超过 8px 才展开
   const OVERLAY_THRESHOLD = 5;     // 环里再拖：5px（和原组件一致）
   /* 2026-11-09：600 → 1000。用户反馈「刚松手环就收回，像被拽回去」；
-     留久一点，看清楚停在哪张，再自己决定点选还是等它收。 */
-  const HOLD_MS = 1000;            // 松手后环保持多久再收回
+     留久一点，看清楚停在哪张，再自己决定点选还是等它收。
+     2026-11-18 第 9 轮：1000 → 2500。用户 16:42 报「滑动 3D 封面流
+     时还是崩溃」——VM 里 0 崩溃、0 pageerror，环消失的唯一机制就是
+     这条定时收回：慢慢看封面、两次拖动之间停 1 秒以上，环就自己收了，
+     用户读成「滑着滑着没了/崩了」。2500ms 内手指再落下会清掉定时器，
+     不影响正常点选；点空白/Esc 仍立即收回。 */
+  const HOLD_MS = 2500;            // 松手后环保持多久再收回
   const ENTER_MS = 560;            // 半径从 0.42R 展开到 R（只在非拖动路径使用）
   /* 拖动灵敏度：物理弧长 180/(πR) 是 1:1 跟手的，但 R≈780 时一张卡要拖
      约 270px，手指会觉得「拖了它没怎么动」。乘 1.45 后约 186px 一张，
@@ -957,9 +962,13 @@
          落回跑马带最初按下的 A 卡上。 */
       const ring = active;
       ring.suppressClick = true;
+      /* 2026-11-18 第 9 轮：环内模式原来只吞 80ms，触屏的合成 click 有时会
+         在 80ms 之后才到（第 9 轮横屏快滑后环直接收掉就是这一下：click 落在
+         空白处走了 closeRing(true)）。改成 300ms，和跑马带模式 400ms 同理；
+         300ms 内在环里再点一张卡会被吞一次，代价可接受。 */
       setTimeout(() => {
         if (active === ring) ring.suppressClick = false;
-      }, mode === 'marquee' ? 400 : 80);
+      }, mode === 'marquee' ? 400 : 300);
       releaseRing(p);
     }
   }
@@ -1048,7 +1057,20 @@
 
   /* ---------------- 覆盖层自己的事件 ---------------- */
   function onOverlayDown(e) {
-    if (!active || active.closing) return;
+    if (!active) return;
+    if (active.closing) {
+      /* 2026-11-18 第 9 轮：收起淡出（430ms）里手指又落下来时，原来直接
+         return，白白吞掉这次触摸——用户会觉得滑着滑着环「死掉了」。
+         撤回收起：关掉 closing 标记，finishClose 的兜底定时器和 frame
+         里的收尾都以 closing 为条件，会自己失效。选歌收起（after 是
+         orig.click()）不撤：让它收完，点的那首歌照常播。 */
+      if (active.after) return;
+      active.closing = false;
+      active.overlay.classList.remove('is-closing');
+      clearTimeout(active.closeTimer);
+      active.closeTimer = 0;
+      wake();
+    }
     if (!e.isPrimary) return;
     if (e.pointerType === 'mouse' && e.button !== 0) return;
     trackPointer(e);
